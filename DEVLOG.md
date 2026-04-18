@@ -4,6 +4,30 @@ Session-by-session ship log. Append-only. New entries on top.
 
 ---
 
+## 2026-04-18 -- Bootstrap Fixes: Shared-Skill Rename + Helper Skills
+
+**Commit:** `597e052` feat: rename shared skills to invest-* and add bootstrap helpers
+
+**What shipped:** Reversed Session 3's "keep k2b-* names for shared skills" call and renamed all four to invest-* (research, scheduler, ship, vault-writer) so K2Bi now has zero K2B-identity carryover in its skill namespace. Three new bootstrap helpers added: `invest-feedback` (/learn, /error, /request capture), `invest-sync` (K2Bi-side /sync skill that wraps deploy-to-mini.sh), `invest-usage-tracker` (skill invocation logger + threshold triggers used by session-start hook and fellow skills). Landed `.claude/settings.json` with K2Bi's Bash + MCP permission allowlist (ssh macmini, rsync, pm2, sqlite3, curl, NBLM CLI, MCP servers). Cleaned up cross-refs in invest-journal, invest-weave, and CLAUDE.md to the new names. Skill count: 11 → 14, all invest-* prefix.
+
+**Codex review:** 3 findings, all addressed:
+- P1 — invest-vault-writer raw-note handoff table still said "Trigger k2b-compile" (5 rows). Fixed inline to `invest-compile`.
+- P1 — invest-research `/research deep` default source gathering still references `~/Projects/K2B/scripts/yt-search.py` + `mcp__perplexity-ask__perplexity_ask` (neither ships with K2Bi). Added explicit `[TODO Phase 2 port]` marker + inline "Dangling in K2Bi — Phase 2 port" annotations on the two dangling bullets; documented the supported-today path (`/research <topic>`, `/research <url>`, `/research deep <topic> --sources <url>...`). Mirrors Session 3's earlier P1 finding carried to Phase 2.
+- P2 — invest-sync's dry-run fallback block probed `K2B_ARCHITECTURE.md` + `k2b-remote/` + `k2b-dashboard/` (none ship in K2Bi; rsync would error). Replaced with an existence-guarded loop over CLAUDE.md/DEVLOG.md/README.md and a commented-out Phase 4+ template for `invest-remote/`.
+
+**Feature status change:** shipped as `--no-feature` (no K2Bi `wiki/concepts/` lane structure yet; tracked in `wiki/planning/`).
+
+**Follow-ups (Phase 2, non-gating):**
+- Port `yt-search.py` to K2Bi with its own OAuth credentials + quota, or swap in a K2Bi-compatible alternative, so `/research deep` works without `--sources`
+- Decide Perplexity MCP vs alternative source broadener for `/research deep` default source gathering
+- Invest-scheduler still references K2B's shared `k2b-remote` scheduler service on the Mini — that's intentional (cross-project daemon, not forked), but the name should be pinned as "shared dependency" in the skill body if confusion comes up again
+
+**Key decisions:**
+- Rename reversal (Session 3 kept original names; this session flipped them): the reason Session 3 kept them was "easier to diff against K2B." In practice that diff happens rarely and the uniform `invest-*` set is easier for Keith's muscle memory + slash-command autocomplete (both Claude Code terminal and Claude Desktop). Trade-off accepted.
+- Three new helpers (feedback, sync, usage-tracker) were added directly into K2Bi rather than ported from K2B — K2B's equivalents (if any) are less mature. K2Bi takes the forward position here.
+
+---
+
 ## 2026-04-18 -- Phase 1 Closure Doc Bundle
 
 **Commit:** `56719c5` docs: point CLAUDE.md at live planning docs in K2Bi-Vault
