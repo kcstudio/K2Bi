@@ -252,6 +252,17 @@ Codex (`/codex:` plugin) is mandatory at two checkpoints: **plan review** before
 
 **Phase 6 additional gate:** mandatory Codex adversarial review of the entire execution layer + validators + decision journal schema before any live capital. See Keith's Phase 6 checklist (in planning archive).
 
+### When Codex is unavailable -- MiniMax M2.7 backup
+
+If Codex CLI is unavailable (quota exhausted, auth error, plugin missing, WebSocket wedged, network hard-fail), the approved backup is `scripts/minimax-review.sh`. Same adversarial-review prompt as Codex (vendored locally), different vendor (MiniMax M2.7 on `api.minimaxi.com`), single-shot, ~90s, ~$0.06 per call, no subscription quota. Cross-vendor adversarial property is preserved.
+
+- **Invocation:** `./scripts/minimax-review.sh` (working-tree scope; `--json` for machine-parseable; `--focus "<text>"` to steer). Output matches Codex's `review-output.schema.json`.
+- **Severity translation:** `critical` ≈ P0, `high` ≈ P1, `medium` ≈ P2, `low` ≈ P3. Apply architect stop-rules written against Codex's P-taxonomy using this mapping.
+- **Does NOT remove the `/ship --skip-codex <reason>` requirement.** `scripts/minimax-review.sh` is a standalone tool; `/ship` still bypasses the Codex gate via the existing flag. When a MiniMax review cleared the diff, use reason string `codex-unavailable-minimax-verified` (or a more specific sub-case like `codex-quota-exhausted-minimax-verified`) so the audit trail reflects that a cross-vendor review ran.
+- **Audit trail:** raw response + parsed JSON + prompt + token usage archived to `.minimax-reviews/` (gitignored). Reference the archive file path in the commit footer or feature note when the gate path was MiniMax.
+- **Coverage is Checkpoint 2 only.** `scripts/minimax-review.sh` covers pre-commit (working-tree) review. Plan review (Checkpoint 1) remains Codex-only. If both Checkpoint 1 needs running AND Codex is unavailable, defer the ship until Codex is back rather than shipping unreviewed at the plan level.
+- **Not primary; stays fallback.** Codex is still the default reviewer when available. Shadow-run comparison data (multiple rounds reviewed by both) is the prerequisite for any future promotion to peer or primary reviewer.
+
 ## Session Discipline
 
 At the END of every Claude Code session in this repo, before closing, run `/ship`. The sync obligation must resolve to either "done now" or "entry recorded in `.pending-sync/` mailbox for later". If `/ship` is genuinely unavailable in the current harness, the ship-skill body documents the manual fallback.

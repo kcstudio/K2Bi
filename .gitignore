@@ -37,3 +37,6 @@ build/
 # Claude Code runtime artifacts (local-only state, never committed)
 .claude/*.lock
 .claude/settings.local.json
+
+# MiniMax review archive (local-only -- raw responses, prompts, usage log)
+.minimax-reviews/
