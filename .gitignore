@@ -33,3 +33,7 @@ ibkr_credentials*
 dist/
 build/
 *.log
+
+# Claude Code runtime artifacts (local-only state, never committed)
+.claude/*.lock
+.claude/settings.local.json
