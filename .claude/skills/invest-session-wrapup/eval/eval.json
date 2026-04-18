@@ -1,7 +1,7 @@
 {
   "tests": [
     {
-      "prompt": "Summarize this conversation: We discussed migrating the legacy IBKR trade history into K2B-Investment. Decided to skip historical trades older than 24 months. Keith will export the executions CSV this week. We also realized the position note template needs an 'entry-thesis' field in frontmatter. Action: update the template, then process the backlog of 5 earnings call transcripts from last week.",
+      "prompt": "Summarize this conversation: We discussed migrating the legacy IBKR trade history into K2Bi. Decided to skip historical trades older than 24 months. Keith will export the executions CSV this week. We also realized the position note template needs an 'entry-thesis' field in frontmatter. Action: update the template, then process the backlog of 5 earnings call transcripts from last week.",
       "expected_output": "A concise wrap-up note saved to raw/research/",
       "assertions": [
         "Does the output include separate Decisions, Action Items, and Insights sections?",

@@ -1,11 +1,11 @@
 ---
 name: invest-autoresearch
-description: Run the Karpathy autoresearch self-improvement loop on K2B-Investment skills. Iteratively improves a target SKILL.md using binary assertions, git-based memory, and the commit-before-test pattern. Use when Keith says /autoresearch, "improve this skill", "run the loop", "optimize skill", "self-improve", or wants to iteratively enhance any K2B-Investment skill's output quality.
+description: Run the Karpathy autoresearch self-improvement loop on K2Bi skills. Iteratively improves a target SKILL.md using binary assertions, git-based memory, and the commit-before-test pattern. Use when Keith says /autoresearch, "improve this skill", "run the loop", "optimize skill", "self-improve", or wants to iteratively enhance any K2Bi skill's output quality.
 ---
 
 # Invest Autoresearch
 
-The Karpathy loop adapted for K2B-Investment skills. Iteratively improves a target file using binary assertions and git-based memory.
+The Karpathy loop adapted for K2Bi skills. Iteratively improves a target file using binary assertions and git-based memory.
 
 ## Commands
 
@@ -15,8 +15,8 @@ The Karpathy loop adapted for K2B-Investment skills. Iteratively improves a targ
 
 ## Vault & Skill Paths
 
-- Vault: `~/Projects/K2B-Investment-Vault`
-- Skills: `~/Projects/K2B-Investment/.claude/skills/`
+- Vault: `~/Projects/K2Bi-Vault`
+- Skills: `~/Projects/K2Bi/.claude/skills/`
 - Each skill's eval infrastructure: `.claude/skills/invest-[name]/eval/`
 
 ## The Loop Protocol
@@ -219,7 +219,7 @@ Read from each skill's `eval/results.tsv` to populate this table.
 
 After completing the main task, log this skill invocation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-autoresearch\t$(echo $RANDOM | md5sum | head -c 8)\tran autoresearch on SKILL" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-autoresearch\t$(echo $RANDOM | md5sum | head -c 8)\tran autoresearch on SKILL" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Post-Loop Handoff

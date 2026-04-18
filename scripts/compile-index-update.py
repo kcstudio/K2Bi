@@ -47,7 +47,7 @@ from datetime import date
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VAULT_ROOT = os.environ.get(
     "K2BI_VAULT_ROOT",
-    os.path.expanduser("~/Projects/K2B-Investment-Vault"),
+    os.path.expanduser("~/Projects/K2Bi-Vault"),
 )
 WIKI_LOG_APPEND = os.environ.get(
     "K2BI_WIKI_LOG_APPEND",

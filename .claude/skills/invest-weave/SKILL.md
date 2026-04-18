@@ -1,6 +1,6 @@
 ---
 name: invest-weave
-description: Background cross-link weaver -- runs MiniMax M2.7 to find missing links between K2B-Investment wiki pages (tickers, sectors, strategies, macro-themes, playbooks) and drops proposals into the review queue. Use when Keith says /weave, "run weave", "find missing links", "propose cross-links", or when the scheduled cron task fires (Phase 4+).
+description: Background cross-link weaver -- runs MiniMax M2.7 to find missing links between K2Bi wiki pages (tickers, sectors, strategies, macro-themes, playbooks) and drops proposals into the review queue. Use when Keith says /weave, "run weave", "find missing links", "propose cross-links", or when the scheduled cron task fires (Phase 4+).
 triggers:
   - /weave
   - weave run
@@ -12,7 +12,7 @@ scope: project
 
 # invest-weave -- Background Cross-Link Weaver
 
-Weaves the K2B-Investment wiki graph tighter over time by finding semantically related pages (tickers, sectors, strategies, macro-themes, playbooks, regimes, positions) that don't cross-link, proposing the top candidates for Keith's approval, and applying approved links as single-sided `related:` frontmatter entries.
+Weaves the K2Bi wiki graph tighter over time by finding semantically related pages (tickers, sectors, strategies, macro-themes, playbooks, regimes, positions) that don't cross-link, proposing the top candidates for Keith's approval, and applying approved links as single-sided `related:` frontmatter entries.
 
 ## Core Concept
 
@@ -47,14 +47,14 @@ This enables weave to gradually earn autonomy. First 10+ proposals are always ma
 
 | Path | Role |
 |---|---|
-| `~/Projects/K2B-Investment/scripts/invest-weave.sh` | Orchestrator script (called by all commands) |
-| `~/Projects/K2B-Investment/scripts/minimax-weave.sh` | MiniMax M2.7 API wrapper with strict JSON schema validation **(TODO Phase 2: not yet ported -- this path is the target. Until the helper script lands, `/weave` cannot run end-to-end.)** |
-| `~/Projects/K2B-Investment-Vault/wiki/context/crosslink-ledger.jsonl` | Proposal memory (applied/rejected/pending/deferred) |
-| `~/Projects/K2B-Investment-Vault/wiki/context/weave-metrics.jsonl` | Per-run statistics |
-| `~/Projects/K2B-Investment-Vault/wiki/context/weave-errors.log` | Quarantine for malformed MiniMax responses |
-| `~/Projects/K2B-Investment-Vault/wiki/.weave.lock` | Concurrency guard (PID + timestamp, 30-min TTL) |
-| `~/Projects/K2B-Investment-Vault/review/contradictions/crosslinks_YYYY-MM-DD_HHMM.md` | Per-run digest note for review |
-| `~/Projects/K2B-Investment-Vault/wiki/log.md` | Append-only run log (shared with compile/lint) |
+| `~/Projects/K2Bi/scripts/invest-weave.sh` | Orchestrator script (called by all commands) |
+| `~/Projects/K2Bi/scripts/minimax-weave.sh` | MiniMax M2.7 API wrapper with strict JSON schema validation **(TODO Phase 2: not yet ported -- this path is the target. Until the helper script lands, `/weave` cannot run end-to-end.)** |
+| `~/Projects/K2Bi-Vault/wiki/context/crosslink-ledger.jsonl` | Proposal memory (applied/rejected/pending/deferred) |
+| `~/Projects/K2Bi-Vault/wiki/context/weave-metrics.jsonl` | Per-run statistics |
+| `~/Projects/K2Bi-Vault/wiki/context/weave-errors.log` | Quarantine for malformed MiniMax responses |
+| `~/Projects/K2Bi-Vault/wiki/.weave.lock` | Concurrency guard (PID + timestamp, 30-min TTL) |
+| `~/Projects/K2Bi-Vault/review/contradictions/crosslinks_YYYY-MM-DD_HHMM.md` | Per-run digest note for review |
+| `~/Projects/K2Bi-Vault/wiki/log.md` | Append-only run log (shared with compile/lint) |
 
 ## Scope (what gets scanned)
 
@@ -147,7 +147,7 @@ Read last 5 rows from `weave-metrics.jsonl`, count ledger entries by status, com
 
 ## Integration with `/review`
 
-K2B-Investment review processes `type: crosslink-digest` items in `review/contradictions/` and delegates processing to `/weave apply <file>` instead of running its normal promote/archive/delete flow.
+K2Bi review processes `type: crosslink-digest` items in `review/contradictions/` and delegates processing to `/weave apply <file>` instead of running its normal promote/archive/delete flow.
 
 ## Integration with other skills
 
@@ -162,7 +162,7 @@ K2B-Investment review processes `type: crosslink-digest` items in `review/contra
 Phase 4+ target registration (via `/schedule` / k2b-remote CLI):
 
 ```bash
-cd ~/Projects/K2B-Investment/k2b-remote && node dist/schedule-cli.js create \
+cd ~/Projects/K2Bi/k2b-remote && node dist/schedule-cli.js create \
   "run /weave" \
   "0 20 * * 0,2,4" \
   8394008217
@@ -219,5 +219,5 @@ This means: no reader ever sees a partial file. Worst case during a concurrent c
 
 After completing the main task, log this skill invocation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-weave\t$(echo $RANDOM | md5sum | head -c 8)\tweave run: N proposals, M applied" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-weave\t$(echo $RANDOM | md5sum | head -c 8)\tweave run: N proposals, M applied" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```

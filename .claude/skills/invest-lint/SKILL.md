@@ -1,6 +1,6 @@
 ---
 name: invest-lint
-description: K2B-Investment vault health maintenance -- find and fix structural issues, keep indexes current, detect orphans and stale content across the trading research vault.
+description: K2Bi vault health maintenance -- find and fix structural issues, keep indexes current, detect orphans and stale content across the trading research vault.
 triggers:
   - /lint
   - vault health check
@@ -114,12 +114,12 @@ Check wiki/ pages for inbound link count:
 Catches the failure mode where `active_rules.md` drifts out of sync with the vault after refactors.
 
 Steps:
-1. Read `K2B-Investment-Vault/System/memory/active_rules.md`.
+1. Read `K2Bi-Vault/System/memory/active_rules.md`.
 2. Parse the `Last promoted:` date from the header.
 3. Extract all vault-relative path references from rule bodies:
    - Backtick-wrapped paths (`` `wiki/insights/` ``, `` `raw/earnings/` ``)
    - Bare folder references in prose
-4. For each extracted path, check if it resolves in `K2B-Investment-Vault/`.
+4. For each extracted path, check if it resolves in `K2Bi-Vault/`.
 5. Flag:
    - **Dead path**: rule references a folder that does not exist (hard error)
    - **Stale promotion**: `Last promoted:` date is older than 30 days (soft warning)
@@ -137,7 +137,7 @@ Steps:
 MiniMax M2.7-powered semantic check -- only runs when explicitly requested (`/lint deep`):
 
 ```bash
-~/Projects/K2B-Investment/scripts/minimax-lint-deep.sh [domain]
+~/Projects/K2Bi/scripts/minimax-lint-deep.sh [domain]
 ```
 
 - Runs on MiniMax M2.7 (not Opus) -- cheap (~$0.02-0.05 per run)
@@ -157,7 +157,7 @@ MiniMax M2.7-powered semantic check -- only runs when explicitly requested (`/li
 
 Every lint run produces two artifacts:
 1. **Inline report** shown to Keith (for manual runs)
-2. **Structured artifact** at `~/Projects/K2B-Investment-Vault/wiki/context/lint-report.md` -- overwritten each run, consumed by `/improve` and other skills
+2. **Structured artifact** at `~/Projects/K2Bi-Vault/wiki/context/lint-report.md` -- overwritten each run, consumed by `/improve` and other skills
 
 ### Inline Report Format
 
@@ -266,5 +266,5 @@ When run manually (`/lint`):
 
 After completing the main task:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-lint\t$(echo $RANDOM | md5sum | head -c 8)\tlint: MODE SUMMARY" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-lint\t$(echo $RANDOM | md5sum | head -c 8)\tlint: MODE SUMMARY" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```

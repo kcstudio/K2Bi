@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# K2B-Investment pre-commit hook (ported from K2B Tier 1 fix #2 + #8).
+# K2Bi pre-commit hook (ported from K2B Tier 1 fix #2 + #8).
 #
 # Check 1: block direct >> wiki/log.md append.
 #   Single writer is scripts/wiki-log-append.sh.

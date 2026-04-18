@@ -1,6 +1,6 @@
 ---
 name: invest-compile
-description: Compile raw sources into wiki knowledge pages -- reads raw captures, identifies affected wiki pages, shows Keith a summary, updates wiki on approval. The knowledge compilation engine that turns filing into digestion for K2B-Investment.
+description: Compile raw sources into wiki knowledge pages -- reads raw captures, identifies affected wiki pages, shows Keith a summary, updates wiki on approval. The knowledge compilation engine that turns filing into digestion for K2Bi.
 triggers:
   - /compile
   - compile this
@@ -27,11 +27,11 @@ Reads raw source captures and compiles them into wiki knowledge pages. Based on 
 
 ## Paths
 
-- Raw sources: `~/Projects/K2B-Investment-Vault/raw/` (news/, filings/, analysis/, earnings/, macro/, youtube/, research/)
-- Wiki output: `~/Projects/K2B-Investment-Vault/wiki/` (tickers/, sectors/, macro-themes/, strategies/, positions/, watchlist/, playbooks/, regimes/, reference/, insights/, context/)
-- Master index: `~/Projects/K2B-Investment-Vault/wiki/index.md`
-- Activity log: `~/Projects/K2B-Investment-Vault/wiki/log.md`
-- Review queue: `~/Projects/K2B-Investment-Vault/review/` (trade-ideas/, strategy-approvals/, alerts/, contradictions/)
+- Raw sources: `~/Projects/K2Bi-Vault/raw/` (news/, filings/, analysis/, earnings/, macro/, youtube/, research/)
+- Wiki output: `~/Projects/K2Bi-Vault/wiki/` (tickers/, sectors/, macro-themes/, strategies/, positions/, watchlist/, playbooks/, regimes/, reference/, insights/, context/)
+- Master index: `~/Projects/K2Bi-Vault/wiki/index.md`
+- Activity log: `~/Projects/K2Bi-Vault/wiki/log.md`
+- Review queue: `~/Projects/K2Bi-Vault/review/` (trade-ideas/, strategy-approvals/, alerts/, contradictions/)
 
 ## Commander/Worker Architecture
 
@@ -57,10 +57,10 @@ Before creating or updating ANY wiki page, check the policy ledger:
 
 ### 1. Call MiniMax Compile Worker
 
-> **TODO Phase 2: invest-compile MiniMax worker not yet ported, this section describes the target behavior.** The bash script `~/Projects/K2B-Investment/scripts/minimax-compile.sh` does NOT yet exist for K2B-Investment. Until Phase 2 ports it, run the extraction step inline within Opus by reading the raw source plus relevant indexes and generating the same structured JSON shape directly.
+> **TODO Phase 2: invest-compile MiniMax worker not yet ported, this section describes the target behavior.** The bash script `~/Projects/K2Bi/scripts/minimax-compile.sh` does NOT yet exist for K2Bi. Until Phase 2 ports it, run the extraction step inline within Opus by reading the raw source plus relevant indexes and generating the same structured JSON shape directly.
 
 ```bash
-~/Projects/K2B-Investment/scripts/minimax-compile.sh "<raw-source-path>"
+~/Projects/K2Bi/scripts/minimax-compile.sh "<raw-source-path>"
 ```
 
 The script (target behavior):
@@ -128,7 +128,7 @@ Opus applies changes from the MiniMax JSON output:
 Call the atomic 4-index helper. This is the ONLY permitted way to update any index during a compile run. Do NOT hand-edit `wiki/<sub>/index.md`, `raw/<sub>/index.md`, `wiki/index.md`, or append to `wiki/log.md` directly.
 
 ```bash
-~/Projects/K2B-Investment/scripts/compile-index-update.py \
+~/Projects/K2Bi/scripts/compile-index-update.py \
   "<raw-source-path>" \
   "<comma-separated-updated-pages>" \
   "<comma-separated-created-pages>"
@@ -232,5 +232,5 @@ This tracks provenance -- which raw sources contributed to this wiki page.
 
 After completing compilation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-compile\t$(echo $RANDOM | md5sum | head -c 8)\tcompiled: SOURCE_FILE -> N wiki pages" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-compile\t$(echo $RANDOM | md5sum | head -c 8)\tcompiled: SOURCE_FILE -> N wiki pages" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```

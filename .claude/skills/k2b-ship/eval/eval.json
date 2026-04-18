@@ -1,0 +1,21 @@
+{
+  "skill": "k2b-ship",
+  "runner": "none (scenario markdown only; read by a human or MiniMax M2.7 when behavioral regression is suspected)",
+  "cases": [
+    {
+      "name": "auto-promote-3x",
+      "file": "cases/auto-promote-3x.md",
+      "tags": ["fix-3", "step-0", "auto-promote"]
+    },
+    {
+      "name": "auto-promote-cap-exceeded",
+      "file": "cases/auto-promote-cap-exceeded.md",
+      "tags": ["fix-3", "step-0", "lru-demotion"]
+    },
+    {
+      "name": "auto-promote-rejected",
+      "file": "cases/auto-promote-rejected.md",
+      "tags": ["fix-3", "step-0", "auto-promote", "rejected"]
+    }
+  ]
+}

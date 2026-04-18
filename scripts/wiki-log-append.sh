@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single writer for ~/Projects/K2B-Investment-Vault/wiki/log.md
+# Single writer for ~/Projects/K2Bi-Vault/wiki/log.md
 # Usage: wiki-log-append.sh <skill> <action> <summary>
 # Example: wiki-log-append.sh /compile raw/research/foo.md "updated 3 wiki pages"
 #
@@ -14,7 +14,7 @@ SKILL="${1:?wiki-log-append: skill arg required}"
 ACTION="${2:?wiki-log-append: action arg required}"
 SUMMARY="${3:?wiki-log-append: summary arg required}"
 
-LOG="${K2BI_WIKI_LOG:-$HOME/Projects/K2B-Investment-Vault/wiki/log.md}"
+LOG="${K2BI_WIKI_LOG:-$HOME/Projects/K2Bi-Vault/wiki/log.md}"
 LOCK="${K2BI_WIKI_LOG_LOCK:-/tmp/k2bi-wiki-log.lock}"
 TS="$(date '+%Y-%m-%d %H:%M')"
 LINE="${TS}  ${SKILL}  ${ACTION}  ${SUMMARY}"

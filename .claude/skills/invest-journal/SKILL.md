@@ -7,11 +7,11 @@ description: Start or end the trading day -- compiles today's captures from vaul
 
 ## Core Model
 
-`/journal` is a **multi-turn conversation**, not a one-shot generator. K2B-Investment harvests what it can find, presents a draft, asks about gaps, and Keith refines until it's right.
+`/journal` is a **multi-turn conversation**, not a one-shot generator. K2Bi harvests what it can find, presents a draft, asks about gaps, and Keith refines until it's right.
 
 ## Vault Path
 
-`~/Projects/K2B-Investment-Vault`
+`~/Projects/K2Bi-Vault`
 
 ## Workflow
 
@@ -21,7 +21,7 @@ Gather from all available sources in parallel:
 
 **a) Vault notes created or modified today:**
 ```bash
-find ~/Projects/K2B-Investment-Vault/{review,raw,wiki,Daily} -name "*.md" -newer ~/Projects/K2B-Investment-Vault/Daily/$(date -v-1d +%Y-%m-%d).md 2>/dev/null
+find ~/Projects/K2Bi-Vault/{review,raw,wiki,Daily} -name "*.md" -newer ~/Projects/K2Bi-Vault/Daily/$(date -v-1d +%Y-%m-%d).md 2>/dev/null
 ```
 Or glob for today's date prefix in filenames.
 
@@ -30,7 +30,7 @@ Check for today's research / session-wrapup notes in:
 - `raw/research/` for any session wrap-ups, research extracts, or insights saved earlier today
 
 **c) Yesterday's journal entry:**
-Read `~/Projects/K2B-Investment-Vault/Daily/$(date -v-1d +%Y-%m-%d).md` for open loops to carry forward.
+Read `~/Projects/K2Bi-Vault/Daily/$(date -v-1d +%Y-%m-%d).md` for open loops to carry forward.
 
 ### Step 2: Classify and Draft
 
@@ -48,7 +48,7 @@ Rules:
 - A quiet trading day = a short note. That's fine.
 - Use bullet points, not paragraphs.
 - Don't hallucinate details. If a capture is vague, include what's there and ask.
-- Don't generate insights Keith didn't express. Use `> [!robot] K2B analysis` callout if surfacing a K2B-Investment-originated connection.
+- Don't generate insights Keith didn't express. Use `> [!robot] K2B analysis` callout if surfacing a K2Bi-originated connection.
 
 ### Step 3: Present Draft and Ask Questions
 
@@ -71,7 +71,7 @@ Based on Keith's responses:
 
 ### Step 5: Save
 
-- Save to `~/Projects/K2B-Investment-Vault/Daily/YYYY-MM-DD.md` (auto-promote -- Daily/ notes never go through review)
+- Save to `~/Projects/K2Bi-Vault/Daily/YYYY-MM-DD.md` (auto-promote -- Daily/ notes never go through review)
 - If the file already exists (morning + evening use), **merge** new content into existing note rather than overwriting
 - Use the k2b-vault-writer skill for the actual write
 - After saving, append via helper:
@@ -93,11 +93,11 @@ Morning mode is brief. Don't prompt for a full trading plan.
 
 ## File Convention
 
-Journal entries: `~/Projects/K2B-Investment-Vault/Daily/YYYY-MM-DD.md`
+Journal entries: `~/Projects/K2Bi-Vault/Daily/YYYY-MM-DD.md`
 
 ## Template
 
-Use the daily-note template from `~/Projects/K2B-Investment-Vault/Templates/daily-note.md` for frontmatter structure (if it exists). Sections are dynamic based on what has content.
+Use the daily-note template from `~/Projects/K2Bi-Vault/Templates/daily-note.md` for frontmatter structure (if it exists). Sections are dynamic based on what has content.
 
 ## Frontmatter
 
@@ -129,7 +129,7 @@ Before linking, glob the vault to confirm the target exists. If a ticker, strate
 
 After completing the main task:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-journal\t$(echo $RANDOM | md5sum | head -c 8)\tcompiled journal entry for YYYY-MM-DD" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-journal\t$(echo $RANDOM | md5sum | head -c 8)\tcompiled journal entry for YYYY-MM-DD" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Vault Awareness
@@ -146,7 +146,7 @@ Once Phase 4 ships, daily journal entries also include **P&L review**, **slippag
 ## Rules
 
 - No em dashes. No AI cliches. No sycophancy.
-- `origin: keith` always -- journal entries are Keith's own capture, K2B-Investment just organizes them.
+- `origin: keith` always -- journal entries are Keith's own capture, K2Bi just organizes them.
 - Keep it concise. Bullet points over paragraphs.
 - A short journal entry is better than a padded one.
 - The conversation IS the skill. Don't rush to save -- iterate until Keith's satisfied.

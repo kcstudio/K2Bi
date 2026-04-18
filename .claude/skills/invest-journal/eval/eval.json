@@ -10,7 +10,7 @@
         "Does it classify the TSM filing read under Theses & Research?",
         "Does it classify the PLTR setup under Watchlist Activity?",
         "Does it carry forward at least one open loop from yesterday?",
-        "Does K2B-Investment ask at least one clarifying question about the captures before saving?",
+        "Does K2Bi ask at least one clarifying question about the captures before saving?",
         "Are empty sections omitted (no Insights section if no insight was expressed)?",
         "Does it treat the Powell macro note as Market Recap rather than a position trade?"
       ]
@@ -23,7 +23,7 @@
         "Does it carry forward the MSFT 10-Q open loop?",
         "Does it omit Positions / Trades section (no position activity)?",
         "Does it omit Watchlist Activity section (no watchlist captures)?",
-        "Does K2B-Investment ask something like 'quiet trading day -- did anything actually move in the book?' or similar?",
+        "Does K2Bi ask something like 'quiet trading day -- did anything actually move in the book?' or similar?",
         "Does each section use bullet points, not paragraphs?"
       ]
     },

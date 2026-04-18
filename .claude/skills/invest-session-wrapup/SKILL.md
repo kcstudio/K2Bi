@@ -1,13 +1,13 @@
 ---
 name: invest-session-wrapup
-description: Capture a conversation summary -- extracts decisions, action items, and insights into a K2B-Investment vault note. Use when Keith says /session-wrapup, "summarize this", "capture this", "save this conversation", or wants to save the key points from a research/trading session.
+description: Capture a conversation summary -- extracts decisions, action items, and insights into a K2Bi vault note. Use when Keith says /session-wrapup, "summarize this", "capture this", "save this conversation", or wants to save the key points from a research/trading session.
 ---
 
 # Invest Session Wrap-Up Capture
 
 ## Vault Path
 
-`~/Projects/K2B-Investment-Vault`
+`~/Projects/K2Bi-Vault`
 
 ## Workflow
 
@@ -16,7 +16,7 @@ description: Capture a conversation summary -- extracts decisions, action items,
    - **Summary**: 3-5 bullet points of what was discussed/accomplished
    - **Decisions**: Any choices made (e.g., entry/exit, sizing, thesis change, watchlist add/remove)
    - **Action Items**: Next steps with context
-   - **Insights**: Technical/operational things learned during the session (e.g., "IBKR FX conversion settles T+2", "earnings call transcript lag is ~6h on Seeking Alpha"). These inform K2B-Investment's behavior and future sessions.
+   - **Insights**: Technical/operational things learned during the session (e.g., "IBKR FX conversion settles T+2", "earnings call transcript lag is ~6h on Seeking Alpha"). These inform K2Bi's behavior and future sessions.
 3. Save the wrap-up to `raw/research/YYYY-MM-DD_session-wrapup-topic.md`, then trigger invest-compile:
    - invest-compile reads the raw wrap-up + wiki/index.md
    - Shows Keith a summary of wiki pages to update (insights to wiki/insights/, action items to ticker/strategy/position pages)
@@ -63,13 +63,13 @@ When saving a wrap-up note, always add `[[wiki links]]`:
 
 After completing the main task, log this skill invocation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-session-wrapup\t$(echo $RANDOM | md5sum | head -c 8)\tcaptured wrap-up for conversation" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-session-wrapup\t$(echo $RANDOM | md5sum | head -c 8)\tcaptured wrap-up for conversation" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Section Guidance
 
 ### Insights
-Insights = what K2B-Investment learned (technical, operational, process). They inform future behavior. Examples:
+Insights = what K2Bi learned (technical, operational, process). They inform future behavior. Examples:
 - "IBKR API requires --data-urlencode for symbols with special chars"
 - "Polygon free tier rate-limits at 5 req/min, switch to paid tier above that"
 - "Earnings call sentiment scoring drifts when transcript has speaker mis-attribution"

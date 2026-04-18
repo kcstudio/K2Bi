@@ -1,23 +1,23 @@
 ---
 name: invest-observer
-description: Harvest implicit preference signals from K2B-Investment vault behavior and synthesize a preference profile that other skills reference. This skill should be used when Keith says /observe, "what have you noticed", "check preferences", "review feedback", or on session-start/scheduled runs. It reads observer-loop analysis, review queue outcomes (trade-ideas, strategy-approvals, alerts, contradictions), revision patterns, and adoption rates to learn what Keith actually wants in his trading workflow without him having to say it explicitly.
+description: Harvest implicit preference signals from K2Bi vault behavior and synthesize a preference profile that other skills reference. This skill should be used when Keith says /observe, "what have you noticed", "check preferences", "review feedback", or on session-start/scheduled runs. It reads observer-loop analysis, review queue outcomes (trade-ideas, strategy-approvals, alerts, contradictions), revision patterns, and adoption rates to learn what Keith actually wants in his trading workflow without him having to say it explicitly.
 ---
 
 # Invest Observer
 
-Harvest implicit preference signals from Keith's K2B-Investment vault behavior. Synthesize patterns into a preference profile that other invest-* skills reference before producing trade ideas, alerts, strategy approvals, and thesis updates.
+Harvest implicit preference signals from Keith's K2Bi vault behavior. Synthesize patterns into a preference profile that other invest-* skills reference before producing trade ideas, alerts, strategy approvals, and thesis updates.
 
 ## Vault & Skill Paths
 
-- Vault: `~/Projects/K2B-Investment-Vault`
-- Preference signals log: `~/Projects/K2B-Investment-Vault/wiki/context/preference-signals.jsonl`
-- Preference profile: `~/Projects/K2B-Investment-Vault/wiki/context/preference-profile.md`
-- Skills: `~/Projects/K2B-Investment/.claude/skills/`
+- Vault: `~/Projects/K2Bi-Vault`
+- Preference signals log: `~/Projects/K2Bi-Vault/wiki/context/preference-signals.jsonl`
+- Preference profile: `~/Projects/K2Bi-Vault/wiki/context/preference-profile.md`
+- Skills: `~/Projects/K2Bi/.claude/skills/`
 - Learnings: `~/.claude/projects/*/memory/self_improve_learnings.md`
 
 ## Vault Query Tools
 
-- **Dataview DQL** (structured frontmatter queries): `~/Projects/K2B-Investment/scripts/vault-query.sh dql '<TABLE query>'`
+- **Dataview DQL** (structured frontmatter queries): `~/Projects/K2Bi/scripts/vault-query.sh dql '<TABLE query>'`
 - **Full-text search**: `mcp__obsidian__search` MCP tool or `vault-query.sh search "<term>"`
 - **Read file**: `mcp__obsidian__get_file_contents` or Read tool
 - **List files**: `mcp__obsidian__list_files_in_dir`
@@ -47,7 +47,7 @@ Then check if this is the first run (no preference-profile.md exists). If so, ru
 
 ### 1a-filter. Filter out processed signals (APPEND-cutoff reader)
 
-Read `~/Projects/K2B-Investment-Vault/wiki/context/preference-signals.jsonl` in **two passes** (signal-processed lines appear after the original signal, so a single top-to-bottom pass would surface signals before seeing their processed marker):
+Read `~/Projects/K2Bi-Vault/wiki/context/preference-signals.jsonl` in **two passes** (signal-processed lines appear after the original signal, so a single top-to-bottom pass would surface signals before seeing their processed marker):
 
 **Pass 1 -- collect filter state:** Walk the entire file. Track:
 1. `cutoff_line` -- the line number of the `type: "grandfather-cutoff"` entry (0 if absent). All lines before it are grandfathered.
@@ -131,7 +131,7 @@ Assign confidence based on:
 
 ## Phase 3: Synthesize Preference Profile
 
-Write to `~/Projects/K2B-Investment-Vault/wiki/context/preference-profile.md`:
+Write to `~/Projects/K2Bi-Vault/wiki/context/preference-profile.md`:
 
 ```yaml
 ---
@@ -146,7 +146,7 @@ up: "[[index]]"
 Body structure:
 
 ```markdown
-# K2B-Investment Preference Profile
+# K2Bi Preference Profile
 
 Last updated: YYYY-MM-DD
 Based on: N feedback signals over N days
@@ -252,17 +252,17 @@ On first `/observe`, if preference-signals.jsonl is empty or doesn't exist:
 
 1. Query archived notes via DQL:
    ```bash
-   ~/Projects/K2B-Investment/scripts/vault-query.sh dql 'TABLE type, origin, date FROM "Archive"'
+   ~/Projects/K2Bi/scripts/vault-query.sh dql 'TABLE type, origin, date FROM "Archive"'
    ```
    Archived items are implicit "not valuable enough to keep" signals.
 2. Query approved trade ideas and adopted strategies:
    ```bash
-   ~/Projects/K2B-Investment/scripts/vault-query.sh dql 'TABLE type, origin, status FROM "wiki/positions" OR FROM "wiki/strategies"'
+   ~/Projects/K2Bi/scripts/vault-query.sh dql 'TABLE type, origin, status FROM "wiki/positions" OR FROM "wiki/strategies"'
    ```
    These are implicit "this was valuable" signals.
 3. Query stale review items across all four queues:
    ```bash
-   ~/Projects/K2B-Investment/scripts/vault-query.sh dql 'TABLE date, review-action AS "action", file.folder AS "queue" FROM "review" WHERE date <= date(today) - dur(7 days)'
+   ~/Projects/K2Bi/scripts/vault-query.sh dql 'TABLE date, review-action AS "action", file.folder AS "queue" FROM "review" WHERE date <= date(today) - dur(7 days)'
    ```
    Items older than 7 days with no review-action = low urgency signal. The queue field shows which subfolder (trade-ideas / strategy-approvals / alerts / contradictions) is accumulating staleness.
 4. Generate an initial preference-signals.jsonl from this retrospective data
@@ -304,12 +304,12 @@ See Phase 3 above for full format. This is a vault note with frontmatter, readab
 
 ## Background Observer Loop
 
-> **Phase 4 deferral.** K2B-Investment Mac Mini provisioning happens at Phase 4. Until then, observer runs manually via `/observe`. The pm2 background loop documented below is the Phase 4 target. For Phase 1-3, ignore the pm2 details and treat all signal harvesting as on-demand from the manual `/observe` command.
+> **Phase 4 deferral.** K2Bi Mac Mini provisioning happens at Phase 4. Until then, observer runs manually via `/observe`. The pm2 background loop documented below is the Phase 4 target. For Phase 1-3, ignore the pm2 details and treat all signal harvesting as on-demand from the manual `/observe` command.
 
-K2B-Investment will run a background observer on Mac Mini (`scripts/observer-loop.sh`, managed by pm2 as `invest-observer`). Once Phase 4 ships, this loop:
+K2Bi will run a background observer on Mac Mini (`scripts/observer-loop.sh`, managed by pm2 as `invest-observer`). Once Phase 4 ships, this loop:
 
 1. Captures observations via a Stop hook (`scripts/hooks/stop-observe.sh`) after every Claude response
-2. When 20+ observations accumulate, calls MiniMax-M2.7 API to analyze patterns _(TODO Phase 2: minimax helpers not yet ported -- the calling script `~/Projects/K2B-Investment/scripts/minimax-observer-analyze.sh` is the planned target)_
+2. When 20+ observations accumulate, calls MiniMax-M2.7 API to analyze patterns _(TODO Phase 2: minimax helpers not yet ported -- the calling script `~/Projects/K2Bi/scripts/minimax-observer-analyze.sh` is the planned target)_
 3. Writes findings to `observer-candidates.md` (surfaced by session-start hook)
 4. Appends detected patterns to `preference-signals.jsonl`
 5. Archives processed observations
@@ -349,7 +349,7 @@ After Keith answers y/n/skip, mark the signal as processed via the helper so bot
 scripts/observer-mark-processed.sh <signal_id> <confirmed|rejected|watching> [L-ID]
 ```
 
-_(TODO Phase 2: minimax helpers not yet ported -- the helper script `~/Projects/K2B-Investment/scripts/observer-mark-processed.sh` mirrors the K2B implementation and will be ported alongside the MiniMax worker scripts.)_
+_(TODO Phase 2: minimax helpers not yet ported -- the helper script `~/Projects/K2Bi/scripts/observer-mark-processed.sh` mirrors the K2B implementation and will be ported alongside the MiniMax worker scripts.)_
 
 Pass `confirmed` when Keith answered yes and a learning was created, `rejected` when he said no (do not surface again), `watching` when he deferred. Include the new L-ID as the third argument when the action produced a learning. `watching` is recorded but does NOT suppress the signal on subsequent reads -- deferred findings resurface next session.
 
@@ -392,7 +392,7 @@ Other invest-* skills can read preference-profile.md before producing output (pl
 
 After completing the main task:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tinvest-observer\t$(echo $RANDOM | md5sum | head -c 8)\tobserved: SUMMARY" >> ~/Projects/K2B-Investment-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-observer\t$(echo $RANDOM | md5sum | head -c 8)\tobserved: SUMMARY" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Notes
