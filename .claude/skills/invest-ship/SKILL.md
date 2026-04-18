@@ -1,5 +1,5 @@
 ---
-name: k2b-ship
+name: invest-ship
 description: End-of-session shipping workflow -- runs Codex pre-commit review, commits, pushes, updates the feature note, updates wiki/concepts/index.md lane membership, appends DEVLOG.md and wiki/log.md, suggests next Backlog promotion, and reminds Keith to /sync. Use when Keith says /ship, "ship it", "wrap up", "end of session", "done shipping", or at the natural end of a build session where code was modified.
 ---
 
@@ -211,7 +211,7 @@ Build a commit message from the categorized diff. Format:
 <optional body with bullet points of major changes>
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
-Co-Shipped-By: k2b-ship
+Co-Shipped-By: invest-ship
 ```
 
 Types: `feat`, `fix`, `refactor`, `docs`, `chore`, `infra`. **Never use em dashes** (K2B rule).
@@ -302,7 +302,7 @@ git commit -m "$(cat <<'EOF'
 docs: devlog for <short-sha>
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
-Co-Shipped-By: k2b-ship
+Co-Shipped-By: invest-ship
 EOF
 )"
 
@@ -326,7 +326,7 @@ Call the single-writer helper (never append to wiki/log.md directly):
 scripts/wiki-log-append.sh /ship "<feature-slug>" "shipped <feature-slug>: <one-line-summary>"
 ```
 
-Replace `<feature-slug>` with the feature note basename (e.g. `feature_k2b-ship`) and `<one-line-summary>` with the same text used in the commit message subject. Helper handles locking, timestamp, and format.
+Replace `<feature-slug>` with the feature note basename (e.g. `feature_invest-ship`) and `<one-line-summary>` with the same text used in the commit message subject. Helper handles locking, timestamp, and format.
 
 ### 10. Multi-ship gate handling
 
@@ -367,7 +367,7 @@ If any files in categories `skills`, `code`, `dashboard`, or `scripts` were in t
 > - **defer** -- drop a new entry in the `.pending-sync/` mailbox so the next session (or the next `/sync`) catches up
 
 **If Keith picks `now`:**
-1. Invoke the `k2b-sync` skill via the Skill tool (or run `"$(git rev-parse --show-toplevel)"/scripts/deploy-to-mini.sh auto` if skill invocation is unavailable in the current harness -- the path resolves to the current repo's deploy script, not hardcoded to K2B, so a sibling repo with its own `scripts/deploy-to-mini.sh` deploys its own tree).
+1. Invoke the `invest-sync` skill via the Skill tool (or run `"$(git rev-parse --show-toplevel)"/scripts/deploy-to-mini.sh auto` if skill invocation is unavailable in the current harness -- the path resolves to the current repo's deploy script, not hardcoded to K2B, so a sibling repo with its own `scripts/deploy-to-mini.sh` deploys its own tree).
 2. Report what was synced.
 3. **Do NOT touch the `.pending-sync/` mailbox.** `/sync` is the sole owner of the mailbox lifecycle. It consumes and deletes its own entries on success. Any cleanup `/ship` did after-the-fact would race with a concurrent `/ship --defer` in another session and could silently destroy a newer deferred entry. Leave the mailbox alone.
 
@@ -414,7 +414,7 @@ If any files in categories `skills`, `code`, `dashboard`, or `scripts` were in t
    PYEOF
    ```
 
-   Required schema fields: `pending` (bool, must be `true` for an active entry), `set_at` (ISO-8601 UTC timestamp), `set_by_commit` (short SHA from step 5), `categories` (list of strings matching the category table), `files` (list of file paths relative to `~/Projects/K2B/`), and `entry_id` (matches the filename stem for traceability). `k2b-sync`'s Step 0 validates these fields and fails loud if any are missing.
+   Required schema fields: `pending` (bool, must be `true` for an active entry), `set_at` (ISO-8601 UTC timestamp), `set_by_commit` (short SHA from step 5), `categories` (list of strings matching the category table), `files` (list of file paths relative to `~/Projects/K2B/`), and `entry_id` (matches the filename stem for traceability). `invest-sync`'s Step 0 validates these fields and fails loud if any are missing.
 
 2. Tell Keith: "Deferred. Entry `<entry_id>` added to `.pending-sync/` mailbox. Next session's startup hook will surface pending mailbox entries, and any later `/sync` invocation will consume them before checking conversation context."
 
@@ -424,12 +424,12 @@ If any files in categories `skills`, `code`, `dashboard`, or `scripts` were in t
 
 **If no syncable files changed:** Skip the question entirely. Do not write a marker. Report "Nothing to sync -- all changes were vault/plan/devlog only."
 
-Do NOT auto-sync without asking. Per Active Rule L-2026-03-29-002, never run manual rsync -- always go through the deploy script via `/sync` or `k2b-sync`.
+Do NOT auto-sync without asking. Per Active Rule L-2026-03-29-002, never run manual rsync -- always go through the deploy script via `/sync` or `invest-sync`.
 
 ### 13. Usage logging
 
 ```bash
-echo -e "$(date +%Y-%m-%d)\tk2b-ship\t$(echo $RANDOM | md5sum | head -c 8)\tshipped FEATURE_SLUG SHORT_SHA" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-ship\t$(echo $RANDOM | md5sum | head -c 8)\tshipped FEATURE_SLUG SHORT_SHA" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ### 13.5. Session summary capture

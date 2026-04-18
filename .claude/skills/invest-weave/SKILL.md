@@ -153,7 +153,7 @@ K2Bi review processes `type: crosslink-digest` items in `review/contradictions/`
 
 - **invest-compile** owns inline `[[wikilinks]]` generated from raw sources. Weave reads compile's output (existing links in page bodies) and excludes those pairs from MiniMax consideration. No fighting, no duplicates.
 - **invest-lint** detects symptoms (orphans, weak backlinks); weave proposes fixes. Weave reads lint's orphan list (when available in `wiki/context/lint-report.md`) to upweight orphan-reducing proposals in utility scoring.
-- **k2b-vault-writer** is the canonical file-writing skill. Weave uses its atomic write conventions for the digest note and `related:` field updates.
+- **invest-vault-writer** is the canonical file-writing skill. Weave uses its atomic write conventions for the digest note and `related:` field updates.
 
 ## Scheduling
 
@@ -201,7 +201,7 @@ Every vault write uses the helper `atomic_write` in `scripts/invest-weave.sh`:
 
 This means: no reader ever sees a partial file. Worst case during a concurrent compile run is a lost update (weave's version silently wins over compile's, or vice versa), which the optimistic re-read check in `/weave apply` catches.
 
-**Deferred to v2 (not in v0):** Full shared vault-mutation lock across `invest-compile` and `k2b-vault-writer`. At Phase 4+ 04:00 HKT runs with idle vault + atomic writes + optimistic concurrency, the collision window is small enough that the heavier lock is not worth the refactor cost yet.
+**Deferred to v2 (not in v0):** Full shared vault-mutation lock across `invest-compile` and `invest-vault-writer`. At Phase 4+ 04:00 HKT runs with idle vault + atomic writes + optimistic concurrency, the collision window is small enough that the heavier lock is not worth the refactor cost yet.
 
 ## v2 backlog (documented here so we don't forget)
 

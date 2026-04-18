@@ -1,5 +1,5 @@
 ---
-name: k2b-research
+name: invest-research
 description: Deep dive into external topics -- scan for new AI tools, techniques, and ideas; analyze URLs, YouTube videos, and GitHub repos. This skill should be used when Keith says /research, "look into this", "what's new in AI", or wants to deep-dive into a topic, URL, or repo. Also triggers on /research deep for multi-source NotebookLM research. For internal system health, use /improve instead.
 ---
 
@@ -88,14 +88,16 @@ Multi-source research powered by Google NotebookLM. Creates a dedicated notebook
 
 #### Phase 1: Source Gathering
 
+> **[TODO Phase 2 port]** The default Source Gathering step below still uses K2B's helpers (`~/Projects/K2B/scripts/yt-search.py`) and the Perplexity MCP, neither of which ships with K2Bi today. In a standalone K2Bi session, `/research deep` without `--sources` will fail at this step. Until Phase 2 ports `yt-search.py` (K2Bi credentials/quota) and decides whether to add a Perplexity MCP or swap in an alternate, the supported paths are: `/research <topic>` (topic scan), `/research <url>` (single-source), and `/research deep <topic> --sources <url>...` (explicit source list). This mirrors the Session 3 Codex P1 finding deferred to Phase 2.
+
 1. Search for sources in parallel:
-   - **YouTube**: Run `python3 ~/Projects/K2B/scripts/yt-search.py "<topic>" --count 15 --months 6` for relevant videos. Uses YouTube Data API v3 with K2B's OAuth credentials (works on both MacBook and Mac Mini). Costs ~101 quota units per search (100 for search.list + 1 for videos.list) out of 10,000/day.
-   - **Perplexity**: Use `mcp__perplexity-ask__perplexity_ask` for broader research including GitHub repos, Reddit discussions, blog posts, tweets. Ask for specific URLs and repo names.
+   - **YouTube**: Run `python3 ~/Projects/K2B/scripts/yt-search.py "<topic>" --count 15 --months 6` for relevant videos. Uses YouTube Data API v3 with K2B's OAuth credentials (works on both MacBook and Mac Mini). Costs ~101 quota units per search (100 for search.list + 1 for videos.list) out of 10,000/day. **Dangling in K2Bi — Phase 2 port.**
+   - **Perplexity**: Use `mcp__perplexity-ask__perplexity_ask` for broader research including GitHub repos, Reddit discussions, blog posts, tweets. Ask for specific URLs and repo names. **Dangling in K2Bi — Phase 2 port.**
    - **Vault**: Grep `~/Projects/K2Bi-Vault/wiki/` for existing vault notes on the topic
 2. Present a numbered source list to Keith. Include title, source type, and brief reason for inclusion.
 3. Keith reviews, adds/removes sources, approves.
 
-If Keith provides `--sources <url1> <url2>`, skip the search phase and use those directly.
+If Keith provides `--sources <url1> <url2>`, skip the search phase and use those directly. **In standalone K2Bi sessions today, this is the required path for `/research deep`.**
 
 #### Phase 2: NotebookLM Setup
 
@@ -808,7 +810,7 @@ All playlist IDs come from `~/Projects/K2B/scripts/k2b-playlists.json` -- the ca
 **Workflow**:
 1. Fetch the source content as usual (WebFetch, YouTube transcript MCP, Read for GitHub README, etc.).
 2. If fetched content is under 10K chars, skip the offload entirely and extract on Opus. See size gate above.
-3. Otherwise, write the fetched content to a temp file, e.g. `/tmp/k2b-research-input-$(date +%s).txt`, remembering the exact filename for the next step.
+3. Otherwise, write the fetched content to a temp file, e.g. `/tmp/invest-research-input-$(date +%s).txt`, remembering the exact filename for the next step.
 4. Call the extractor with the SAME filename from step 3:
    ```bash
    ~/Projects/K2B/scripts/minimax-research-extract.sh \
@@ -908,7 +910,7 @@ up: "[[Home]]"
 
 After completing the main task, log this skill invocation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tk2b-research\t$(echo $RANDOM | md5sum | head -c 8)\tran research: FOCUS" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-research\t$(echo $RANDOM | md5sum | head -c 8)\tran research: FOCUS" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Notes

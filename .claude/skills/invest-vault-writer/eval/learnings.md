@@ -1,4 +1,4 @@
-# Autoresearch Learnings: k2b-vault-writer
+# Autoresearch Learnings: invest-vault-writer
 
 ## What Works
 

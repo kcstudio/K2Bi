@@ -73,7 +73,7 @@ Based on Keith's responses:
 
 - Save to `~/Projects/K2Bi-Vault/Daily/YYYY-MM-DD.md` (auto-promote -- Daily/ notes never go through review)
 - If the file already exists (morning + evening use), **merge** new content into existing note rather than overwriting
-- Use the k2b-vault-writer skill for the actual write
+- Use the invest-vault-writer skill for the actual write
 - After saving, append via helper:
   `scripts/wiki-log-append.sh /journal <journal-note> "captured: <entities>"`
 
@@ -150,4 +150,4 @@ Once Phase 4 ships, daily journal entries also include **P&L review**, **slippag
 - Keep it concise. Bullet points over paragraphs.
 - A short journal entry is better than a padded one.
 - The conversation IS the skill. Don't rush to save -- iterate until Keith's satisfied.
-- Use k2b-vault-writer conventions for all note creation and cross-linking.
+- Use invest-vault-writer conventions for all note creation and cross-linking.

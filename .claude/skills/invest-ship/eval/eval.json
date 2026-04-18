@@ -1,5 +1,5 @@
 {
-  "skill": "k2b-ship",
+  "skill": "invest-ship",
   "runner": "none (scenario markdown only; read by a human or MiniMax M2.7 when behavioral regression is suspected)",
   "cases": [
     {

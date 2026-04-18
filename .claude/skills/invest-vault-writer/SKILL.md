@@ -1,5 +1,5 @@
 ---
-name: k2b-vault-writer
+name: invest-vault-writer
 description: Create or update notes in the K2Bi Obsidian vault with correct frontmatter, cross-links, and MOC integration. Use when creating any new note in the vault, or when updating an existing note after progress is made on a ticker, strategy, sector, or trade. Also use when another skill (invest-journal, invest-compile, invest-session-wrapup) needs to create or update a linked note.
 ---
 
@@ -84,11 +84,11 @@ K2B uses a 3-layer vault architecture (Karpathy model):
 
 | Capture Type | Raw Destination | Then |
 |--------------|----------------|------|
-| YouTube video | `raw/youtube/` | Trigger k2b-compile |
-| Meeting transcript | `raw/meetings/` | Trigger k2b-compile |
-| Research briefing | `raw/research/` | Trigger k2b-compile |
-| TLDR | `raw/tldrs/` | Trigger k2b-compile |
-| Daily extracts | `raw/daily/` | Trigger k2b-compile |
+| YouTube video | `raw/youtube/` | Trigger invest-compile |
+| Meeting transcript | `raw/meetings/` | Trigger invest-compile |
+| Research briefing | `raw/research/` | Trigger invest-compile |
+| TLDR | `raw/tldrs/` | Trigger invest-compile |
+| Daily extracts | `raw/daily/` | Trigger invest-compile |
 
 ### Wiki Pages (compiled output)
 
@@ -345,7 +345,7 @@ This pass runs AFTER the note is written and validated, not during writing.
 Before writing, editing, or deleting ANY vault note, check the policy ledger:
 
 1. **Read** `wiki/context/policy-ledger.jsonl`
-2. **Filter** entries where `scope` matches this skill (`k2b-vault-writer`) or is `*` (global)
+2. **Filter** entries where `scope` matches this skill (`invest-vault-writer`) or is `*` (global)
 3. **For each matching guard**: verify the action complies with the rule. If it doesn't, stop and adjust.
 4. **For each matching autonomy entry**: if `auto_eligible` is true AND the action matches, proceed without asking Keith. Otherwise, ask Keith for approval.
 5. **After Keith approves/rejects an autonomy action**: update the ledger entry's `approved`/`rejected` count. When `approved >= graduation_threshold` AND `rejected / (approved + rejected) < max_rejection_rate`, propose auto-eligibility to Keith. If Keith confirms, set `auto_eligible: true`.
@@ -383,5 +383,5 @@ After writing, confirm:
 
 After completing the main task, log this skill invocation:
 ```bash
-echo -e "$(date +%Y-%m-%d)\tk2b-vault-writer\t$(echo $RANDOM | md5sum | head -c 8)\twrote/updated vault note: FILENAME" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-vault-writer\t$(echo $RANDOM | md5sum | head -c 8)\twrote/updated vault note: FILENAME" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```

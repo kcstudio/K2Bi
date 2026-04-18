@@ -203,7 +203,7 @@ The skill ports are Session 2 work. The intended commands once ported:
 
 ## Codex Adversarial Review
 
-Codex (`/codex:` plugin) is mandatory at two checkpoints: **plan review** before implementation and **pre-commit review** before committing. Both non-negotiable; if one is skipped, the other is mandatory. Procedure lives in the local `invest-ship` (or `k2b-ship` if fork kept original name) skill body.
+Codex (`/codex:` plugin) is mandatory at two checkpoints: **plan review** before implementation and **pre-commit review** before committing. Both non-negotiable; if one is skipped, the other is mandatory. Procedure lives in the local `invest-ship` skill body.
 
 **Phase 6 additional gate:** mandatory Codex adversarial review of the entire execution layer + validators + decision journal schema before any live capital. See Keith's Phase 6 checklist (in planning archive).
 

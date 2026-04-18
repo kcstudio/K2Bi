@@ -1,5 +1,5 @@
 ---
-name: k2b-scheduler
+name: invest-scheduler
 description: Create, list, pause, resume, and delete persistent scheduled tasks for K2Bi. Use when Keith says /schedule, "schedule", "remind me", "set up a recurring", "every week do X", "run this daily", "automate", or wants any task to run on a timer. Handles both recurring cron schedules and one-time reminders. Backs onto K2B's shared k2b-remote scheduler service.
 ---
 
@@ -146,7 +146,7 @@ ssh macmini "cd ~/Projects/K2B/k2b-remote && node dist/schedule-cli.js delete <i
 After creating, modifying, or listing tasks, append to the usage log:
 
 ```bash
-echo -e "$(date +%Y-%m-%d)\tk2b-scheduler\t$(echo $RANDOM | md5 | head -c 8)\tcreated/listed/paused/deleted task" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
+echo -e "$(date +%Y-%m-%d)\tinvest-scheduler\t$(echo $RANDOM | md5 | head -c 8)\tcreated/listed/paused/deleted task" >> ~/Projects/K2Bi-Vault/wiki/context/skill-usage-log.tsv
 ```
 
 ## Examples
