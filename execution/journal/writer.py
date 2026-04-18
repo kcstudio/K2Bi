@@ -82,6 +82,8 @@ class JournalWriter:
         ticker: str | None = None,
         side: str | None = None,
         qty: int | None = None,
+        broker_order_id: str | None = None,
+        broker_perm_id: str | None = None,
         error: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         ts: datetime | None = None,
@@ -109,6 +111,10 @@ class JournalWriter:
             record["side"] = side
         if qty is not None:
             record["qty"] = qty
+        if broker_order_id is not None:
+            record["broker_order_id"] = broker_order_id
+        if broker_perm_id is not None:
+            record["broker_perm_id"] = broker_perm_id
         if error is not None:
             record["error"] = error
         if metadata is not None:

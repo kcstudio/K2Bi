@@ -1,0 +1,976 @@
+# cash-only invariant: no sell-side paths in this module (reconciliation
+# reads broker state; does not generate orders). Sell-side enforcement
+# is owned by execution.risk.cash_only and called by runner.py + engine
+# main pre-submit hook.
+"""Crash-restart reconciliation between the journal and the broker.
+
+Architect Q3-refined contract:
+
+    Broker is authoritative for positions + order status. The journal
+    is authoritative for INTENT (what the engine meant to do). On
+    restart we:
+        1. Walk the journal back to the last engine_stopped event and
+           derive "journal-implied" position + pending-order state.
+        2. Pull current broker state (positions, open orders, recent
+           executions, completed-order status history).
+        3. Classify each journal-pending order against its broker
+           counterpart: FILLED / CANCELLED / REJECTED / PARTIALLY_FILLED
+           / STILL_OPEN. All allowed; log recovery_reconciled for each.
+        4. Check for discrepancies (phantom position, oversized
+           position, missing position, phantom open order). Any hit =
+           refuse-to-start unless K2BI_ALLOW_RECOVERY_MISMATCH=1.
+
+Identity: match by broker_perm_id first, broker_order_id second.
+permId is stable across IB Gateway restarts; orderId re-issues on each
+new session (architect-mandated in journal v2 payload).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from typing import Any, Iterable
+
+
+LOG = logging.getLogger("k2bi.engine.recovery")
+
+
+def _safe_decimal(raw: Any) -> Decimal | None:
+    """Parse a Decimal from journal data; return None on corruption.
+
+    R16-minimax: journal payload fields like stop_loss / limit_price
+    are written as stringified Decimals, but a partial-write / manual
+    edit / future-writer bug could land a non-numeric value. Raising
+    InvalidOperation from inside _pending_from_journal would crash the
+    engine before engine_started could be journaled. Degrade
+    gracefully: log the corruption and return None so the rest of
+    recovery can still classify the order by broker ID.
+    """
+    if raw in (None, "", "None"):
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        LOG.warning(
+            "recovery: corrupt Decimal in journal payload (%r); using None",
+            raw,
+        )
+        return None
+
+from ..connectors.types import (
+    BrokerOpenOrder,
+    BrokerOrderStatusEvent,
+    BrokerPosition,
+    CLIENT_TAG_PREFIX,
+    LIVE_ORDER_STATUSES,
+    TERMINAL_ORDER_STATUSES,
+    parse_client_tag,
+)
+
+
+RECOVERY_OVERRIDE_ENV = "K2BI_ALLOW_RECOVERY_MISMATCH"
+# How far back to walk journal + broker history on restart. A full
+# calendar day covers overnight crashes; longer outages trip the
+# weekly_cap breaker first anyway.
+DEFAULT_LOOKBACK = timedelta(hours=48)
+
+
+class RecoveryStatus(str, Enum):
+    CLEAN = "clean"                      # empty journal + empty broker
+    CATCH_UP = "catch_up"                # reconciled cleanly, may include drift/partials
+    MISMATCH_REFUSED = "mismatch_refused"
+    MISMATCH_OVERRIDE = "mismatch_override"  # K2BI_ALLOW_RECOVERY_MISMATCH=1
+
+
+@dataclass(frozen=True)
+class PendingFromJournal:
+    """Extracted view of an order the journal last saw as in-flight.
+
+    `stop_loss` is preserved here (R15-minimax finding) so that a
+    resumed AwaitingOrderState keeps the strategy-level stop reference
+    across restart. Broker still holds the protective stop child via
+    the bracket, but engine-internal tracking of the order loses the
+    stop context if we don't carry it through recovery.
+    """
+
+    trade_id: str | None
+    strategy: str | None
+    broker_order_id: str | None
+    broker_perm_id: str | None
+    ticker: str
+    side: str
+    qty: int
+    limit_price: Decimal | None
+    submitted_at: datetime
+    stop_loss: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class PositionFromJournal:
+    """Positions implied by the journal's fill history + last engine
+    snapshot."""
+
+    ticker: str
+    qty: int
+    avg_price: Decimal
+
+
+@dataclass(frozen=True)
+class ReconciliationEvent:
+    """One reconciliation outcome, ready to be handed to JournalWriter.
+    The engine's recovery step iterates these and appends each to the
+    journal so audit trail is complete regardless of how many orders
+    we caught up."""
+
+    event_type: str
+    payload: dict[str, Any]
+    ticker: str | None = None
+    broker_order_id: str | None = None
+    broker_perm_id: str | None = None
+    trade_id: str | None = None
+    strategy: str | None = None
+
+
+@dataclass
+class ReconciliationResult:
+    """Outcome of a single reconcile() pass.
+
+    engine/main.py treats `status == MISMATCH_REFUSED` as refuse-to-start
+    unless the K2BI_ALLOW_RECOVERY_MISMATCH env flag is set. Regardless
+    of status, `events` must be journaled -- mismatch audit trail is
+    exactly as important as catch-up audit trail."""
+
+    status: RecoveryStatus
+    events: list[ReconciliationEvent] = field(default_factory=list)
+    mismatch_reasons: list[dict[str, Any]] = field(default_factory=list)
+    adopted_positions: list[BrokerPosition] = field(default_factory=list)
+    adopted_open_orders: list[BrokerOpenOrder] = field(default_factory=list)
+
+
+def reconcile(
+    *,
+    journal_tail: list[dict[str, Any]],
+    broker_positions: list[BrokerPosition],
+    broker_open_orders: list[BrokerOpenOrder],
+    broker_order_status: list[BrokerOrderStatusEvent],
+    now: datetime,
+    override_env: str | None = None,
+    override_env_name: str = RECOVERY_OVERRIDE_ENV,
+) -> ReconciliationResult:
+    """Classify broker state against journal-implied state.
+
+    Pure function: takes all inputs, returns a result. Engine is the
+    only caller that turns the result into journal writes + state
+    machine transition.
+
+    Algorithm in two phases:
+
+        Phase A classifies each journal-pending order against its
+        broker counterpart (filled/cancelled/rejected/partial/still-
+        open/vanished). Catch-up fills are used to project a delta
+        against journal-implied positions so the Phase B position-diff
+        doesn't mistake a legitimate catch-up fill for a phantom
+        position.
+
+        Phase B diffs broker positions + open orders against the
+        projected journal-implied state and flags discrepancies.
+
+    `override_env`: explicit value for the override flag (tests pass
+    "" or "1"; production caller reads os.environ and passes through).
+    `override_env_name`: the NAME of the env var that was consulted,
+    so mismatch records report the actual remediation instruction to
+    operators (Codex round-7 P3).
+    """
+    override_raw = (
+        override_env
+        if override_env is not None
+        else os.environ.get(override_env_name, "")
+    )
+    override_active = override_raw.strip() == "1"
+
+    implied_positions = _positions_from_journal(journal_tail)
+    implied_pending = _pending_from_journal(journal_tail)
+
+    events: list[ReconciliationEvent] = []
+    mismatches: list[dict[str, Any]] = []
+
+    # ---- Phase A: classify journal-pending against broker fate ----
+
+    status_index = _index_status_events(broker_order_status)
+    open_index = _index_open_orders(broker_open_orders)
+    seen_broker_ids: set[str] = set()
+    # Per-ticker (signed_qty_delta, last_broker_avg_fill_price).
+    # Positive qty means the pending was a buy that filled, growing
+    # inventory; negative means a sell that filled, reducing it.
+    reconciliation_deltas: dict[str, list[tuple[int, Decimal | None]]] = {}
+
+    # Build the trade-id fallback map BEFORE classification so
+    # _match_broker_order can also match by client_tag when the
+    # journal never captured broker IDs (crash between submit_order
+    # success and order_submitted journal write -- Codex round-4 P1).
+    trade_id_to_open = _index_open_orders_by_trade_id(broker_open_orders)
+    trade_id_to_status = _index_status_events_by_trade_id(broker_order_status)
+
+    for pending in implied_pending:
+        match = _match_broker_order(
+            pending,
+            status_index,
+            open_index,
+            trade_id_open_index=trade_id_to_open,
+            trade_id_status_index=trade_id_to_status,
+        )
+        if match is None:
+            # Journal said "submitted", broker knows nothing. Could be
+            # a) the order never actually left (engine crashed between
+            # submit-intent and broker ack) OR b) a broker-side gap.
+            # Either way, mark as "cancelled-by-crash" reconciliation
+            # so the pending cleanly clears; if it later resurfaces
+            # with broker ack, the fresh order_submitted event will
+            # show up in the same window.
+            events.append(
+                ReconciliationEvent(
+                    event_type="recovery_reconciled",
+                    payload={
+                        "case": "pending_no_broker_counterpart",
+                        "note": (
+                            "journal-pending order never reached broker or "
+                            "broker-side record missing"
+                        ),
+                        "journal_view": _pending_payload(pending),
+                    },
+                    trade_id=pending.trade_id,
+                    strategy=pending.strategy,
+                    broker_order_id=pending.broker_order_id,
+                    broker_perm_id=pending.broker_perm_id,
+                    ticker=pending.ticker,
+                )
+            )
+            continue
+
+        kind, obj = match
+        broker_perm = _perm_id_of(obj)
+        broker_oid = _order_id_of(obj)
+        if broker_perm:
+            seen_broker_ids.add(f"perm:{broker_perm}")
+        if broker_oid:
+            seen_broker_ids.add(f"oid:{broker_oid}")
+
+        if kind == "open":
+            assert isinstance(obj, BrokerOpenOrder)
+            events.append(
+                ReconciliationEvent(
+                    event_type="recovery_reconciled",
+                    payload={
+                        "case": "pending_still_open",
+                        "broker_status": obj.status,
+                        "filled_qty": obj.filled_qty,
+                        "remaining_qty": obj.qty - obj.filled_qty,
+                        "journal_view": _pending_payload(pending),
+                    },
+                    trade_id=pending.trade_id,
+                    strategy=pending.strategy,
+                    broker_order_id=broker_oid,
+                    broker_perm_id=broker_perm,
+                    ticker=obj.ticker,
+                )
+            )
+            continue
+
+        assert kind == "status"
+        assert isinstance(obj, BrokerOrderStatusEvent)
+        case = _classify_terminal(obj)
+        events.append(
+            ReconciliationEvent(
+                event_type="recovery_reconciled",
+                payload={
+                    "case": case,
+                    "broker_status": obj.status,
+                    "filled_qty": obj.filled_qty,
+                    "remaining_qty": obj.remaining_qty,
+                    "avg_fill_price": (
+                        str(obj.avg_fill_price)
+                        if obj.avg_fill_price is not None
+                        else None
+                    ),
+                    "broker_reason": obj.reason,
+                    "journal_view": _pending_payload(pending),
+                },
+                trade_id=pending.trade_id,
+                strategy=pending.strategy,
+                broker_order_id=broker_oid,
+                broker_perm_id=broker_perm,
+                ticker=pending.ticker,
+            )
+        )
+
+        if case in {"pending_filled", "pending_partially_filled"} and obj.filled_qty > 0:
+            sign = 1 if pending.side == "buy" else -1
+            delta = sign * obj.filled_qty
+            reconciliation_deltas.setdefault(pending.ticker, []).append(
+                (delta, obj.avg_fill_price)
+            )
+
+    # ---- Phase B prep: apply deltas to implied positions ----
+
+    projected_by_ticker: dict[str, tuple[int, Decimal]] = {
+        p.ticker: (p.qty, p.avg_price) for p in implied_positions
+    }
+    for ticker, deltas in reconciliation_deltas.items():
+        for delta_qty, fill_avg in deltas:
+            old_qty, old_avg = projected_by_ticker.get(
+                ticker, (0, Decimal("0"))
+            )
+            new_qty = old_qty + delta_qty
+            if new_qty <= 0:
+                projected_by_ticker.pop(ticker, None)
+                continue
+            if delta_qty > 0 and fill_avg is not None:
+                old_cost = old_avg * Decimal(old_qty) if old_qty > 0 else Decimal("0")
+                new_cost = fill_avg * Decimal(delta_qty)
+                new_avg = (old_cost + new_cost) / Decimal(new_qty)
+            else:
+                new_avg = old_avg
+            projected_by_ticker[ticker] = (new_qty, new_avg)
+
+    # ---- Phase B.1: phantom open orders ----
+
+    # Track trade_ids seen among journal-pending orders so we can
+    # recognize stop-loss child orders (Codex round-4 P1). Stop
+    # children carry the parent's trade_id in their client_tag with a
+    # :stop suffix; they are expected open orders after the parent
+    # fills, not phantoms.
+    pending_trade_ids: set[str] = set()
+    for pending in implied_pending:
+        if pending.trade_id:
+            pending_trade_ids.add(pending.trade_id)
+    # Also treat trade_ids observed in journal fills (parent already
+    # filled + cleared) as "ours" so their surviving stop children do
+    # not flag phantoms.
+    for rec in journal_tail:
+        if rec.get("event_type") in {
+            "order_submitted",
+            "order_filled",
+            "order_proposed",
+        }:
+            tid = rec.get("trade_id")
+            if tid:
+                pending_trade_ids.add(tid)
+
+    for open_order in broker_open_orders:
+        matched = False
+        perm = open_order.broker_perm_id
+        oid = open_order.broker_order_id
+        if perm and f"perm:{perm}" in seen_broker_ids:
+            matched = True
+        if oid and f"oid:{oid}" in seen_broker_ids:
+            matched = True
+        if matched:
+            continue
+
+        # Client-tag based recognition for k2bi-managed orders.
+        strategy, trade_id, is_stop = parse_client_tag(open_order.client_tag)
+        if strategy is not None and trade_id is not None and trade_id in pending_trade_ids:
+            # Emit a reconciled event so the audit trail records the
+            # child's presence; continue -- not a phantom.
+            events.append(
+                ReconciliationEvent(
+                    event_type="recovery_reconciled",
+                    payload={
+                        "case": (
+                            "stop_child_recognized"
+                            if is_stop
+                            else "managed_order_recognized"
+                        ),
+                        "client_tag": open_order.client_tag,
+                        "broker_status": open_order.status,
+                        "qty": open_order.qty,
+                        "filled_qty": open_order.filled_qty,
+                        "remaining_qty": open_order.qty - open_order.filled_qty,
+                        "tif": open_order.tif,
+                    },
+                    strategy=strategy,
+                    trade_id=trade_id,
+                    broker_order_id=oid,
+                    broker_perm_id=perm,
+                    ticker=open_order.ticker,
+                )
+            )
+            continue
+
+        mismatches.append(
+            {
+                "case": "phantom_open_order",
+                "broker_order_id": oid,
+                "broker_perm_id": perm,
+                "ticker": open_order.ticker,
+                "side": open_order.side,
+                "qty": open_order.qty,
+                "status": open_order.status,
+                "client_tag": open_order.client_tag,
+            }
+        )
+
+    # ---- Phase B.2: position diff against projected state ----
+
+    broker_by_ticker = {p.ticker: p for p in broker_positions}
+
+    for ticker, broker_pos in broker_by_ticker.items():
+        projected = projected_by_ticker.get(ticker)
+        if projected is None:
+            mismatches.append(
+                {
+                    "case": "phantom_position",
+                    "ticker": ticker,
+                    "broker_qty": broker_pos.qty,
+                    "broker_avg_price": str(broker_pos.avg_price),
+                }
+            )
+            continue
+        implied_qty, implied_avg = projected
+        if broker_pos.qty > implied_qty:
+            mismatches.append(
+                {
+                    "case": "position_oversized_vs_journal",
+                    "ticker": ticker,
+                    "broker_qty": broker_pos.qty,
+                    "journal_implied_qty": implied_qty,
+                }
+            )
+            continue
+        if broker_pos.qty < implied_qty:
+            mismatches.append(
+                {
+                    "case": "position_undersized_vs_journal",
+                    "ticker": ticker,
+                    "broker_qty": broker_pos.qty,
+                    "journal_implied_qty": implied_qty,
+                }
+            )
+            continue
+        if broker_pos.avg_price != implied_avg:
+            events.append(
+                ReconciliationEvent(
+                    event_type="avg_price_drift",
+                    payload={
+                        "ticker": ticker,
+                        "journal_avg_price": str(implied_avg),
+                        "broker_avg_price": str(broker_pos.avg_price),
+                        "delta": str(broker_pos.avg_price - implied_avg),
+                    },
+                    ticker=ticker,
+                )
+            )
+
+    for ticker, (implied_qty, _) in projected_by_ticker.items():
+        if ticker not in broker_by_ticker:
+            mismatches.append(
+                {
+                    "case": "journal_position_missing_at_broker",
+                    "ticker": ticker,
+                    "journal_implied_qty": implied_qty,
+                }
+            )
+
+    # ---- 4. status assembly ----
+
+    if not mismatches and not events and not broker_positions and not broker_open_orders:
+        status = RecoveryStatus.CLEAN
+    elif not mismatches:
+        status = RecoveryStatus.CATCH_UP
+    else:
+        status = (
+            RecoveryStatus.MISMATCH_OVERRIDE
+            if override_active
+            else RecoveryStatus.MISMATCH_REFUSED
+        )
+
+    # Record override usage explicitly so the audit trail shows why a
+    # session started despite discrepancies.
+    if status == RecoveryStatus.MISMATCH_OVERRIDE:
+        events.append(
+            ReconciliationEvent(
+                event_type="recovery_state_mismatch",
+                payload={
+                    "override_env": override_env_name,
+                    "override_value": override_raw,
+                    "mismatch_count": len(mismatches),
+                    "mismatches": mismatches,
+                    "resolution": "proceeding_with_override",
+                    "ts": now.isoformat(),
+                },
+            )
+        )
+    elif status == RecoveryStatus.MISMATCH_REFUSED:
+        events.append(
+            ReconciliationEvent(
+                event_type="recovery_state_mismatch",
+                payload={
+                    "override_env": override_env_name,
+                    "override_value": override_raw,
+                    "mismatch_count": len(mismatches),
+                    "mismatches": mismatches,
+                    "resolution": "engine_refuses_start",
+                    "ts": now.isoformat(),
+                },
+            )
+        )
+
+    return ReconciliationResult(
+        status=status,
+        events=events,
+        mismatch_reasons=mismatches,
+        adopted_positions=list(broker_positions),
+        adopted_open_orders=list(broker_open_orders),
+    )
+
+
+# ---------- journal-implied state extraction ----------
+
+
+def _positions_from_journal(
+    records: Iterable[dict[str, Any]],
+) -> list[PositionFromJournal]:
+    """Walk records forward, tracking (qty, avg_price) per ticker.
+
+    Sources of position state, in replay order:
+        - engine_recovered.adopted_positions    (snapshot from prior
+                                                 reconciliation / override)
+        - order_filled                          (live fill event)
+        - recovery_reconciled with case=pending_filled /
+          pending_partially_filled             (fill discovered during
+                                                 recovery)
+
+    Engine_recovered acts as a "checkpoint" -- after any recovery pass
+    writes it, subsequent startups can seed from that snapshot even if
+    the original order_filled events have since aged out of the
+    lookback window. Without this, a restart that overrode a
+    recovery_state_mismatch and adopted broker positions would see the
+    same broker positions flagged as phantoms on the next restart once
+    the original fills scrolled out of the 48-hour window (Codex
+    round-1 P2).
+
+    All other events (validator_pass, order_proposed, order_submitted,
+    order_rejected, breaker_triggered, kill_*, auth_*, disconnect_*,
+    eod_*) do not change positions. This keeps the extraction
+    predictable -- one event type, one effect.
+    """
+    per_ticker: dict[str, tuple[int, Decimal]] = {}
+    for rec in records:
+        event_type = rec.get("event_type")
+        payload = rec.get("payload", {}) or {}
+        if event_type == "engine_recovered":
+            # Snapshot reset: the recovery that wrote this record made
+            # the engine's view of the world consistent with the
+            # broker at that moment, so we REPLACE the accumulated
+            # per_ticker rather than add to it. Any later order_filled
+            # or recovery_reconciled events in the same replay window
+            # still accumulate on top.
+            per_ticker = {}
+            for adopted in payload.get("adopted_positions", []) or []:
+                ticker = adopted.get("ticker")
+                qty = adopted.get("qty")
+                avg = adopted.get("avg_price")
+                if not ticker or qty is None or avg is None:
+                    continue
+                try:
+                    qty_int = int(qty)
+                    avg_dec = Decimal(str(avg))
+                except (ValueError, TypeError, InvalidOperation):
+                    continue
+                if qty_int == 0:
+                    continue
+                per_ticker[ticker] = (qty_int, avg_dec)
+        elif event_type == "order_filled":
+            ticker = rec.get("ticker") or payload.get("ticker")
+            side = rec.get("side") or payload.get("side")
+            qty = rec.get("qty") or payload.get("qty")
+            price_raw = payload.get("fill_price")
+            if not ticker or not side or qty is None or price_raw is None:
+                continue
+            per_ticker[ticker] = _apply_fill(
+                per_ticker.get(ticker, (0, Decimal("0"))),
+                side=str(side).lower(),
+                qty=int(qty),
+                price=Decimal(str(price_raw)),
+            )
+        elif event_type == "recovery_reconciled":
+            case = payload.get("case")
+            if case not in {"pending_filled", "pending_partially_filled"}:
+                continue
+            ticker = rec.get("ticker") or payload.get("ticker")
+            side = payload.get("journal_view", {}).get("side")
+            qty = payload.get("filled_qty")
+            price_raw = payload.get("avg_fill_price")
+            if not ticker or not side or qty is None or price_raw is None:
+                continue
+            per_ticker[ticker] = _apply_fill(
+                per_ticker.get(ticker, (0, Decimal("0"))),
+                side=str(side).lower(),
+                qty=int(qty),
+                price=Decimal(str(price_raw)),
+            )
+
+    out: list[PositionFromJournal] = []
+    for ticker, (qty, avg) in per_ticker.items():
+        if qty == 0:
+            continue
+        out.append(PositionFromJournal(ticker=ticker, qty=qty, avg_price=avg))
+    return out
+
+
+def _apply_fill(
+    state: tuple[int, Decimal],
+    *,
+    side: str,
+    qty: int,
+    price: Decimal,
+) -> tuple[int, Decimal]:
+    held, avg = state
+    if side == "buy":
+        new_held = held + qty
+        if new_held <= 0:
+            return new_held, Decimal("0")
+        total_cost = avg * Decimal(held) + price * Decimal(qty)
+        return new_held, total_cost / Decimal(new_held)
+    # sell: reduce inventory at the same cost basis (no realized-P&L
+    # tracking at the journal-replay level; that is invest-journal's
+    # concern).
+    new_held = held - qty
+    if new_held <= 0:
+        return 0, Decimal("0")
+    return new_held, avg
+
+
+def _pending_from_journal(
+    records: Iterable[dict[str, Any]],
+) -> list[PendingFromJournal]:
+    """Scan for orders whose last event is submitted-but-not-terminal.
+
+    Algorithm: walk forward, keeping a map keyed by the most stable
+    identifier available (trade_id > perm_id > order_id). Terminal
+    events clear the entry; NON-terminal events (partial fills) must
+    leave it in place so a crash mid-sequence correctly classifies the
+    remainder as still-pending.
+
+    Codex round-6 P1: `order_filled` is emitted on every fill,
+    including partials -- the engine's payload carries
+    `cumulative_filled_qty` + `remaining_qty`. Treating any
+    `order_filled` as terminal loses track of partially filled live
+    orders across restart. The correct predicate is:
+        full-fill  -> cumulative_filled_qty >= order qty (terminal)
+        partial    -> cumulative_filled_qty < order qty (still pending)
+
+    When a journal record lacks cumulative_filled_qty (old v1 record
+    or an external producer), fall back to accumulating `qty` from the
+    record itself, which the engine sets to the SINGLE-FILL qty on
+    order_filled events.
+    """
+    per_key: dict[str, PendingFromJournal] = {}
+    per_key_filled: dict[str, int] = {}
+    terminal_cases = {
+        "pending_filled",
+        "pending_cancelled",
+        "pending_rejected",
+        "pending_partially_filled",  # remainder-only reconciliation
+        "pending_no_broker_counterpart",
+    }
+    for rec in records:
+        event_type = rec.get("event_type")
+        payload = rec.get("payload", {}) or {}
+        key = _pending_key(rec)
+        if key is None:
+            continue
+        if event_type in {"order_proposed", "order_submitted"}:
+            try:
+                qty_int = int(rec.get("qty") or payload.get("qty") or 0)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "recovery: corrupt qty in journal payload (%r); using 0",
+                    rec.get("qty") or payload.get("qty"),
+                )
+                qty_int = 0
+            per_key[key] = PendingFromJournal(
+                trade_id=rec.get("trade_id"),
+                strategy=rec.get("strategy"),
+                broker_order_id=rec.get("broker_order_id"),
+                broker_perm_id=rec.get("broker_perm_id"),
+                ticker=rec.get("ticker") or payload.get("ticker", ""),
+                side=(rec.get("side") or payload.get("side", "")).lower(),
+                qty=qty_int,
+                limit_price=_safe_decimal(payload.get("limit_price")),
+                submitted_at=_parse_ts(rec.get("ts")) or datetime.now(timezone.utc),
+                stop_loss=_safe_decimal(payload.get("stop_loss")),
+            )
+            per_key_filled.setdefault(key, 0)
+        elif event_type == "order_filled":
+            # Track cumulative fill. Prefer the engine-authored
+            # `cumulative_filled_qty` when present (accurate across
+            # partials); otherwise accumulate the per-record fill qty.
+            cumulative_raw = payload.get("cumulative_filled_qty")
+            if cumulative_raw is not None:
+                try:
+                    per_key_filled[key] = int(cumulative_raw)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                fill_raw = rec.get("qty") or payload.get("fill_qty")
+                if fill_raw is not None:
+                    try:
+                        per_key_filled[key] = (
+                            per_key_filled.get(key, 0) + int(fill_raw)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            pending = per_key.get(key)
+            if pending is not None and per_key_filled.get(key, 0) >= pending.qty:
+                per_key.pop(key, None)
+        elif event_type in {"order_rejected", "order_timeout"}:
+            per_key.pop(key, None)
+        elif event_type == "kill_blocked":
+            # Codex round-9 P2: kill_blocked can fire between an
+            # order_proposed record and any broker call -- the order
+            # was intentionally never sent. Leaving the proposal in
+            # per_key would misclassify every kill-during-submit case
+            # as pending_no_broker_counterpart on restart.
+            per_key.pop(key, None)
+        elif event_type == "recovery_reconciled":
+            case = payload.get("case")
+            if case in terminal_cases:
+                per_key.pop(key, None)
+
+    return list(per_key.values())
+
+
+def _pending_key(record: dict[str, Any]) -> str | None:
+    """Pick the lifecycle-stable identifier for a pending-order entry.
+
+    Codex round-2 P2: trade_id is the FIRST identifier every event in
+    a trade lifecycle carries (engine emits it on order_proposed,
+    before any broker call), and it remains on every subsequent
+    order_submitted / order_filled / order_rejected. Keying on
+    trade_id first means the proposal event + terminal event land on
+    the same map entry and terminal cleanup actually clears the
+    pending. Keying on perm_id first (as the prior implementation
+    did) stranded the trade-keyed proposal entry because perm_id
+    isn't assigned until submit, so every completed trade left a
+    phantom "pending_no_broker_counterpart" after recovery.
+
+    perm_id / order_id remain as fallback so records emitted by a
+    process that didn't stamp trade_id can still be tracked.
+    """
+    trade_id = record.get("trade_id")
+    if trade_id:
+        return f"trade:{trade_id}"
+    perm = record.get("broker_perm_id")
+    if perm:
+        return f"perm:{perm}"
+    oid = record.get("broker_order_id")
+    if oid:
+        return f"oid:{oid}"
+    return None
+
+
+# ---------- broker-side matching ----------
+
+
+def _index_open_orders(
+    rows: Iterable[BrokerOpenOrder],
+) -> dict[str, BrokerOpenOrder]:
+    idx: dict[str, BrokerOpenOrder] = {}
+    for row in rows:
+        if row.broker_perm_id:
+            idx[f"perm:{row.broker_perm_id}"] = row
+        if row.broker_order_id:
+            idx[f"oid:{row.broker_order_id}"] = row
+    return idx
+
+
+def _index_status_events(
+    rows: Iterable[BrokerOrderStatusEvent],
+) -> dict[str, BrokerOrderStatusEvent]:
+    """Most-recent-wins if the broker returned multiple status updates
+    for the same order.  IBKR's reqCompletedOrdersAsync() can include
+    intermediate states; we keep only the terminal one."""
+    idx: dict[str, BrokerOrderStatusEvent] = {}
+    for row in rows:
+        if row.status not in TERMINAL_ORDER_STATUSES:
+            continue
+        for k in _status_keys(row):
+            prior = idx.get(k)
+            if prior is None or row.last_update_at >= prior.last_update_at:
+                idx[k] = row
+    return idx
+
+
+def _status_keys(row: BrokerOrderStatusEvent) -> list[str]:
+    out: list[str] = []
+    if row.broker_perm_id:
+        out.append(f"perm:{row.broker_perm_id}")
+    if row.broker_order_id:
+        out.append(f"oid:{row.broker_order_id}")
+    return out
+
+
+def _match_broker_order(
+    pending: PendingFromJournal,
+    status_index: dict[str, BrokerOrderStatusEvent],
+    open_index: dict[str, BrokerOpenOrder],
+    *,
+    trade_id_open_index: dict[str, BrokerOpenOrder] | None = None,
+    trade_id_status_index: dict[str, BrokerOrderStatusEvent] | None = None,
+) -> tuple[str, BrokerOrderStatusEvent | BrokerOpenOrder] | None:
+    # Broker-ID match first: strongest signal.
+    for key_fn in (
+        lambda: f"perm:{pending.broker_perm_id}" if pending.broker_perm_id else None,
+        lambda: f"oid:{pending.broker_order_id}" if pending.broker_order_id else None,
+    ):
+        key = key_fn()
+        if key is None:
+            continue
+        if key in status_index:
+            return "status", status_index[key]
+        if key in open_index:
+            return "open", open_index[key]
+
+    # Trade-id fallback (Codex round-4 P1): when the journal never
+    # recorded broker IDs because order_submitted write was lost, we
+    # can still match via the orderRef/client_tag that ib_async sent
+    # to the broker at submit-time. The caller passes indexes built
+    # from BrokerOpenOrder.client_tag and the status-event side
+    # equivalent; missing indexes skip this branch.
+    if pending.trade_id:
+        if trade_id_status_index is not None:
+            hit = trade_id_status_index.get(pending.trade_id)
+            if hit is not None:
+                return "status", hit
+        if trade_id_open_index is not None:
+            hit = trade_id_open_index.get(pending.trade_id)
+            if hit is not None:
+                return "open", hit
+    return None
+
+
+def _index_open_orders_by_trade_id(
+    rows: Iterable[BrokerOpenOrder],
+) -> dict[str, BrokerOpenOrder]:
+    """Map trade_id -> parent open order.
+
+    Codex round-14 P1: stop children MUST be excluded from this
+    index. Crash-window scenario: order_proposed journaled, parent
+    filled before restart, only the :stop child remains open at
+    broker. If we let a child slot into the trade_id fallback,
+    _match_broker_order would classify the parent as
+    pending_still_open (wrongly) and either resume the wrong order
+    or flag phantom position on next tick. The stop child is
+    recognized separately via stop_child_recognized; this map only
+    tracks parents.
+    """
+    parents: dict[str, BrokerOpenOrder] = {}
+    for row in rows:
+        strategy, trade_id, is_stop = parse_client_tag(row.client_tag)
+        if not trade_id or is_stop:
+            continue
+        parents[trade_id] = row
+    return parents
+
+
+def _index_status_events_by_trade_id(
+    rows: Iterable[BrokerOrderStatusEvent],
+) -> dict[str, BrokerOrderStatusEvent]:
+    """Map trade_id -> most-recent-terminal status event.
+
+    Codex round-11 P1: crash-window orders (submit succeeded, journal
+    had only order_proposed) can finish at the broker before restart.
+    BrokerOrderStatusEvent now carries client_tag (populated by the
+    connector from ib_async's orderRef on completed orders), so
+    recovery can match by trade_id and classify the terminal fate
+    rather than leaving the proposal as pending_no_broker_counterpart.
+    """
+    idx: dict[str, BrokerOrderStatusEvent] = {}
+    for row in rows:
+        if row.status not in TERMINAL_ORDER_STATUSES:
+            continue
+        strategy, trade_id, _ = parse_client_tag(row.client_tag)
+        if not trade_id:
+            continue
+        prior = idx.get(trade_id)
+        if prior is None or row.last_update_at >= prior.last_update_at:
+            idx[trade_id] = row
+    return idx
+
+
+def _classify_terminal(status: BrokerOrderStatusEvent) -> str:
+    """Map a terminal broker status to a reconciliation case.
+
+    Codex round-2 P1: the dimension that matters for position
+    reconciliation is `filled_qty`, not the status string. A Cancelled
+    or Rejected order with filled_qty > 0 still moved inventory, and
+    the reconciliation_deltas pass must see it as a partial fill so
+    the implied position includes those shares. Otherwise the next
+    restart sees the broker position as phantom.
+    """
+    if status.filled_qty > 0:
+        if status.remaining_qty == 0:
+            return "pending_filled"
+        return "pending_partially_filled"
+    if status.status == "Rejected":
+        return "pending_rejected"
+    if status.status in {"Cancelled", "ApiCancelled", "Inactive"}:
+        return "pending_cancelled"
+    # Any other terminal-ish status (shouldn't happen given the filter
+    # in _index_status_events) falls through to cancelled semantics.
+    return "pending_cancelled"
+
+
+def _pending_payload(pending: PendingFromJournal) -> dict[str, Any]:
+    return {
+        "ticker": pending.ticker,
+        "side": pending.side,
+        "qty": pending.qty,
+        "limit_price": (
+            str(pending.limit_price)
+            if pending.limit_price is not None
+            else None
+        ),
+        "stop_loss": (
+            str(pending.stop_loss)
+            if pending.stop_loss is not None
+            else None
+        ),
+        "submitted_at": pending.submitted_at.isoformat(),
+    }
+
+
+def _perm_id_of(obj: Any) -> str | None:
+    value = getattr(obj, "broker_perm_id", None)
+    return value or None
+
+
+def _order_id_of(obj: Any) -> str | None:
+    value = getattr(obj, "broker_order_id", None)
+    return value or None
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+__all__ = [
+    "DEFAULT_LOOKBACK",
+    "PendingFromJournal",
+    "PositionFromJournal",
+    "RECOVERY_OVERRIDE_ENV",
+    "ReconciliationEvent",
+    "ReconciliationResult",
+    "RecoveryStatus",
+    "reconcile",
+]

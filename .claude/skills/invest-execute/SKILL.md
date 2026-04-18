@@ -3,42 +3,114 @@ name: invest-execute
 description: Claude-side wrapper for the Python execution engine. Reads engine state from the vault (kill-switch, last decision journal entries, open positions), surfaces it to Keith, and can manually trigger a run of the engine's main loop. Does NOT call any validator or bypass; the engine owns all enforcement. Use when Keith says /execute, "run the engine", "what's the engine doing", "show me the last trades", "is the kill switch on".
 tier: Trader
 phase: 2
-status: stub
+status: shipped
 ---
 
-# invest-execute (STUB -- Phase 2 build work)
+# invest-execute
 
-Stub skill. Implementation is Phase 2 milestone 2.8. Specs below.
+Thin Claude wrapper over the Python execution engine (`execution/engine/main.py`).
 
-## MVP shape
+Claude orchestrates; the engine enforces. Every sub-command below reads or triggers; none of them bypass a validator, delete `.killed`, or submit an order outside the engine process.
 
-**Sub-commands:**
-- `/execute status` -- print .killed state, last 10 decision journal entries, open IBKR positions (from engine's cached state, NOT a fresh ib_async call by Claude)
-- `/execute run` -- trigger one pass of the engine main loop (in Phase 2, invoke locally; in Phase 4, SSH the Mini and launch via pm2 restart)
-- `/execute journal` -- tail today's `raw/journal/YYYY-MM-DD.jsonl` with pretty-printing
-- `/execute kill-status` -- show whether `.killed` is present and when it was written
+## Sub-commands
 
-**Read-only boundary:**
-Claude CANNOT:
-- Edit `execution/validators/config.yaml` (invest-propose-limits drafts a delta into review/)
-- Delete `.killed` (human-only)
-- Place orders directly (only the engine process can submit via ibkr.py)
-- Bypass any validator (the engine refuses on a reject, period)
+Keith triggers with `/execute <sub>`. If `<sub>` is omitted, default to `status`.
 
-Claude CAN:
-- Trigger a run (the engine decides whether to act based on its own state)
-- Read any file the engine writes to the vault
-- Surface engine state to Keith for human judgment
+### `/execute status`
 
-## Non-goals (not in Phase 2)
+Surface a one-screen summary of engine state.
 
-- Continuous polling dashboard (Phase 4 if needed; pm2 cron already keeps engine alive)
-- Cross-strategy view (Phase 2 runs one strategy; multi-strategy view is Phase 4)
-- P&L attribution (Phase 2 P&L stub is manual; Phase 4 auto-attributes to strategies)
+```bash
+VAULT="$HOME/Projects/K2Bi-Vault"
+KILL_FILE="$VAULT/System/.killed"
+JOURNAL_DIR="$VAULT/raw/journal"
+TODAY_JOURNAL="$JOURNAL_DIR/$(date -u +%Y-%m-%d).jsonl"
+```
+
+Show:
+
+1. **Kill switch** — present or absent; if present, who wrote it + when (`jq . "$KILL_FILE"`).
+2. **Last 10 journal events** — `tail -n 10 "$TODAY_JOURNAL"` piped through `jq -c '{ts, event_type, strategy, ticker, side, qty}'` so the line-per-event digest fits a terminal width.
+3. **Open positions** — parsed from the most recent `engine_started` or `engine_recovered` event's `adopted_positions` payload. Engine owns the authoritative list; Claude does NOT call `ib_async` directly.
+4. **Last submitted orders with broker IDs** — grep for `event_type=order_submitted` in today's journal, show `ticker`, `side`, `qty`, `broker_order_id`, `broker_perm_id`, `ts`.
+
+Render as a Markdown report with headings `### Kill`, `### Recent events`, `### Open positions`, `### Last submitted orders`. Keep under 30 lines on a typical day.
+
+### `/execute run`
+
+Trigger one tick of the engine main loop.
+
+Phase 2: invoke locally from the MacBook (engine runs against the same IB Gateway 10.37 on `localhost:4002`).
+
+```bash
+cd "$HOME/Projects/K2Bi"
+python3 -m execution.engine.main --once
+```
+
+If `ib_async` is not installed, print the install command and stop:
+
+```bash
+python3 -c "import ib_async" 2>/dev/null || {
+  echo "ib_async missing. Install with: pip install ib_async==2.1.0"
+  exit 1
+}
+```
+
+Phase 4 (not in this ship): SSH the Mac Mini and invoke via `pm2 restart invest-execute` instead.
+
+After the tick returns, surface the newest journal events it produced by comparing `$(wc -l "$TODAY_JOURNAL")` before and after the call; print only the delta.
+
+### `/execute journal`
+
+Pretty-print today's journal with one event per line.
+
+```bash
+VAULT="$HOME/Projects/K2Bi-Vault"
+JOURNAL="$VAULT/raw/journal/$(date -u +%Y-%m-%d).jsonl"
+if [ ! -f "$JOURNAL" ]; then
+  echo "No journal for today yet."
+  exit 0
+fi
+jq -c '{ts, event_type, strategy, trade_id, ticker, side, qty, broker_order_id, broker_perm_id, payload}' < "$JOURNAL"
+```
+
+Accept an optional `--since <ISO-ts>` filter to narrow output.
+
+### `/execute kill-status`
+
+Fast check. Print one line:
+
+```bash
+VAULT="$HOME/Projects/K2Bi-Vault"
+KILL_FILE="$VAULT/System/.killed"
+if [ -f "$KILL_FILE" ]; then
+  TS=$(jq -r .ts "$KILL_FILE")
+  WHY=$(jq -r .reason "$KILL_FILE")
+  SRC=$(jq -r .source "$KILL_FILE")
+  echo "kill active since ${TS} (source=${SRC}, reason=${WHY})"
+else
+  echo "kill inactive"
+fi
+```
+
+## Read-only boundary (architectural)
+
+Claude **cannot**:
+
+- Edit `execution/validators/config.yaml` (invest-propose-limits drafts a delta into `review/strategy-approvals/` for Keith's explicit approval; only `/invest-ship` lands the edit).
+- Delete `.killed` (human-only filesystem operation; no Claude-accessible path modifies it).
+- Place orders directly (the IBKR connector in `execution/connectors/ibkr.py` is invoked only inside the engine's `run_forever` or `run_once`).
+- Bypass any validator (the engine's `run_all` short-circuits on the first rejection; there is no `--force` flag).
+
+Claude **can**:
+
+- Trigger a tick via `/execute run`; the engine decides whether to submit based on its own state, strategies, validators, and breakers.
+- Read any file the engine writes to the vault (journal, `.killed`, engine-started payload).
+- Surface engine state to Keith for human judgment.
 
 ## Hard rule
 
-Any Phase 2 edit to this skill that grants Claude the ability to override a validator, delete .killed, or submit orders without going through the engine is a rejection during /invest-ship Codex review. The boundary is architectural, not convenience.
+Any edit to this skill that grants Claude the ability to override a validator, delete `.killed`, or submit orders without going through the engine is a rejection during `/invest-ship` Codex review. The boundary is architectural, not convenience.
 
 ## Pedagogical layer (Teach Mode)
 
@@ -49,34 +121,56 @@ LEARNING_STAGE=$(grep -E '^learning-stage:' ~/Projects/K2Bi-Vault/System/memory/
 LEARNING_STAGE=${LEARNING_STAGE:-novice}
 ```
 
-If `LEARNING_STAGE` is `novice` or `intermediate`, append the following per-fill footer after the standard fill receipt + decision journal confirmation:
+If `$LEARNING_STAGE` is `novice` or `intermediate`, append a **Why this matters for your position** footer after the standard output whenever the command produced a fill or a kill transition. The footer covers:
 
-```markdown
----
-**Why this matters for your position:**
+- Position change: new qty, new percentage of NAV, cost basis
+- Stop-loss level translated to both ticker-side dollars and HKD account risk
+- Daily risk envelope remaining
+- Any correlation / concentration flag active
+- Watch-points (next strategy rule that would close the position)
 
-[2-3 sentences explaining what the fill changes: new total exposure, percentage of portfolio now in this name, daily risk budget remaining after this trade, any concentration or correlation flag, what watch-points are now active (stop-loss level in HKD, take-profit if any).]
-```
-
-Example:
+Example after a `/execute run` that filled a 70-share SPY buy:
 
 ```markdown
 **Fill received:**
 
-- order-id: O-2026-04-22-0017
+- trade-id: T-2026-04-22-0017
 - ticker: SPY
 - action: buy
-- quantity: 70 shares
+- quantity: 70
 - fill-price: $498.32
-- slippage-vs-expected: -$0.08 (within 0.05% expectation)
-- decision-journal: T-2026-04-22-0017
+- slippage-vs-expected: -$0.08 (0.016%)
 
 ---
 **Why this matters for your position:**
 
-You now hold 70 shares of SPY at HK$50,820 (~5.1% of portfolio). Stop-loss is at $448.49 (10% below entry); if hit, you lose HK$5,082 -- exactly at the 1% trade-risk cap, no margin to spare. Daily risk envelope: HK$10,000 used of HK$10,000 budget today, so this is the last trade until tomorrow. Take-profit at Friday close per strategy rules. No correlated positions open, so no concentration flag.
+You now hold 70 SPY at HK$50,820 (5.1% of NAV). Stop-loss $448.49 -> HK$5,082 max loss -> exactly at 1% trade-risk cap. Daily risk budget: fully consumed; no further buys until tomorrow. No correlated positions open. Take-profit at Friday close per strategy rules.
 ```
 
-If `LEARNING_STAGE` is `advanced`, skip the footer.
+If `$LEARNING_STAGE` is `advanced`, skip the footer.
 
-Terms appearing for the first time in this output that exist in `K2Bi-Vault/wiki/reference/glossary.md` render as `[[glossary#term-name]]`. Terms not yet in the glossary get auto-stubbed per the Teach Mode convention in `CLAUDE.md`.
+Terms appearing for the first time that exist in `K2Bi-Vault/wiki/reference/glossary.md` render as `[[glossary#term-name]]` wiki-links (first occurrence only per output). Terms not yet in the glossary get stubbed at the bottom of the glossary file in the same skill run per the Teach Mode convention in `CLAUDE.md`.
+
+## Engine internals (reference, not operational)
+
+The Python engine in `execution/engine/main.py` is a state machine with these states:
+
+- `INIT` — startup; connect to IBKR, reconcile journal vs broker
+- `CONNECTED_IDLE` — healthy, waiting for the next tick
+- `PROCESSING_TICK` — evaluating approved strategies
+- `SUBMITTING` — order in flight to IBKR
+- `AWAITING_FILL` — broker acknowledged, waiting for fill / partial / rejection
+- `RECONCILING` — fill received, updating positions, journaling
+- `KILLED` — `.killed` file present; no new orders submitted
+- `DISCONNECTED` — IB Gateway unreachable; exponential-backoff reconnect
+- `SHUTDOWN` — graceful exit
+
+State transitions are fully specified in `K2Bi-Vault/wiki/planning/m2.6-engine-state-machine.md`. Each transition emits one or more journal events (see `K2Bi-Vault/wiki/reference/journal-schema.md`).
+
+Claude never calls into any module under `execution/` directly. The only entry points are the bash commands above and (Phase 4) the pm2-managed daemon on the Mac Mini.
+
+## Non-goals (not in Phase 2)
+
+- Continuous polling dashboard (Phase 4 if needed; pm2 cron already keeps the engine alive).
+- Cross-strategy view (Phase 2 runs one strategy at a time; multi-strategy view lands in Phase 4).
+- P&L attribution (Phase 2 P&L stub is manual; Bundle 5 wires IBKR fills; Phase 4 auto-attributes to strategies).
