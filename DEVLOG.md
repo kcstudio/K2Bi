@@ -4,6 +4,25 @@ Session-by-session ship log. Append-only. New entries on top.
 
 ---
 
+## 2026-04-19 -- Remove stale NEXT_SESSION.md reference from CLAUDE.md
+
+**Commit:** `832508d` docs: remove stale NEXT_SESSION.md reference from CLAUDE.md
+
+**What shipped:** CLAUDE.md's "What's Next (Phase 1 Session 3)" section pointed at `NEXT_SESSION.md`, a file that was never committed to git (verified via `git log --all -- NEXT_SESSION.md`, empty result) and no longer exists on disk. The Session 3 summary text had also drifted now that Phase 1 shipped at `4ea9b70` on 2026-04-18. Replaced with a short pointer to `[[planning/index#Resume Card]]` (the authoritative "what's next" source on every new session), noting Phase 1 CLOSED and Phase 2 Bundle 3 mid-flight at `2b0272b` cycle 5 of 7. Grep confirmed CLAUDE.md was the only file carrying the stale reference.
+
+**Codex review:** clean. Working-tree scope, zero findings -- verdict: "do not introduce an identifiable functional or maintainability bug that would warrant an inline review finding."
+
+**Feature status change:** none -- `--no-feature` docs cleanup, no feature note touched.
+
+**Follow-ups:** none. Resume Card at `~/Projects/K2Bi-Vault/wiki/planning/index.md` was left untouched per explicit instruction; Bundle 3 cycle 6 in-flight work (`scripts/lib/propose_limits.py`, `tests/test_propose_limits.py`, `proposals/2026-04-19_k2bi-bundle-3-approval-gate-spec.md`) was not touched.
+
+**Key decisions:** NEXT_SESSION.md not restored -- Resume Card has absorbed its role and the file never existed in git history, so this is pure forward-motion cleanup rather than a file-resurrection call.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Co-Shipped-By: invest-ship
+
+---
+
 ## 2026-04-19 -- Fork-hygiene tightening + audit guard finishing pass
 
 **Commit:** `e8e8e61` chore(fork-hygiene): tighten audit guard + finish K2B->K2Bi org swap
