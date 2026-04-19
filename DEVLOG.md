@@ -343,3 +343,24 @@ One out-of-scope finding in Pass 4 (P2 on `CLAUDE.md:153` — strategy-gate enfo
 - Post-commit hook written in Python (not bash) so it can import `execution.risk.kill_switch.write_retired` + `execution.engine.main.derive_retire_slug` directly; bash + python shell-out would duplicate the slug derivation and re-open the parity gap R11 flagged in cycle 3.
 - `_nfc()` does more than NFC -- it also `str()`-coerces YAML scalars and `isoformat()`-canonicalises datetimes. The expanded contract closes 3 reviewer-reported false-positive classes (float vs quoted string, int vs quoted int, unquoted datetime vs quoted ISO string) without loosening the safety-critical equality check on actually-different values.
 - Override env usage is now logged to `wiki/log.md` via the single-writer helper in addition to stderr. Git does not capture stderr into the commit object, so stderr-only audit left no durable record; the new best-effort log call does.
+
+
+## 2026-04-19 -- Bundle 3 cycle 4 gap closed: invest-sync reads deploy-config.yml
+
+**Commit:** `59b454b` fix(invest-sync): read categories from deploy-config.yml (closes cycle 2 gap)
+
+**What shipped:** Cycle 2 anchored `scripts/deploy-config.yml` as the single source of truth for K2Bi's category set and pointed `/invest-ship`'s step-12 preflight at it. The propagation missed `/invest-sync`'s SKILL.md, which still hardcoded K2B's K2B-era set `{skills, code, dashboard, scripts}`. Cycle 4's own defer mailbox entry -- category `execution` -- landed in that gap and surfaced the bug: the scan flagged the entry as UNREADABLE with the confusingly precise message "category:unknown execution (expected subset of ['code', 'dashboard', 'scripts', 'skills'])". Rule going forward: no skill or script hardcodes category / target lists; every consumer shells out to `scripts/lib/deploy_config.py list-categories` / `list-targets` / `classify`.
+
+This commit also extracts the previously inline mailbox-scan Python heredoc from SKILL.md into `scripts/lib/pending_sync.py` so the scan + delete + fail-closed logic is testable in isolation. New module, new CLI, 25 new tests covering happy paths + every rejection class + stale `.tmp_` files + delete race-safety. Full suite: 418 passing.
+
+**Codex review:** R1 APPROVE; verified `scan_mailbox` fail-closes on `load_valid_categories` error, yaml-symmetry test parses `deploy-config.yml` correctly line-by-line, SKILL.md decision tree matches helper stdout format (`EMPTY` / `VALID|...` / `UNREADABLE|...`). MiniMax R1 four findings -- F1 (empty helper output silent pass) / F2 (yaml symmetry test gap) / F3 (empty-output test gap) fixed inline, F4 (preflight coverage) dismissed as out-of-scope (covered in `tests/test_deploy_coverage.py`). MiniMax R2 surfaced five theoretical TOCTOU / clock-skew / caching / caller-contract concerns on a design already documented as race-free by producer contract; all deferred per spec §10 triage. User/linter added `scripts/audit-fork-drift.sh` + `scripts/fork-audit-allowlist.txt` alongside `/invest-ship`'s new step 0, both shipped in this commit and runs clean on the current tree.
+
+**Feature status change:** no feature note (infra cleanup; follows cycle 4's standalone-commit pattern).
+
+**Follow-ups:**
+- Re-run `/invest-sync` to consume the cycle 4 defer mailbox entry + deploy to Mini (session closeout action).
+- Cycle 5: `/invest-ship --approve-strategy`, `--reject-strategy`, `--retire-strategy`, `--diagnose-approved` subcommands (unblocked by cycle 4 hooks + this infra cleanup).
+
+**Key decisions (infra-level):**
+- Extracting `pending_sync.py` was more than a one-line VALID_CATEGORIES swap but worth the reach: the bash heredoc was 80+ lines with complex state encoding, impossible to unit-test, and the bug it surfaced (category allowlist drift) would have recurred every time someone forked the skill without re-running the scan code. A proper module with a CLI is the pattern every other hook check has already adopted (`strategy_frontmatter.py`, `deploy_config.py`).
+- Yaml-symmetry test parses `scripts/deploy-config.yml` via regex (not `yaml.safe_load`) to stay consistent with `deploy_config.py`'s stdlib-only fallback parser -- the test should not impose a PyYAML dependency the helper doesn't require.
