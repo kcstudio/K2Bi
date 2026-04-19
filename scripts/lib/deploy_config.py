@@ -28,6 +28,25 @@ Subcommands are text-oriented so bash can consume them via command substitution:
       by `targets:` AND not in `excludes:` is a drift signal; print each to
       stderr and exit 1. Exit 0 on clean.
 
+  deploy_config.py detect-categories
+      Print the set of categories that have changed since the last successful
+      sync. The set unions: (a) uncommitted working-tree diffs vs HEAD,
+      (b) untracked files respecting .gitignore, (c) committed diffs between
+      the sentinel SHA at .sync-state/last-synced-commit and HEAD. If the
+      sentinel is absent (first-time deploy) or points to an unreachable SHA
+      (rebased/amended away), falls back to printing all known categories so
+      nothing is silently skipped on the next rsync. Replaces the cycle-2
+      deploy-to-mini.sh auto-detect which keyed off `git diff HEAD~1 HEAD`
+      and missed committed code changes when a devlog-only commit landed on
+      top of them (the cycle-5 carry-over bug).
+
+  deploy_config.py record-sync
+      Write the current `git rev-parse HEAD` SHA to
+      .sync-state/last-synced-commit atomically (tempfile + os.replace).
+      Called by deploy-to-mini.sh after a successful (non-dry-run) sync so
+      the next detect-categories call can scope its diff to commits that
+      landed after this point.
+
 The config file path defaults to $(git rev-parse --show-toplevel)/scripts/deploy-config.yml;
 override via $K2BI_DEPLOY_CONFIG.
 """
@@ -371,6 +390,265 @@ def cmd_classify(config: dict, files: list[str]) -> int:
     return 0
 
 
+def _sentinel_path(repo: Path) -> Path:
+    """Return the path where record-sync persists the last-successfully-synced
+    HEAD SHA. Lives under .sync-state/ at repo root -- gitignored, per-machine
+    state, never deployed (the Mini has its own local state).
+
+    Kept separate from the .pending-sync/ mailbox on purpose: the mailbox is a
+    producer/consumer queue owned by /ship and /sync; this sentinel is a
+    single-writer state marker owned by /sync alone. Mixing them under one
+    dir would blur the ownership model that makes the mailbox race-free.
+    """
+    return repo / ".sync-state" / "last-synced-commit"
+
+
+def _git_in(repo: Path, *args: str) -> tuple[int, str, str]:
+    """Run git -C <repo> <args>; return (returncode, stdout, stderr).
+
+    Never raises on git failure -- callers decide how to degrade. Returns
+    (-1, "", "<reason>") if the git binary is not on PATH at all, which
+    makes fresh-container test harnesses behave the same as "not a repo".
+    """
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return -1, "", "git binary not found"
+    return p.returncode, p.stdout, p.stderr
+
+
+def _read_sentinel(repo: Path, *, head_sha: str | None = None) -> str | None:
+    """Return the last-synced SHA if present AND still a valid diff base
+    for the current HEAD, else None. A None return means detect-categories
+    falls back to "all categories" -- the conservative default so no
+    change slips past a fresh clone, an orphaned sentinel after a rebase,
+    or an unrelated-history sentinel after a branch switch.
+
+    Validity contract (Codex R7 final-gate F2): the sentinel must name an
+    object in the local database AND be an ancestor of the HEAD we are
+    diffing against. `git cat-file -e` alone accepts orphaned/abandoned-
+    branch SHAs that happen to still be reachable via reflog or another
+    ref -- `git diff <stale_sentinel> HEAD` on such a SHA would treat the
+    two trees as if they shared history and potentially miss or
+    mis-categorise files. `git merge-base --is-ancestor` rejects the SHA
+    when it is not an ancestor of HEAD, forcing the conservative "all
+    categories" fallback in that case.
+    """
+    path = _sentinel_path(repo)
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None
+    sha = raw.strip().split()[0] if raw.strip() else ""
+    if not sha:
+        return None
+    # A SHA that doesn't resolve to a reachable commit is useless for diff
+    # scope, so treat it as absent. This happens after force-pushes, amends
+    # outside the reflog window, or a destructive `git gc`.
+    rc, _, _ = _git_in(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+    if rc != 0:
+        return None
+    # Second gate (Codex R7 final-gate F2): the sentinel must be an
+    # ancestor of HEAD (or the explicit head_sha the caller pinned) so a
+    # branch-switch or orphan-branch SHA does not produce a nonsense
+    # diff base. `git merge-base --is-ancestor A B` exits 0 iff A is an
+    # ancestor of B.
+    target = head_sha or "HEAD"
+    rc, _, _ = _git_in(repo, "merge-base", "--is-ancestor", sha, target)
+    if rc != 0:
+        return None
+    return sha
+
+
+def _classify_file_to_category(
+    path: str, targets: list[tuple[str, str]]
+) -> str | None:
+    """Longest-prefix match path -> category; None if no target covers it."""
+    fnorm = path[2:] if path.startswith("./") else path
+    for tpath, tcat in targets:
+        if fnorm == tpath or fnorm.startswith(tpath + "/"):
+            return tcat
+    return None
+
+
+def cmd_detect_categories(
+    config: dict, *, head_sha: str | None = None
+) -> int:
+    """Print one category per line for every category that has pending changes
+    since the last successful sync.
+
+    Union of three signals:
+      1. `git diff --name-only HEAD` (uncommitted modifications, both staged
+         and unstaged)
+      2. `git ls-files --others --exclude-standard` (untracked files
+         respecting .gitignore)
+      3. `git diff --name-only <sentinel> <head>` (committed changes after
+         the last successful sync, where <head> is either the pinned
+         `--head` argument or the current `HEAD` at call time)
+
+    Fallback to "all known categories" when (a) git is not installed, (b) the
+    working directory is not a git repo, or (c) the sentinel is absent,
+    unreachable, OR not an ancestor of <head>. The ancestor check rejects
+    sentinels from orphaned / force-pushed-out branches so we never diff
+    against an unrelated history (Codex R7 final-gate F2).
+
+    `head_sha` is the Codex R7 final-gate F1 fix: callers that will also
+    invoke `record-sync` on the same run should pass the same pinned SHA
+    to both, so detection and sentinel advance agree on which snapshot
+    got synced. Without the pin, HEAD could advance between detection and
+    record-sync, producing a sentinel that claims commits got synced that
+    were never part of the detection scope.
+
+    Exit 0 always. An empty stdout means "no pending changes" -- the caller
+    (deploy-to-mini.sh auto mode) treats that as a "no-op, exit 0" signal.
+    """
+    repo = _repo_root()
+    # Verify we are in a git repo at all. Missing git, or a non-git override
+    # path, triggers the "all categories" fallback so first-time deploys work.
+    rc, _, _ = _git_in(repo, "rev-parse", "--git-dir")
+    if rc != 0:
+        return cmd_list_categories(config)
+
+    # Dirty + untracked always compare against the CURRENT working tree /
+    # HEAD. `head_sha` is only used to scope the committed-since-sentinel
+    # diff -- it is the upper bound of "this sync's snapshot". Using
+    # `head_sha` for the dirty diff would pull committed-past-the-pin files
+    # back into the pending set, defeating the whole point of pinning.
+    files: set[str] = set()
+
+    rc, dirty, _ = _git_in(repo, "diff", "--name-only", "HEAD")
+    if rc == 0:
+        files.update(line for line in dirty.splitlines() if line.strip())
+
+    rc, untracked, _ = _git_in(
+        repo, "ls-files", "--others", "--exclude-standard"
+    )
+    if rc == 0:
+        files.update(line for line in untracked.splitlines() if line.strip())
+
+    sentinel = _read_sentinel(repo, head_sha=head_sha)
+    if sentinel is None:
+        # First-time sync OR stale sentinel (not an ancestor of <head>, or
+        # missing from the object db) -- force all categories so we never
+        # silently skip a deploy on a fresh workspace or a history rewrite.
+        # Keith can still run `/sync <category>` or `/sync all` explicitly;
+        # this is only the auto-detect default.
+        return cmd_list_categories(config)
+
+    # Committed diff: sentinel..<pinned head or current HEAD>. The upper
+    # bound is the only place `head_sha` applies -- it lets deploy-to-mini.sh
+    # say "treat the state at run-start as the ceiling" so a commit that
+    # landed mid-sync does not sneak into this run's category set.
+    upper_bound = head_sha or "HEAD"
+    rc, committed, _ = _git_in(
+        repo, "diff", "--name-only", sentinel, upper_bound
+    )
+    if rc == 0:
+        files.update(line for line in committed.splitlines() if line.strip())
+
+    targets = [(t["path"].rstrip("/"), t["category"]) for t in config["targets"]]
+    targets.sort(key=lambda pc: len(pc[0]), reverse=True)
+
+    cats: set[str] = set()
+    for f in files:
+        cat = _classify_file_to_category(f, targets)
+        if cat is not None:
+            cats.add(cat)
+
+    for c in sorted(cats):
+        print(c)
+    return 0
+
+
+def cmd_record_sync(config: dict, *, sha: str | None = None) -> int:
+    """Atomically record a HEAD SHA as the last-successfully-synced commit.
+    Called by deploy-to-mini.sh after all rsync targets for a run have
+    landed (not on --dry-run).
+
+    `sha` is the Codex R7 final-gate F1 fix: deploy-to-mini.sh captures
+    a baseline SHA at run start and passes it through both detect-categories
+    and record-sync so the sentinel never advances past commits that were
+    never part of the matching rsync plan. When `sha` is None (legacy
+    callers, tests, manual invocation), falls back to `git rev-parse HEAD`
+    at call time -- the race-prone old behaviour, retained for ergonomics.
+
+    Write uses `tempfile.mkstemp` in the sentinel directory so two
+    concurrent `record-sync` invocations cannot collide on a deterministic
+    temp name (Codex R7 final-gate F3). The mkstemp fd is closed before
+    replace so the swap is a single filesystem syscall on POSIX.
+    """
+    import tempfile
+
+    repo = _repo_root()
+    target_sha = sha
+    if target_sha is None:
+        rc, head, stderr = _git_in(repo, "rev-parse", "HEAD")
+        if rc != 0:
+            sys.stderr.write(
+                "deploy-config record-sync: cannot read HEAD "
+                f"(not a git repo, or empty history): {stderr.strip()}\n"
+            )
+            return 1
+        target_sha = head.strip()
+    else:
+        target_sha = target_sha.strip()
+    if len(target_sha) < 7 or not all(
+        c in "0123456789abcdefABCDEF" for c in target_sha
+    ):
+        sys.stderr.write(
+            f"deploy-config record-sync: refusing to write malformed"
+            f" sha {target_sha!r}\n"
+        )
+        return 1
+
+    # Resolve to full SHA + verify it exists in the object database. This
+    # catches `--sha deadbeef` typos from the caller before we poison the
+    # sentinel with an unreachable SHA.
+    rc, full, err = _git_in(
+        repo, "rev-parse", "--verify", f"{target_sha}^{{commit}}"
+    )
+    if rc != 0:
+        sys.stderr.write(
+            f"deploy-config record-sync: sha {target_sha!r} does not resolve"
+            f" to a commit in this repo: {err.strip()}\n"
+        )
+        return 1
+    resolved_sha = full.strip()
+
+    path = _sentinel_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp returns a UNIQUE temp name, so two concurrent record-sync
+    # invocations each write their own file and each os.replace() is
+    # atomic and independent. The previous implementation used a
+    # deterministic `.tmp` suffix -- two racers would clobber each other's
+    # temp file, potentially leaving the sentinel at the wrong run's SHA
+    # (Codex R7 final-gate F3).
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".tmp_", suffix=".sync-state", dir=str(path.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(resolved_sha + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        sys.stderr.write(f"deploy-config record-sync: write failed: {exc}\n")
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        return 1
+    return 0
+
+
 def cmd_preflight(config: dict) -> int:
     """Fail loud on any repo path that is neither deployed (covered by a
     `targets:` entry) nor intentionally local (covered by an `excludes:`
@@ -428,6 +706,36 @@ def main() -> int:
 
     sub.add_parser("preflight", help="fail on uncovered top-level entries")
 
+    p_dc = sub.add_parser(
+        "detect-categories",
+        help="print categories with pending changes since last sync",
+    )
+    p_dc.add_argument(
+        "--head",
+        default=None,
+        help=(
+            "Pin the diff target to this SHA instead of the current "
+            "`HEAD`. Used by deploy-to-mini.sh so detection + record-sync "
+            "agree on the same snapshot even if a new commit lands "
+            "mid-sync."
+        ),
+    )
+
+    p_rs = sub.add_parser(
+        "record-sync",
+        help="atomically record a HEAD SHA as last-synced",
+    )
+    p_rs.add_argument(
+        "--sha",
+        default=None,
+        help=(
+            "Explicit SHA to record. Defaults to `git rev-parse HEAD` "
+            "at call time. Pass the same SHA that detect-categories "
+            "saw so the sentinel cannot advance past content that "
+            "never made it through rsync."
+        ),
+    )
+
     args = parser.parse_args()
     config = _load()
 
@@ -440,6 +748,10 @@ def main() -> int:
         return cmd_classify(config, files)
     if args.cmd == "preflight":
         return cmd_preflight(config)
+    if args.cmd == "detect-categories":
+        return cmd_detect_categories(config, head_sha=args.head)
+    if args.cmd == "record-sync":
+        return cmd_record_sync(config, sha=args.sha)
     parser.error(f"unknown subcommand {args.cmd}")
     return 2
 

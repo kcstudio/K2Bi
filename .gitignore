@@ -37,9 +37,14 @@ build/
 # Claude Code runtime artifacts (local-only state, never committed)
 .claude/*.lock
 .claude/settings.local.json
+.claude/worktrees/
 
 # MiniMax review archive (local-only -- raw responses, prompts, usage log)
 .minimax-reviews/
 
 # Unified review-runner archive (heartbeat log + state JSON per job)
 .code-reviews/
+
+# Sync sentinel (last-successfully-synced HEAD SHA) -- per-machine state
+# written by scripts/lib/deploy_config.py record-sync; never deployed
+.sync-state/

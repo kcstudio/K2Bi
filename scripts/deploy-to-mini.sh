@@ -51,38 +51,24 @@ KNOWN_CATEGORIES=$(python3 "$CONFIG_HELPER" list-categories)
 
 # --- helpers --------------------------------------------------------------
 
-detect_changes() {
-    # Tracked modified files since HEAD, plus untracked files anywhere within
-    # a deployed tree. Covers new-files-never-committed so /ship catches them
-    # before the first commit that lands them.
+detect_changed_categories() {
+    # Ask the config helper for the set of categories with pending changes
+    # since the last successful sync (sentinel at .sync-state/last-synced-commit).
+    # Canonical implementation unions uncommitted diffs, untracked files, and
+    # committed-since-sentinel diffs. Replaces the cycle-2 `git diff HEAD~1
+    # HEAD` fallback, which silently dropped earlier commits once a devlog
+    # follow-up commit landed on top (the cycle-5 carry-over bug).
+    #
+    # $1 is the pinned baseline SHA (captured at run start). Passed through
+    # to detect-categories + record-sync so the sentinel never advances past
+    # content the rsync plan did not see (Codex R7 final-gate F1).
     cd "$LOCAL_BASE"
-    local changes
-    changes=$(git diff --name-only HEAD 2>/dev/null || true)
-    if [[ -z "$changes" ]]; then
-        changes=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+    local baseline="${1:-}"
+    if [[ -n "$baseline" ]]; then
+        python3 "$CONFIG_HELPER" detect-categories --head "$baseline"
+    else
+        python3 "$CONFIG_HELPER" detect-categories
     fi
-    local untracked
-    untracked=$(git ls-files --others --exclude-standard 2>/dev/null || true)
-    if [[ -n "$untracked" ]]; then
-        if [[ -n "$changes" ]]; then
-            changes=$(printf '%s\n%s\n' "$changes" "$untracked")
-        else
-            changes="$untracked"
-        fi
-    fi
-    printf '%s\n' "$changes" | awk 'NF'
-}
-
-classify_changes() {
-    # Echo the set of distinct categories touched by $1 (newline-separated file list).
-    # Uses the config helper so the category semantics stay in one place.
-    local files="$1"
-    if [[ -z "$files" ]]; then
-        return 0
-    fi
-    printf '%s\n' "$files" | python3 "$CONFIG_HELPER" classify \
-        | awk -F '\t' '$1 != "uncovered" {print $1}' \
-        | sort -u
 }
 
 rsync_target() {
@@ -161,18 +147,31 @@ is_known_category() {
     return 1
 }
 
+# Codex R7 final-gate F1: capture the baseline SHA ONCE at run start and
+# thread it through detection + record-sync. Without this, a commit that
+# lands locally while rsync is copying files would advance the sentinel
+# even though its content was never part of the sync plan.
+#
+# MiniMax R7 R2 F1: a silent capture failure (empty BASELINE_SHA) causes
+# detect + record-sync to each re-resolve HEAD independently and
+# potentially disagree. For a real sync run, that is a correctness gap
+# we must surface loudly. --dry-run bypasses record-sync entirely, so
+# baseline inconsistency there is observational; still require git so
+# the dry-run reflects what the real run would do.
+BASELINE_SHA="$(cd "$LOCAL_BASE" && git rev-parse HEAD 2>/dev/null || true)"
+if [[ -z "$BASELINE_SHA" ]]; then
+    err "Cannot capture baseline SHA: \`git rev-parse HEAD\` failed in $LOCAL_BASE."
+    err "Deploy requires an initialised git repo with at least one commit."
+    err "If this is a fresh clone, finish \`git clone\` before running /sync."
+    exit 1
+fi
+
 RUN_CATEGORIES=""
 case "$MODE" in
     auto)
-        changes=$(detect_changes)
-        if [[ -z "$changes" ]]; then
-            warn "No changes detected. Use 'all' to force full sync."
-            exit 0
-        fi
-        RUN_CATEGORIES=$(classify_changes "$changes")
+        RUN_CATEGORIES=$(detect_changed_categories "$BASELINE_SHA")
         if [[ -z "$RUN_CATEGORIES" ]]; then
-            warn "Changes detected but none map to deploy-config.yml categories."
-            echo "$changes"
+            warn "No pending changes since last sync. Use 'all' to force full sync."
             exit 0
         fi
         ;;
@@ -224,5 +223,17 @@ echo ""
 if $DRY_RUN; then
     log "Dry run complete. Run without --dry-run to sync."
 else
+    # Record the post-sync HEAD so the next auto-detect can diff from here.
+    # Pass the pinned baseline SHA so the sentinel matches the snapshot we
+    # actually synced even if HEAD advanced mid-run (Codex R7 final-gate F1).
+    # A sentinel write failure is not fatal -- the sync itself succeeded; we
+    # just warn so Keith knows the next auto run may over-sync.
+    record_sync_args=()
+    if [[ -n "$BASELINE_SHA" ]]; then
+        record_sync_args+=(--sha "$BASELINE_SHA")
+    fi
+    if ! python3 "$CONFIG_HELPER" record-sync "${record_sync_args[@]}"; then
+        warn "Sync succeeded but sentinel write failed -- next auto run may over-sync."
+    fi
     log "Sync complete."
 fi

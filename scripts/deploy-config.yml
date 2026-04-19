@@ -65,9 +65,11 @@ excludes:
   - node_modules
   - build
   - dist
-  # Mailbox + reviewer archives (per-machine, never shipped)
+  # Mailbox + reviewer archives + sync sentinel (per-machine, never shipped)
   - .pending-sync
   - .minimax-reviews
+  - .code-reviews
+  - .sync-state
   # Vault is Syncthing-managed, not rsync-managed
   - K2Bi-Vault
   # Design docs + research workspace (MacBook dev tier only)
