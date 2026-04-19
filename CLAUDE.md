@@ -280,9 +280,9 @@ K2Bi ships in 6 phases. Summary:
 
 Cross-phase pillars: NotebookLM as first-class research pillar; monolithic single-agent + bear-case + deterministic validators (NOT firm-mimicry); IBKR HK as single broker stack (Alpaca dropped 2026-04-15); end-of-day approval window (no ad-hoc, no emergency override).
 
-## What's Next (Phase 1 Session 3)
+## What's Next
 
-See `NEXT_SESSION.md` in this repo root for the detailed Session 3 plan. Summary: finalize K2Bi standalone independence (fork remaining shared skills, seed memory, set up GitHub remote, configure Mac Mini infrastructure including Syncthing + first /sync, standalone verification, /ship smoke test). Session 3 closes Phase 1. After Phase 1 ships, Phase 2 starts in a new session from this repo.
+Read [[planning/index#Resume Card]] first on every new session -- it is the authoritative "what's next" source (current state, next concrete action, priority read order). Phase 1 is CLOSED (shipped 2026-04-18 at `4ea9b70`); Phase 2 is IN PROGRESS with Bundle 3 mid-flight at `2b0272b` (cycle 5 of 7).
 
 ## Planning Docs (Operational, Live)
 
