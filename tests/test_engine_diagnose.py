@@ -199,6 +199,49 @@ class FindNewestEngineStartedTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result["event_type"], "engine_started")
 
+    def test_nan_bearing_journal_line_is_skipped(self):
+        # Codex m2.23 round-3 surface audit: the diagnose read path
+        # (_iter_journal_read_only) must enforce the same RFC-8259
+        # strict-JSON contract as writer + recovery. A legacy or
+        # tampered line containing bare NaN / Infinity tokens must be
+        # silently skipped (not yielded with Python float('nan')
+        # values), so the diagnose output never surfaces non-RFC-8259
+        # journal records. Pair with a clean engine_started record on
+        # the same day so we can assert the clean one is still
+        # returned.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            day_file = tmp / f"{today}.jsonl"
+            day_file.write_text(
+                '{"ts": "2026-04-20T09:00:00+00:00", '
+                '"schema_version": 2, '
+                '"event_type": "engine_started", '
+                '"trade_id": null, "journal_entry_id": "01CLEAN", '
+                '"strategy": null, "git_sha": "test01", '
+                '"payload": {"strategies": []}}\n'
+                # Legacy/tampered NaN-bearing line for order_filled -
+                # earlier ts so it would lose the tie-break anyway.
+                '{"ts": "2026-04-20T08:00:00+00:00", '
+                '"schema_version": 2, '
+                '"event_type": "order_filled", '
+                '"trade_id": null, "journal_entry_id": "01BAD", '
+                '"strategy": null, "git_sha": "test01", '
+                '"payload": {}, "slippage_bps": NaN}\n',
+                encoding="utf-8",
+            )
+            # Iterator must not raise + the clean record must surface.
+            records = list(engine_main._iter_journal_read_only(day_file))
+            # The NaN-bearing order_filled line is skipped entirely;
+            # only the clean engine_started record survives.
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["event_type"], "engine_started")
+            self.assertEqual(records[0]["journal_entry_id"], "01CLEAN")
+            # And the higher-level finder still works correctly.
+            found = engine_main._find_newest_engine_started(tmp)
+            self.assertIsNotNone(found)
+            self.assertEqual(found["journal_entry_id"], "01CLEAN")
+
     def test_single_record_today(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

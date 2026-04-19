@@ -19,13 +19,19 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import math
 import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .schema import SCHEMA_VERSION, JournalSchemaError, validate
+from .schema import (
+    SCHEMA_VERSION,
+    JournalSchemaError,
+    reject_non_finite_json_constant,
+    validate,
+)
 from .ulid import new_ulid
 
 
@@ -84,6 +90,10 @@ class JournalWriter:
         qty: int | None = None,
         broker_order_id: str | None = None,
         broker_perm_id: str | None = None,
+        slippage_bps: float | None = None,
+        commission_usd: float | None = None,
+        fees_total_usd: float | None = None,
+        correlation_vs_portfolio: float | None = None,
         error: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         ts: datetime | None = None,
@@ -115,6 +125,35 @@ class JournalWriter:
             record["broker_order_id"] = broker_order_id
         if broker_perm_id is not None:
             record["broker_perm_id"] = broker_perm_id
+        # m2.23 Phase 5 metric fields -- prereg so first paper ticket
+        # populates 5.5/5.6/5.7 on day 1 rather than back-patching at
+        # day 90. Values are range-checked here (not in schema.validate)
+        # because the journal is append-only source-of-truth: letting
+        # NaN / Infinity / out-of-range values land produces non-standard
+        # JSON that downstream strict parsers can't read, and an
+        # impossible correlation like 1.5 silently breaks the Phase 5.7
+        # aggregator. Fail fast at write time.
+        if slippage_bps is not None:
+            self._require_finite_float("slippage_bps", slippage_bps)
+            record["slippage_bps"] = slippage_bps
+        if commission_usd is not None:
+            self._require_finite_float("commission_usd", commission_usd)
+            self._require_non_negative("commission_usd", commission_usd)
+            record["commission_usd"] = commission_usd
+        if fees_total_usd is not None:
+            self._require_finite_float("fees_total_usd", fees_total_usd)
+            self._require_non_negative("fees_total_usd", fees_total_usd)
+            record["fees_total_usd"] = fees_total_usd
+        if correlation_vs_portfolio is not None:
+            self._require_finite_float(
+                "correlation_vs_portfolio", correlation_vs_portfolio
+            )
+            if not -1.0 <= correlation_vs_portfolio <= 1.0:
+                raise ValueError(
+                    f"correlation_vs_portfolio must be in [-1, 1], "
+                    f"got {correlation_vs_portfolio!r}"
+                )
+            record["correlation_vs_portfolio"] = correlation_vs_portfolio
         if error is not None:
             record["error"] = error
         if metadata is not None:
@@ -151,6 +190,21 @@ class JournalWriter:
                     line = line.rstrip("\n")
                     if not line:
                         continue
+                    # Architect m2.23 R4 resolution (Path A): read_all
+                    # intentionally stays LENIENT -- plain json.loads,
+                    # no parse_constant hook. The writer (allow_nan=False)
+                    # and the crash-recovery tail-finalize branch
+                    # (strict parse_constant) together prevent new
+                    # NaN/Infinity records from ever landing on disk,
+                    # which is the m2.23 contract. Making read_all
+                    # strict would couple a single complete-but-bad line
+                    # to 24h of history loss via `_read_recent_journal`'s
+                    # silent catch, and engine startup MUST succeed on
+                    # corruption so .killed + reconcile stay reachable.
+                    # Strict reader + quarantine redesign is deferred to
+                    # Phase 5.1 kickoff (or first burn-in corruption
+                    # event); see the DEVLOG follow-up block of the
+                    # m2.23 cycle for the full trigger + ship shape.
                     out.append(json.loads(line))
             return out
         finally:
@@ -201,32 +255,46 @@ class JournalWriter:
             # A missing trailing newline is ambiguous: the last record may
             # be a crashed partial, OR a COMPLETE JSON object whose
             # newline got lost on a short write. Try to parse it first.
-            # If it parses, the record is valid -- append the newline
-            # durably and skip recovery. Only if parse fails is this a
-            # real partial that must be truncated + marked.
+            # If it parses AND contains no NaN/Infinity tokens, the
+            # record is valid -- append the newline durably and skip
+            # recovery. Only if parse fails is this a real partial that
+            # must be truncated + marked. The strict parse_constant
+            # hook mirrors `allow_nan=False` on the write path so the
+            # recovery finalize branch cannot launder Python-extension
+            # JSON into the audit log.
             last_fragment = parts[-1]
             try:
-                json.loads(last_fragment.decode("utf-8"))
-                # It parses: treat as a complete record just missing \n.
-                # Write the trailing newline in place + fsync; no
-                # recovery_truncated event (nothing was lost).
+                json.loads(
+                    last_fragment.decode("utf-8"),
+                    parse_constant=reject_non_finite_json_constant,
+                )
+                # It parses strictly: treat as a complete record just
+                # missing \n. Write the trailing newline in place +
+                # fsync; no recovery_truncated event (nothing was lost).
                 with latest.open("ab") as f:
                     f.write(b"\n")
                     f.flush()
                     os.fsync(f.fileno())
                 return None
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 pass
 
             partial = last_fragment
             complete = parts[:-1]
 
-            # Try parsing the last "complete" line to catch mid-line corruption too.
+            # Try parsing the last "complete" line to catch mid-line
+            # corruption too. Same strict policy as the tail-finalize
+            # branch (Codex m2.23 round-3): a complete-but-NaN line is
+            # still corruption; treating it as valid would let non-
+            # RFC-8259 JSON survive recovery in the rewritten file.
             last_complete_ok = True
             if complete:
                 try:
-                    json.loads(complete[-1].decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    json.loads(
+                        complete[-1].decode("utf-8"),
+                        parse_constant=reject_non_finite_json_constant,
+                    )
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                     last_complete_ok = False
                     complete = complete[:-1]
                     partial = parts[-2] + b"\n" + partial
@@ -266,7 +334,13 @@ class JournalWriter:
             # state is either "original with partial tail" OR "clean +
             # marker" -- never "clean without marker".
             marker_line = (
-                json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
+                json.dumps(
+                    record,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
             ).encode("utf-8")
 
             tmp_path = latest.with_suffix(latest.suffix + ".recover.tmp")
@@ -290,6 +364,27 @@ class JournalWriter:
             self._release_lock(lock_fd)
 
     # ---------- internals ----------
+
+    @staticmethod
+    def _require_finite_float(name: str, value: Any) -> None:
+        """Reject NaN / Infinity on numeric journal fields.
+
+        Codex m2.23 review P1: sparse data + divide-by-zero can yield
+        nan/inf in slippage/fees/correlation metrics. Python's json.dumps
+        emits these as bare NaN/Infinity tokens by default, producing
+        non-standard JSON that strict downstream consumers can't parse.
+        The journal is append-only source-of-truth -- hard reject at
+        write time.
+        """
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number, got {type(value).__name__}")
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+
+    @staticmethod
+    def _require_non_negative(name: str, value: float) -> None:
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value!r}")
 
     def _path_for(self, when: datetime) -> Path:
         return self.base_dir / f"{when.strftime('%Y-%m-%d')}.jsonl"
@@ -323,7 +418,21 @@ class JournalWriter:
 
     def _write_record_holding_lock(self, path: Path, record: dict[str, Any]) -> None:
         """Append one record. Caller MUST already hold the sidecar lock for `path`."""
-        line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
+        # allow_nan=False is defense-in-depth: append()'s field-level
+        # validators already reject non-finite numeric fields, but the
+        # strict JSON flag also catches any future caller that smuggles
+        # nan/inf through `payload` / `metadata`. The journal's audit
+        # contract requires RFC-8259 JSON, not Python's default
+        # NaN/Infinity extension.
+        line = (
+            json.dumps(
+                record,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        )
         # Fresh-file creates also need a parent-directory fsync: on POSIX,
         # fsync of the file descriptor alone does not make the new
         # directory entry durable. Without this, a power loss after the

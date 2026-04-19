@@ -22,6 +22,15 @@ v2 diff from v1:
     - SCHEMA_VERSION: 1 -> 2
     - Added 16 event types (see EVENT_TYPES_V2_ADDITIONS)
     - Added optional top-level fields: broker_order_id, broker_perm_id
+
+v2 additive (2026-04-20, m2.23 Phase 5 metric audit):
+    - Added optional top-level fields for Phase 5 metric capture on day 1
+      rather than back-patching at day 90:
+        slippage_bps              -> Phase 5.5 slippage vs expectation
+        commission_usd            -> Phase 5.6 fee erosion (broker commission)
+        fees_total_usd            -> Phase 5.6 fee erosion (incl regulatory)
+        correlation_vs_portfolio  -> Phase 5.7 correlation check
+      Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
 """
 
 from __future__ import annotations
@@ -102,13 +111,36 @@ OPTIONAL_TOP_LEVEL = (
     "ticker",
     "side",
     "qty",
-    "broker_order_id",   # v2: IB orderId (int serialized as str)
-    "broker_perm_id",    # v2: IB permId -- stable across IB Gateway restarts
+    "broker_order_id",            # v2: IB orderId (int serialized as str)
+    "broker_perm_id",             # v2: IB permId -- stable across IB Gateway restarts
+    # m2.23 Phase 5 metric capture (additive, 2026-04-20):
+    "slippage_bps",               # 5.5: signed float, negative = fill worse than ref
+    "commission_usd",             # 5.6: broker commission on the ticket (float)
+    "fees_total_usd",             # 5.6: aggregate ticket fees incl regulatory (float)
+    "correlation_vs_portfolio",   # 5.7: -1..1 snapshot at decision time
 )
 
 
 class JournalSchemaError(ValueError):
     pass
+
+
+def reject_non_finite_json_constant(raw: str) -> Any:
+    """`json.loads(..., parse_constant=...)` callback that rejects NaN / Infinity.
+
+    The journal's audit contract is RFC-8259 JSON; NaN / Infinity /
+    -Infinity tokens are a Python-only extension that strict
+    downstream consumers (non-Python, different runtimes) cannot read.
+    Every read/write path that touches journal JSON delegates to this
+    callback so the contract is enforced identically across writer,
+    reader, crash recovery, and out-of-process diagnose tooling.
+
+    Codex m2.23 round-3 surface audit: keep this helper in schema.py
+    (not writer.py) so cross-module callers -- engine diagnose reader,
+    future replay helpers -- can import the contract without reaching
+    into writer internals.
+    """
+    raise ValueError(f"non-finite JSON constant in journal: {raw!r}")
 
 
 def validate(record: dict[str, Any]) -> None:

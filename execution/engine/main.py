@@ -60,6 +60,7 @@ from ..connectors.types import (
     LIVE_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
 )
+from ..journal.schema import reject_non_finite_json_constant
 from ..journal.ulid import new_ulid
 from ..journal.writer import JournalWriter
 from ..risk import cash_only, kill_switch
@@ -2400,11 +2401,18 @@ def _iter_journal_read_only(path: Path):
                     if not line:
                         continue
                     try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        # Skip corrupt lines. The writer's recovery
-                        # path cleans those up on its next append; we
-                        # must not touch disk from the diagnose read.
+                        yield json.loads(
+                            line,
+                            parse_constant=reject_non_finite_json_constant,
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        # Skip corrupt / non-RFC-8259 lines. JSONDecodeError
+                        # covers structural breakage; ValueError is raised
+                        # by the parse_constant hook when a NaN / Infinity
+                        # token appears. Both are "don't consume this
+                        # record" outcomes -- the writer's recovery path
+                        # cleans them up on its next append; the diagnose
+                        # read must never touch disk (Codex R7 P1 #2).
                         continue
         except OSError as exc:  # pragma: no cover -- advisory diagnose
             LOG.warning("diagnose: could not read %s: %s", path, exc)

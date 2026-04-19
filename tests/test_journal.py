@@ -431,6 +431,351 @@ class TimestampNormalizationTests(unittest.TestCase):
             self.writer.read_all(when=datetime(2026, 4, 18, 12, 0))
 
 
+class Phase5FieldsRoundTripTests(unittest.TestCase):
+    """m2.23 (2026-04-20) preregistered optional fields for Phase 5 metrics:
+        5.5 slippage              -> slippage_bps
+        5.6 fees                  -> commission_usd + fees_total_usd
+        5.7 correlation           -> correlation_vs_portfolio
+
+    Additive, no schema version bump. Records written WITHOUT these
+    fields must still parse (backward compat) so v2 records written
+    before m2.23 remain valid.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.writer = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_slippage_roundtrip(self):
+        rec = self.writer.append(
+            event_type="order_filled",
+            payload={"fill_price": "499.92", "reference_price": "500.00"},
+            slippage_bps=-1.6,
+        )
+        self.assertEqual(rec["slippage_bps"], -1.6)
+        records = self.writer.read_all()
+        self.assertEqual(records[0]["slippage_bps"], -1.6)
+
+    def test_fees_roundtrip(self):
+        rec = self.writer.append(
+            event_type="order_filled",
+            payload={"fill_price": "500.00"},
+            commission_usd=1.05,
+            fees_total_usd=1.23,
+        )
+        self.assertEqual(rec["commission_usd"], 1.05)
+        self.assertEqual(rec["fees_total_usd"], 1.23)
+        records = self.writer.read_all()
+        self.assertEqual(records[0]["commission_usd"], 1.05)
+        self.assertEqual(records[0]["fees_total_usd"], 1.23)
+
+    def test_correlation_roundtrip(self):
+        rec = self.writer.append(
+            event_type="order_proposed",
+            payload={"ticker": "SPY"},
+            correlation_vs_portfolio=0.42,
+        )
+        self.assertEqual(rec["correlation_vs_portfolio"], 0.42)
+        records = self.writer.read_all()
+        self.assertEqual(records[0]["correlation_vs_portfolio"], 0.42)
+
+    def test_backward_compat_without_new_fields(self):
+        self.writer.append(
+            event_type="order_submitted",
+            payload={"n": 1},
+        )
+        records = self.writer.read_all()
+        self.assertEqual(len(records), 1)
+        for key in (
+            "slippage_bps",
+            "commission_usd",
+            "fees_total_usd",
+            "correlation_vs_portfolio",
+        ):
+            self.assertNotIn(key, records[0])
+
+    def test_schema_version_not_bumped(self):
+        # Additive-only rule: Phase 5 field additions must NOT bump
+        # SCHEMA_VERSION past 2. A bump here would break readers that
+        # correctly allowlist {1, 2} per KNOWN_SCHEMA_VERSIONS.
+        from execution.journal.schema import KNOWN_SCHEMA_VERSIONS
+
+        self.assertEqual(SCHEMA_VERSION, 2)
+        self.assertEqual(set(KNOWN_SCHEMA_VERSIONS), {1, 2})
+
+
+class Phase5FieldValidationTests(unittest.TestCase):
+    """Codex m2.23 P1: the four Phase 5 metric fields must reject
+    NaN / Infinity / out-of-range values at write time. The journal
+    is append-only source-of-truth; a landed non-finite value cannot
+    be repaired and poisons downstream Phase 5 aggregators.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.writer = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _assert_nothing_written(self) -> None:
+        self.assertEqual(self.writer.read_all(), [])
+
+    def test_rejects_nan_slippage(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, slippage_bps=float("nan")
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_inf_slippage(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, slippage_bps=float("inf")
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_nan_commission(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, commission_usd=float("nan")
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_negative_commission(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, commission_usd=-0.01
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_negative_fees_total(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, fees_total_usd=-1.0
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_inf_fees_total(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled",
+                payload={},
+                fees_total_usd=float("inf"),
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_nan_correlation(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_proposed",
+                payload={},
+                correlation_vs_portfolio=float("nan"),
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_correlation_above_1(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_proposed",
+                payload={},
+                correlation_vs_portfolio=1.5,
+            )
+        self._assert_nothing_written()
+
+    def test_rejects_correlation_below_minus_1(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_proposed",
+                payload={},
+                correlation_vs_portfolio=-1.0001,
+            )
+        self._assert_nothing_written()
+
+    def test_accepts_correlation_at_bounds(self):
+        # Exactly +1 and -1 are valid (perfect positive/negative correlation).
+        self.writer.append(
+            event_type="order_proposed",
+            payload={},
+            correlation_vs_portfolio=1.0,
+        )
+        self.writer.append(
+            event_type="order_proposed",
+            payload={},
+            correlation_vs_portfolio=-1.0,
+        )
+        records = self.writer.read_all()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["correlation_vs_portfolio"], 1.0)
+        self.assertEqual(records[1]["correlation_vs_portfolio"], -1.0)
+
+    def test_accepts_zero_fees(self):
+        # Zero is a valid fee value (free-trade promo, paper account).
+        self.writer.append(
+            event_type="order_filled",
+            payload={},
+            commission_usd=0.0,
+            fees_total_usd=0.0,
+        )
+        records = self.writer.read_all()
+        self.assertEqual(records[0]["commission_usd"], 0.0)
+        self.assertEqual(records[0]["fees_total_usd"], 0.0)
+
+    def test_rejects_bool_as_numeric_field(self):
+        # bool is a subclass of int in Python; accepting it silently would
+        # serialize `True` / `False` as 1 / 0 in the journal. Force caller
+        # to pass a real number.
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="order_filled", payload={}, slippage_bps=True
+            )
+        self._assert_nothing_written()
+
+
+class Phase5SerializationHardeningTests(unittest.TestCase):
+    """Codex m2.23 P1 defense-in-depth: json.dumps must use allow_nan=False
+    so any nan/inf that slips through via payload/metadata gets caught at
+    write time instead of producing non-standard JSON on disk.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.writer = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_nan_in_payload_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="validator_pass",
+                payload={"bad": float("nan")},
+            )
+        # No partial file should be visible.
+        path = self.writer.path_for_today()
+        if path.exists():
+            # file may have been created with nothing inside; in either
+            # case, no parseable records should be present
+            self.assertEqual(self.writer.read_all(), [])
+
+    def test_inf_in_metadata_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.writer.append(
+                event_type="validator_pass",
+                payload={},
+                metadata={"latency_ms": float("inf")},
+            )
+
+    def test_read_all_stays_lenient_on_complete_nan_line(self):
+        # Architect m2.23 R4 resolution (Path A): read_all MUST remain
+        # lenient on complete newline-terminated lines. Making it
+        # strict couples a single bad line to 24h of history loss via
+        # `_read_recent_journal`'s silent-catch block, and engine
+        # startup MUST succeed on journal corruption so `.killed` +
+        # reconcile paths stay reachable. This test LOCKS IN the
+        # lenient contract so a future well-meaning refactor cannot
+        # silently re-strict read_all. The strict-reader + quarantine
+        # redesign is deferred to Phase 5.1 kickoff (see DEVLOG
+        # follow-up block in the m2.23 cycle).
+        import math as _math
+
+        w = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        w.append(event_type="order_submitted", payload={"n": 1})
+        path = w.path_for_today()
+        with path.open("ab") as f:
+            f.write(
+                b'{"ts":"2026-04-20T00:00:00.000000+00:00","schema_version":2,'
+                b'"event_type":"order_filled","trade_id":"x","journal_entry_id":"y",'
+                b'"strategy":null,"git_sha":null,"payload":{},"slippage_bps":Infinity}\n'
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        # Must NOT raise. Both records surface; the consumer is
+        # responsible for isfinite checks on Phase 5 metric fields.
+        records = w.read_all()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["event_type"], "order_submitted")
+        self.assertEqual(records[1]["event_type"], "order_filled")
+        # And the NaN/Infinity token rides through as a Python float.
+        # Consumers who care MUST isfinite-guard; the reader does not
+        # enforce (by architect decision).
+        self.assertTrue(_math.isinf(records[1]["slippage_bps"]))
+
+    def test_recovery_rewrites_complete_nan_line_as_truncation(self):
+        # Codex m2.23 round-3 P2: the recovery "last complete line" check
+        # must treat a NaN-bearing complete line as corruption too, so a
+        # rewritten recovered file does not carry the bad record forward.
+        w1 = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        w1.append(event_type="order_submitted", payload={"n": 1})
+        path = w1.path_for_today()
+        # Append a complete (newline-terminated) NaN-bearing line AND a
+        # real partial trailing line so recovery's "check last complete"
+        # branch is exercised against the NaN line.
+        with path.open("ab") as f:
+            f.write(
+                b'{"ts":"2026-04-20T00:00:00.000000+00:00","schema_version":2,'
+                b'"event_type":"order_filled","trade_id":"x","journal_entry_id":"y",'
+                b'"strategy":null,"git_sha":null,"payload":{},"slippage_bps":NaN}\n'
+                b'{"ts":"2026-04-20T00:00:01.000000+00:00","partial"'
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Restart triggers recovery. The NaN-bearing complete line must
+        # be recognized as corruption (last_complete_ok=False path) and
+        # excluded from the rewritten file.
+        JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        # Reader now enforces strict JSON too, so read_all would raise
+        # if the NaN line had survived. If it did not survive, read_all
+        # returns only the valid original record plus the recovery marker.
+        w2 = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        records = w2.read_all()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["event_type"], "order_submitted")
+        self.assertEqual(records[1]["event_type"], "recovery_truncated")
+
+    def test_recovery_rejects_newlineless_tail_with_nan(self):
+        # Codex m2.23 round-2 P2: crash recovery previously used plain
+        # json.loads to decide if a newline-less tail was a complete
+        # record that just lost its \n. Python's default json.loads
+        # accepts NaN / Infinity as valid, so a pre-strict writer (or
+        # a manually tampered file) could slip non-standard JSON
+        # through the recovery finalize branch. Strict parser must
+        # reject the fragment and fall back to treat-as-crashed-partial.
+        w1 = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        w1.append(event_type="order_submitted", payload={"n": 1})
+        path = w1.path_for_today()
+        # Append a newline-less tail that is syntactically valid JSON
+        # ONLY because Python accepts bare NaN tokens.
+        with path.open("ab") as f:
+            f.write(
+                b'{"ts":"2026-04-20T00:00:00.000000+00:00","schema_version":2,'
+                b'"event_type":"order_filled","trade_id":"x","journal_entry_id":"y",'
+                b'"strategy":null,"git_sha":null,"payload":{},"slippage_bps":NaN}'
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Simulate restart: recovery must NOT treat the NaN-bearing tail
+        # as "complete record just missing \n" -- it must truncate +
+        # mark the loss via recovery_truncated. (truncated_excerpt is
+        # capped at 80 chars and the NaN token lives at the end of the
+        # fragment, so we assert on truncated_bytes instead.)
+        w2 = JournalWriter(base_dir=self.base, git_sha=FIXED_GIT_SHA)
+        records = w2.read_all()
+        # Expect the 1 original record + exactly 1 recovery_truncated.
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["event_type"], "order_submitted")
+        self.assertEqual(records[1]["event_type"], "recovery_truncated")
+        self.assertGreater(records[1]["metadata"]["truncated_bytes"], 0)
+
+
 class RecoveryLockTests(unittest.TestCase):
     """Codex P1: recover_trailing_partial must hold the same sidecar lock
     as _atomic_append so a concurrent in-flight append is not misread as a
