@@ -179,15 +179,24 @@ If `codex-companion.mjs` is missing entirely (plugin not installed): fail loudly
 If Codex cannot run (quota reset, CLI wedged, plugin missing, network hard-fail, auth error), the approved backup is `scripts/minimax-review.sh`. Same adversarial-review prompt (vendored locally at `scripts/lib/adversarial-review.md`), different vendor (MiniMax M2.7 on `api.minimaxi.com`), single-shot, ~90s per call, ~$0.06 per call, no subscription quota. Cross-vendor adversarial property preserved.
 
 ```bash
-./scripts/minimax-review.sh                                  # working-tree scope, markdown output (default)
-./scripts/minimax-review.sh --json > /tmp/review.json        # machine-parseable JSON
-./scripts/minimax-review.sh --focus "<specific concern>"     # add focus area to the prompt
+# Pre-commit (Checkpoint 2): scope review to the files the commit will actually touch.
+# Prevents unrelated working-tree bloat (e.g. an in-progress 900-line plan sitting
+# next to the commit) from consuming the prompt budget and diluting the review.
+FILES="$(git diff --name-only HEAD | paste -sd, -)"
+./scripts/minimax-review.sh --scope diff --files "$FILES" --focus "<specific concern>"
+./scripts/minimax-review.sh --scope diff --files "$FILES" --json > /tmp/review.json
+
+# Plan review (Checkpoint 1) via MiniMax -- see "Plan review fallback" below.
+./scripts/minimax-review.sh --scope plan --plan "<plan-path>" --focus "<specific concern>"
+
+# Broader options
+./scripts/minimax-review.sh                                  # working-tree scope (Phase A; pulls every dirty file)
 ./scripts/minimax-review.sh --model MiniMax-M2.5             # fall further if M2.7 also misbehaves
 ```
 
 **Procedure when using the fallback:**
 
-1. Run `./scripts/minimax-review.sh` (or `--json` if you want to grep findings programmatically).
+1. Run `./scripts/minimax-review.sh --scope diff --files "$FILES"` with `FILES` = `git diff --name-only HEAD | paste -sd, -` (or `--json` if you want to grep findings programmatically). Use `--scope plan --plan <path>` for Checkpoint 1 plan review via MiniMax.
 2. Present findings neutrally to Keith. Severity translation: `critical` ≈ P0, `high` ≈ P1, `medium` ≈ P2, `low` ≈ P3 -- apply the same architect stop-rule (e.g. "ship when P1=0 + P2 isolated") against MiniMax severities using this mapping.
 3. Keith decides fix now / defer / accept. If fixed, re-run the tool on the new diff. Re-runs label the round `R<N>-minimax` (not just `R<N>`) so the audit trail is honest about the reviewer switch.
 4. The `/ship` gate is **still bypassed via `--skip-codex <reason>`** -- this skill's behavior does not change. Use one of these reason strings so the audit trail reflects whether MiniMax ran:
@@ -198,13 +207,13 @@ If Codex cannot run (quota reset, CLI wedged, plugin missing, network hard-fail,
 
 **Does NOT cover:**
 
-- **Plan review (Checkpoint 1).** `scripts/minimax-review.sh` is pre-commit (working-tree) only. If Checkpoint 1 also needs running AND Codex is unavailable, defer the ship until Codex is back rather than shipping unreviewed at the plan level.
 - **Automatic `/ship` integration.** `/ship` does not detect Codex failure and auto-fallback. The assistant runs `minimax-review.sh` manually when Codex errors, inspects the output, then proceeds with `/ship --skip-codex <reason>`. Keeping the switch explicit preserves audit clarity.
+
+**Plan review via MiniMax (Phase B, 2026-04-19):** `scripts/minimax-review.sh --scope plan --plan <path>` parses wikilinks and inline path refs in the plan file and pulls the referenced source files into the review context. This replaces the previous limitation that required deferring to Codex for Checkpoint 1 -- both checkpoints are now MiniMax-eligible when Codex is unavailable.
 
 **When to prefer waiting for Codex over running MiniMax:**
 
 - Iterative review loops (R1, R2, R3, ...) that were already started on Codex. Switching vendors mid-loop invalidates the convergence signal (different model, different blind spots, different finding baseline). Finish the loop on Codex if you can wait; relabel as `R<N>-minimax` if you switch.
-- Plan-review-sized work where Checkpoint 1 is the main gate and you don't have a Codex session on hand.
 
 ### Codex Adversarial Review -- the two checkpoints
 
