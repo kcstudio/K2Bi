@@ -99,6 +99,7 @@ Day-one consequences:
 - No AI cliches. No "Certainly!", "Great question!", "I'd be happy to", "As an AI".
 - No sycophancy. No excessive apologies.
 - Don't narrate. Don't explain your process. Just do the work.
+- Speak plainly. Keith speaks English as a second language. Skip jargon ("dogfood", "end-to-end", "split-brain", "canonical", etc.). If a technical word is unavoidable, explain it in simple words right after. Prefer short sentences and concrete examples over abstract ones. When Keith says "I don't understand" or "in English", rewrite simpler, not louder.
 - When creating vault notes, always use the appropriate template structure.
 - Always add YAML frontmatter with `tags`, `date`, `type`, `origin`, `up`.
 - When extracting from research sources, attribute insights with `origin:` correctly.
