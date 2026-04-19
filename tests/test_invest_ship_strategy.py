@@ -326,6 +326,66 @@ def _seed_bear_case_proceed(
     return path
 
 
+def _seed_backtest_passed(
+    repo: Path,
+    slug: str = "spy",
+    *,
+    date: str | None = None,
+    look_ahead_check: str = "passed",
+    look_ahead_check_reason: str = "",
+) -> Path:
+    """Seed raw/backtests/<date>_<slug>_backtest.md with a valid-schema
+    capture so `handle_approve_strategy`'s Bundle 4 cycle 3 backtest-
+    gate scan finds a fresh PROCEED. Default is today (real calendar)
+    with look_ahead_check=passed so CLI subprocess tests work without
+    pinning the clock. Fixed-clock tests can pin the date explicitly.
+    """
+    from datetime import date as _date
+    import yaml
+
+    backtests_dir = repo / "raw" / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    d = date or _date.today().isoformat()
+    fm = {
+        "tags": ["backtest", slug, "raw"],
+        "date": d,
+        "type": "backtest",
+        "origin": "k2bi-generate",
+        "up": "[[backtests/index]]",
+        "strategy_slug": slug,
+        "strategy_commit_sha": "abc123def456",
+        "backtest": {
+            "window": {"start": "2024-04-19", "end": d},
+            "source": "yfinance",
+            "source_version": "1.3.0",
+            "symbol": "SPY",
+            "reference_symbol": "SPY",
+            "metrics": {
+                "sharpe": 1.0,
+                "sortino": 1.5,
+                "max_dd_pct": -5.0,
+                "win_rate_pct": 55.0,
+                "avg_winner_pct": 2.0,
+                "avg_loser_pct": -1.5,
+                "total_return_pct": 20.0,
+                "n_trades": 30,
+                "avg_trade_holding_days": 5.0,
+            },
+            "look_ahead_check": look_ahead_check,
+            "look_ahead_check_reason": look_ahead_check_reason,
+            "last_run": f"{d}T10:00:00+00:00",
+        },
+    }
+    path = backtests_dir / f"{d}_{slug}_backtest.md"
+    path.write_text(
+        "---\n"
+        + yaml.safe_dump(fm, sort_keys=False, default_flow_style=False)
+        + "---\n\nbody\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_config_yaml(
     repo: Path, content: str | None = None
 ) -> Path:
@@ -435,7 +495,10 @@ class HandleApproveStrategyTests(unittest.TestCase):
         subprocess.run(["rm", "-rf", str(self.repo)], check=False)
 
     def test_happy_path_rewrites_frontmatter(self):
-        _seed_bear_case_proceed(self.repo, ticker="SPY")
+        _seed_bear_case_proceed(
+            self.repo, ticker="SPY", today="2026-04-19",
+        )
+        _seed_backtest_passed(self.repo, slug="spy", date="2026-04-19")
         path = _write_strategy(self.repo, slug="spy")
         now = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
         hints = iss.handle_approve_strategy(
@@ -481,7 +544,10 @@ class HandleApproveStrategyTests(unittest.TestCase):
         # immutability invariant.
         # NB: _write_strategy prepends `## How This Works\n\n` itself, so
         # `how_body` is just the prose after that heading.
-        _seed_bear_case_proceed(self.repo, ticker="SPY")
+        _seed_bear_case_proceed(
+            self.repo, ticker="SPY", today="2026-04-19",
+        )
+        _seed_backtest_passed(self.repo, slug="spy", date="2026-04-19")
         body = (
             "Line one.\n"
             "\n"
@@ -1236,6 +1302,7 @@ class CLISubprocessTests(unittest.TestCase):
 
     def test_approve_strategy_happy_path_emits_json(self):
         _seed_bear_case_proceed(self.repo, ticker="SPY")
+        _seed_backtest_passed(self.repo, slug="spy")
         _write_strategy(self.repo, slug="spy")
         result = self._run(
             "approve-strategy", "wiki/strategies/strategy_spy.md"

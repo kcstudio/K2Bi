@@ -111,16 +111,72 @@ def _seed_bear_case_proceed(repo: Path, env: dict, ticker: str = "SPY") -> Path:
     return path
 
 
+def _seed_backtest_passed(
+    repo: Path, env: dict, slug: str = "spy"
+) -> Path:
+    """Seed raw/backtests/<date>_<slug>_backtest.md with a passed-gate
+    capture + commit it so `handle_approve_strategy`'s Bundle 4 cycle 3
+    backtest gate finds a fresh PROCEED. Idempotent-ish: re-runs
+    overwrite the file + re-commit cleanly.
+    """
+    from datetime import date as _date
+    import yaml
+
+    today = _date.today().isoformat()
+    rel = f"raw/backtests/{today}_{slug}_backtest.md"
+    fm = {
+        "tags": ["backtest", slug, "raw"],
+        "date": today,
+        "type": "backtest",
+        "origin": "k2bi-generate",
+        "up": "[[backtests/index]]",
+        "strategy_slug": slug,
+        "strategy_commit_sha": "abc123def456",
+        "backtest": {
+            "window": {"start": "2024-04-19", "end": today},
+            "source": "yfinance",
+            "source_version": "1.3.0",
+            "symbol": "SPY",
+            "reference_symbol": "SPY",
+            "metrics": {
+                "sharpe": 1.0,
+                "sortino": 1.5,
+                "max_dd_pct": -5.0,
+                "win_rate_pct": 55.0,
+                "avg_winner_pct": 2.0,
+                "avg_loser_pct": -1.5,
+                "total_return_pct": 20.0,
+                "n_trades": 30,
+                "avg_trade_holding_days": 5.0,
+            },
+            "look_ahead_check": "passed",
+            "look_ahead_check_reason": "",
+            "last_run": f"{today}T10:00:00+00:00",
+        },
+    }
+    content = (
+        "---\n"
+        + yaml.safe_dump(fm, sort_keys=False, default_flow_style=False)
+        + "---\n\nbody\n"
+    )
+    path = write_file(repo, rel, content)
+    result = harness_commit(repo, env, f"chore: seed backtest {slug}", rel)
+    if result.returncode != 0:
+        raise AssertionError(f"backtest seed commit failed: {result.stderr}")
+    return path
+
+
 def _seed_proposed_strategy(
     repo: Path, env: dict, slug: str = "spy"
 ) -> Path:
     """Write a proposed strategy + commit it. Returns the file path.
 
-    Automatically seeds a PROCEED bear-case for the strategy's default
-    ticker (SPY) because `handle_approve_strategy` now refuses approval
-    without it (Bundle 4 cycle 2 gate, spec §3.2).
+    Automatically seeds a PROCEED bear-case + passed backtest for the
+    strategy's default ticker because `handle_approve_strategy` now
+    refuses approval without both (Bundle 4 cycle 2 + cycle 3 gates).
     """
     _seed_bear_case_proceed(repo, env, ticker=default_order()["ticker"])
+    _seed_backtest_passed(repo, env, slug=slug)
     content = strategy_text(
         name=slug,
         status="proposed",

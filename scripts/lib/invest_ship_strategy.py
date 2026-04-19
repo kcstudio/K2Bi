@@ -79,6 +79,23 @@ from scripts.lib import invest_bear_case as ibc
 from scripts.lib import strategy_frontmatter as sf
 
 
+# ---------- backtest approval gate constants (Bundle 4 cycle 3 / m2.15) ----------
+
+
+# Spec §3.5 LOCKED enum for the `backtest.look_ahead_check` field. Any
+# other value on a backtest file refuses approval (forces the enum to
+# stay locked; drift would need an explicit spec change + rev here).
+_BACKTEST_LOOK_AHEAD_PASSED = "passed"
+_BACKTEST_LOOK_AHEAD_SUSPICIOUS = "suspicious"
+
+
+# Spec §3.5 override section heading. Keith writes this in the strategy
+# body to accept a `suspicious` backtest. `has_section` accepts any suffix
+# after the heading (Backtest Override (2026-04-19), etc.), so the text
+# here is just the canonical heading title -- the helper handles variants.
+_BACKTEST_OVERRIDE_HEADING = "Backtest Override"
+
+
 # ---------- constants ----------
 
 # Required frontmatter fields on a strategy file at approval time. The
@@ -461,6 +478,848 @@ def scan_bear_case_for_ticker(
             f"unknown bear_verdict value {bear_verdict_raw!r} on "
             f"wiki/tickers/{ticker}.md; run /invest bear-case "
             f"{ticker} --refresh"
+        ),
+    )
+
+
+# ---------- backtest approval gate (Bundle 4 cycle 3 / m2.15) ----------
+
+
+_CAPTURE_FILENAME_DATE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})(?:_(\d{6}))?_"
+)
+
+
+def _is_writer_produced_filename(name: str, slug: str) -> bool:
+    """Strict check that `name` matches the writer's capture contract:
+
+        <YYYY-MM-DD>_<slug>_backtest.md                    (bare)
+        <YYYY-MM-DD>_<HHMMSS>_<slug>_backtest.md           (collision)
+
+    HHMMSS is validated as a real wall-clock time (00..23, 00..59,
+    00..59). The slug segment must match `slug` byte-exact (prevents a
+    file labeled for a different slug from glob-matching via suffix
+    collision).
+
+    Codex R8 #1 HIGH: the glob `*_<slug>_backtest.md` admits many non-
+    writer-produced paths (junk_<slug>_backtest.md, dates with invalid
+    HHMMSS like _999999_, misspelled segments). Without strict
+    filename validation, a hand-crafted file can enter the sort and
+    clear approval with forged passed content. This function is the
+    single seam that decides whether a file is eligible at all.
+    """
+    suffix = f"_{slug}_backtest.md"
+    if not name.endswith(suffix):
+        return False
+    prefix = name[: -len(suffix)]
+    # Bare form: YYYY-MM-DD.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", prefix):
+        try:
+            _dt.date.fromisoformat(prefix)
+        except ValueError:
+            return False
+        return True
+    # Collision form: YYYY-MM-DD_HHMMSS.
+    m = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})", prefix
+    )
+    if not m:
+        return False
+    try:
+        _dt.date.fromisoformat(m.group(1))
+    except ValueError:
+        return False
+    hh, mm, ss = int(m.group(2)), int(m.group(3)), int(m.group(4))
+    return 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59
+
+
+def _parse_filename_timestamp(name: str) -> _dt.datetime | None:
+    """Extract an aware datetime (UTC) from a capture filename.
+
+    Filename shapes accepted (spec §2.5 + plan-prompt decision #3):
+
+        <YYYY-MM-DD>_<slug>_backtest.md             -> <date>T00:00:00Z
+        <YYYY-MM-DD>_<HHMMSS>_<slug>_backtest.md    -> <date>T<HH:MM:SS>Z
+
+    Used to compare candidate captures chronologically when their
+    `backtest.last_run` cannot be parsed (malformed YAML, missing
+    field, etc.) -- the filename itself encodes approximate
+    chronology even when lex-sort disagrees with wall-clock.
+
+    Returns None when the filename does not match either shape.
+    """
+    m = _CAPTURE_FILENAME_DATE_RE.match(name)
+    if not m:
+        return None
+    date_str = m.group(1)
+    time_str = m.group(2)
+    try:
+        date = _dt.date.fromisoformat(date_str)
+    except ValueError:
+        return None
+    if time_str is None:
+        return _dt.datetime(
+            date.year, date.month, date.day, tzinfo=_dt.timezone.utc
+        )
+    try:
+        hh = int(time_str[0:2])
+        mm = int(time_str[2:4])
+        ss = int(time_str[4:6])
+        return _dt.datetime(
+            date.year, date.month, date.day, hh, mm, ss,
+            tzinfo=_dt.timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def _parse_last_run_timestamp(raw: Any) -> _dt.datetime | None:
+    """Coerce a `backtest.last_run` value to an aware `datetime` (UTC
+    if the source was naive). Returns None on anything not coercible --
+    callers skip files whose last_run is missing / malformed rather
+    than raising so a single bad capture cannot jam the gate.
+
+    Accepts:
+      * datetime/datetime.date (YAML typed)
+      * ISO-8601 string, with `Z` suffix normalised to `+00:00`
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, _dt.datetime):
+        ts = raw
+    elif isinstance(raw, _dt.date):
+        ts = _dt.datetime(raw.year, raw.month, raw.day)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            ts = _dt.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=_dt.timezone.utc)
+    return ts
+
+
+def _select_most_recent_backtest(
+    files: list[Path],
+) -> tuple[Path | None, dict | None, tuple[Path, str] | None]:
+    """Return `(path, frontmatter, malformed_newer)` for the capture
+    with the maximum `backtest.last_run` among the non-empty candidates.
+
+    `malformed_newer` is `(path, reason)` when any candidate with a
+    filename lex-greater than the selected one failed to parse or
+    lacks a usable last_run. Codex R2 #3 fix: surfacing this to the
+    caller forces a REFUSE rather than silently falling back to an
+    older valid capture when the newest one is corrupted. That is the
+    safe default -- a malformed latest run should block approval, not
+    hide behind stale evidence.
+
+    Codex R1 HIGH fix: the plan-prompt's "filename-descending =
+    chronological" assumption is false on same-day collisions (bare
+    `<date>_<slug>` sorts after `<date>_<HHMMSS>_<slug>` because
+    digits < lowercase in ASCII). Parsing `last_run` from every
+    candidate closes that surface at small cost (a few YAML parses
+    per approval; typical captures-per-slug is O(1..10)).
+
+    Returns `(None, None, None)` when NO candidate has a usable
+    last_run -- the caller falls back to filename-descending[0] so
+    the specific malformed-capture schema error surfaces to Keith.
+    """
+    parsed: list[tuple[_dt.datetime, Path, dict]] = []
+    unparseable: list[tuple[Path, str]] = []
+    for p in files:
+        try:
+            fm = sf.parse(p.read_bytes())
+        except OSError as exc:
+            unparseable.append((p, f"could not read ({exc})"))
+            continue
+        except ValueError as exc:
+            unparseable.append((p, f"unparseable ({exc})"))
+            continue
+        bt = fm.get("backtest") if isinstance(fm, dict) else None
+        if not isinstance(bt, dict):
+            unparseable.append((p, "missing `backtest:` mapping"))
+            continue
+        ts = _parse_last_run_timestamp(bt.get("last_run"))
+        if ts is None:
+            unparseable.append(
+                (p, "missing or malformed `last_run` timestamp")
+            )
+            continue
+        # Codex R4 #1 HIGH: last_run is mutable YAML -- a tampered
+        # capture could set a future last_run and outrank a newer
+        # valid rerun. Consistency check: the parsed last_run MUST
+        # stay within a tolerance of the filename-encoded timestamp.
+        # Different tolerances apply to bare vs HHMMSS filenames:
+        #
+        #   - HHMMSS filename encodes time-of-day, so the tolerance
+        #     is tight (1h -- covers clock-skew + second-boundary
+        #     writes but nothing more).
+        #   - Bare filename encodes date only, so the tolerance is
+        #     48h (±24h for timezone offsets -- Codex R5 #1: the
+        #     writer stamps UTC but a third-party-produced capture
+        #     could use local time, landing in adjacent UTC dates
+        #     near day boundaries).
+        #
+        # Outside these windows, treat as unparseable so the gate
+        # refuses rather than trusting a forged value.
+        _fname_match = _CAPTURE_FILENAME_DATE_RE.match(p.name)
+        if _fname_match is not None:
+            # Codex R6 #1 HIGH: bare filenames encode DATE only. The
+            # safe check is "last_run's local calendar date (in its
+            # own timezone) must equal the filename date". That
+            # naturally accommodates any timezone offset without
+            # allowing nearly-48h of future drift -- an older bare
+            # capture with `last_run: 2026-04-20T23:00Z` has local
+            # date 2026-04-20, which won't equal a filename-encoded
+            # 2026-04-19. HHMMSS filenames still require tight match
+            # (1h) against the encoded wall-clock.
+            is_bare = _fname_match.group(2) is None
+            filename_date_str = _fname_match.group(1)
+            if is_bare:
+                # Compare last_run's LOCAL calendar date (i.e. the
+                # date seen by the wall-clock of `ts.tzinfo`) to the
+                # filename date.
+                ts_local_date = ts.date().isoformat()
+                if ts_local_date != filename_date_str:
+                    unparseable.append(
+                        (
+                            p,
+                            f"last_run ({ts.isoformat()}) local date "
+                            f"{ts_local_date} does not match filename "
+                            f"date {filename_date_str}; capture appears "
+                            f"tampered or filename/content mismatch"
+                        )
+                    )
+                    continue
+            else:
+                # HHMMSS filename: tight 1h window against UTC value.
+                filename_ts = _parse_filename_timestamp(p.name)
+                if filename_ts is not None:
+                    delta = abs((ts - filename_ts).total_seconds())
+                    if delta > 3600:
+                        unparseable.append(
+                            (
+                                p,
+                                f"last_run ({ts.isoformat()}) diverges "
+                                f"from filename timestamp "
+                                f"({filename_ts.isoformat()}) by more "
+                                f"than 1h; capture appears tampered or "
+                                f"filename/content mismatch"
+                            )
+                        )
+                        continue
+        parsed.append((ts, p, fm))
+    if not parsed:
+        return None, None, None
+    # Pick the last_run-max among parsed candidates.
+    parsed.sort(reverse=True, key=lambda x: x[0])
+    selected_ts, selected_path, selected_fm = parsed[0]
+    # Check whether any unparseable file is CHRONOLOGICALLY newer
+    # than the selected one. Codex R3 HIGH: filename lex-order
+    # disagrees with chronology on same-day collisions (bare form
+    # sorts after HHMMSS form because digits < lowercase), so
+    # `path.name > selected_path.name` wrongly flagged an earlier
+    # malformed first-of-day run as "newer" than the later valid
+    # HHMMSS-form rerun. Fix: parse the filename's embedded date +
+    # optional HHMMSS into a datetime and compare that to the
+    # selected capture's last_run. Only block when the malformed
+    # file was actually written AFTER the selected one.
+    # Codex R7 #1 HIGH fix: compare malformed-vs-selected ordering in
+    # the FILENAME DOMAIN (date + optional HHMMSS), not in UTC-instant
+    # domain. Selected's `ts` is its last_run (which may live in a
+    # negative-offset tz, pushing UTC instants across day boundaries
+    # and creating the asymmetry R7 #1 identified). Filename keys are
+    # immutable + ISO-sortable + match the writer's stamping logic.
+    selected_fname_key = _filename_sort_key(selected_path.name)
+    newer_malformed: tuple[Path, str] | None = None
+    for path, reason in unparseable:
+        path_fname_key = _filename_sort_key(path.name)
+        if path_fname_key is None:
+            # Filename doesn't match our scheme; be defensive and
+            # treat unparseable filename prefixes as potentially
+            # newer. Surface the file so Keith can inspect.
+            newer_malformed = (path, reason)
+            break
+        if (
+            selected_fname_key is not None
+            and path_fname_key > selected_fname_key
+        ):
+            newer_malformed = (path, reason)
+            break
+    return selected_path, selected_fm, newer_malformed
+
+
+def _filename_sort_key(name: str) -> tuple[str, str] | None:
+    """Return a (date_str, hhmmss_str) tuple suitable for chronological
+    comparison. HHMMSS defaults to `000000` for bare filenames, so a
+    same-day HHMMSS form sorts AFTER the bare form (correct chronology
+    at the filename level) and a next-day bare form sorts after a
+    prior-day HHMMSS form. Returns None when the filename does not
+    match the capture scheme.
+    """
+    m = _CAPTURE_FILENAME_DATE_RE.match(name)
+    if not m:
+        return None
+    return (m.group(1), m.group(2) or "000000")
+
+
+# Override section body expected shape (spec §3.5 LOCK):
+#
+#   ## Backtest Override
+#
+#   Backtest run: <ISO date> at `raw/backtests/YYYY-MM-DD_<slug>_backtest.md`
+#   Suspicious flag reason: <copy from backtest's look_ahead_check_reason>
+#   Why this is acceptable: <Keith's text, must be non-empty>
+#
+# The gate validates (Codex R1 HIGH #2 + R2 HIGH #1 fixes):
+#   1. Section is present (heading check via sf.has_section).
+#   2. Section body has a `Why this is acceptable:` line with
+#      non-empty after-label text (R1).
+#   3. Section body has a `Backtest run:` line naming the SELECTED
+#      capture's basename (R2 -- stale overrides pointing at a
+#      prior capture no longer clear a fresh suspicious run).
+#   4. Section body has a `Suspicious flag reason:` line containing
+#      the CURRENT look_ahead_check_reason (R2 -- reason substring
+#      match, not exact match, so Keith can add context prose).
+#
+# This binds the override to the specific capture it was written for;
+# boilerplate / stale overrides left in place for a prior run are
+# rejected. Reason is substring-match (not byte-exact) so Keith can
+# prefix / suffix commentary without tripping the gate.
+_OVERRIDE_JUSTIFICATION_LABEL = "why this is acceptable:"
+_OVERRIDE_BACKTEST_RUN_LABEL = "backtest run:"
+_OVERRIDE_SUSPICIOUS_REASON_LABEL = "suspicious flag reason:"
+
+
+@dataclass(frozen=True)
+class _OverrideSection:
+    """Parsed `## Backtest Override` section fields. `None` on any field
+    means "label not found"; empty string means "label present but no
+    text after it"."""
+
+    justification: str | None
+    backtest_run_line: str | None
+    suspicious_reason_line: str | None
+
+
+def _extract_override_section(strategy_body: str) -> _OverrideSection | None:
+    """Parse the `## Backtest Override` section body into its three
+    labelled lines. Returns None when the heading is absent.
+
+    Labels are matched case-insensitively. Each label's value is the
+    text on the same line AFTER the label (not subsequent lines) --
+    overrides that wrap a label's value across lines are treated as
+    a single-line value whose continuation is discarded. The locked
+    format in spec §3.5 puts each label on its own line, so this is
+    not a real limitation.
+    """
+    if not sf.has_section(strategy_body, _BACKTEST_OVERRIDE_HEADING):
+        return None
+    lines = strategy_body.splitlines()
+    in_section = False
+    justification: str | None = None
+    backtest_run_line: str | None = None
+    suspicious_reason_line: str | None = None
+    justification_collector: list[str] = []
+    justification_label_seen = False
+    for line in lines:
+        stripped = line.strip()
+        stripped_low = stripped.lower()
+        if not in_section:
+            if stripped_low.startswith("## backtest override"):
+                in_section = True
+            continue
+        # End section on next H2.
+        if line.startswith("## ") and not stripped_low.startswith(
+            "## backtest override"
+        ):
+            break
+        # Label matching: search at the start of the line (after strip)
+        # so markdown emphasis prefixes (`- `, `* `) still match.
+        if (
+            backtest_run_line is None
+            and stripped_low.startswith(_OVERRIDE_BACKTEST_RUN_LABEL)
+        ):
+            backtest_run_line = stripped[
+                len(_OVERRIDE_BACKTEST_RUN_LABEL):
+            ].strip()
+            continue
+        if (
+            suspicious_reason_line is None
+            and stripped_low.startswith(_OVERRIDE_SUSPICIOUS_REASON_LABEL)
+        ):
+            suspicious_reason_line = stripped[
+                len(_OVERRIDE_SUSPICIOUS_REASON_LABEL):
+            ].strip()
+            continue
+        if (
+            not justification_label_seen
+            and stripped_low.startswith(_OVERRIDE_JUSTIFICATION_LABEL)
+        ):
+            justification_label_seen = True
+            after = stripped[
+                len(_OVERRIDE_JUSTIFICATION_LABEL):
+            ].lstrip()
+            if after:
+                justification_collector.append(after)
+            continue
+        # Continuation lines for the justification: collect everything
+        # after the label until the section ends or another H3 starts.
+        if justification_label_seen:
+            if line.startswith("### "):
+                break
+            justification_collector.append(line)
+    if justification_label_seen:
+        justification = "\n".join(justification_collector).strip()
+    return _OverrideSection(
+        justification=justification,
+        backtest_run_line=backtest_run_line,
+        suspicious_reason_line=suspicious_reason_line,
+    )
+
+
+@dataclass(frozen=True)
+class BacktestScanResult:
+    """Outcome of `scan_backtests_for_slug` -- mirrors the
+    BearCaseScanResult shape from cycle 2 so `handle_approve_strategy`
+    can consume both gates with identical plumbing. `verdict` is the
+    single enum the gate consumes; `reason` is empty on PROCEED and
+    populated with a Keith-facing message on REFUSE.
+
+    Spec §3.5 LOCKED algorithm produces this outcome.
+    """
+
+    verdict: str  # "PROCEED" | "REFUSE"
+    reason: str
+
+
+def scan_backtests_for_slug(
+    slug: str,
+    *,
+    vault_root: Path,
+) -> BacktestScanResult:
+    """Scan `<vault_root>/raw/backtests/*_<slug>_backtest.md` for a
+    most-recent backtest capture + check its `look_ahead_check` field
+    against the override-section rule in the strategy body.
+
+    Spec §3.5 LOCKED algorithm (verbatim):
+
+      1. Glob `*_<slug>_backtest.md`. Empty => HARD REFUSE.
+      2. Filter out zero-byte files (defensive against interrupted
+         atomic writes from the concurrency window per §2.5). All empty
+         => HARD REFUSE.
+      3. Filename-descending sort; pick files[0] as "most recent".
+      4. Parse frontmatter. YAML error => HARD REFUSE.
+      5. `look_ahead_check == "passed"` => PROCEED.
+      6. `look_ahead_check == "suspicious"`: read strategy body; if
+         `## Backtest Override` section present (any suffix), PROCEED;
+         else REFUSE with the threshold-reason surfaced.
+      7. Any other `look_ahead_check` value => HARD REFUSE (forces the
+         enum to stay locked to {passed, suspicious}).
+
+    `vault_root` is explicit for test determinism; production callers
+    (`handle_approve_strategy`) pass `path.resolve().parents[2]` same as
+    the bear-case gate. Symlink containment is enforced on the
+    backtests directory so a crafted `wiki/backtests -> elsewhere`
+    symlink cannot clear approval from a file outside the vault.
+
+    Known limitation: on a same-day re-run collision, the locked
+    filename scheme produces paths where the bare `<date>_<slug>_
+    backtest.md` form sorts lexicographically AFTER the
+    `<date>_HHMMSS_<slug>_backtest.md` form (digits < lowercase slug
+    letters in ASCII). Filename-descending thus picks the EARLIER
+    same-day run as "most recent". Fixed via `_select_most_recent_
+    backtest` which uses parsed `backtest.last_run` for selection +
+    filename-sort-key for malformed-newer detection.
+
+    **Phase 4 deferral (Codex R2 #2 / R4 #2 / R9 #1):** this gate
+    does NOT cross-verify the capture's `strategy_commit_sha` against
+    the strategy file's current revision. That means a strategy
+    edited AFTER a passed backtest can still be approved on the
+    stale capture's evidence without re-running /backtest. The
+    defence is operational: `/invest-ship --approve-strategy` runs
+    after Keith has hand-edited + reviewed; the expectation is that
+    Keith re-runs /backtest when material strategy edits happen.
+    Phase 4 will add the git-log-based cross-check alongside the
+    walk-forward harness (triggered by first paper trade signal or
+    operational discipline gap surfacing during burn-in).
+    """
+    # Step 1-2 preamble: resolve + containment-check the backtests dir.
+    try:
+        resolved_vault_root = vault_root.resolve(strict=False)
+        backtests_dir = (vault_root / "raw" / "backtests").resolve(
+            strict=False
+        )
+    except OSError as exc:
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"cannot resolve vault/backtests path ({exc}); refusing "
+                f"to scan backtest for {slug}."
+            ),
+        )
+    try:
+        backtests_dir.relative_to(resolved_vault_root)
+    except ValueError:
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"raw/backtests resolves to {backtests_dir!s}, outside "
+                f"vault_root {resolved_vault_root!s}; refusing to scan."
+            ),
+        )
+
+    # MiniMax R1 #3 MEDIUM: disambiguate "vault missing" from "no
+    # backtest yet". `resolve(strict=False)` silently succeeds on a
+    # typoed vault_root, which would otherwise produce the same "no
+    # backtest found; run /backtest" message as a legitimate first-
+    # run state. That sends Keith into a loop where /backtest also
+    # fails (can't write to the missing vault). Explicit vault guard.
+    if not vault_root.exists():
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"vault_root {vault_root!s} does not exist; check "
+                f"vault path before re-running approval"
+            ),
+        )
+
+    # Step 1: glob + filename-descending sort. We use pathlib.Path.glob
+    # here rather than stdlib glob so test vault_roots with spaces /
+    # dots behave identically to production. Sorted on the full repo-
+    # relative path string so ISO date prefix drives the ordering.
+    if not backtests_dir.is_dir():
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"no backtest found for strategy; run "
+                f"/backtest {slug} first"
+            ),
+        )
+    # Codex R8 #1 HIGH: glob admits off-scheme filenames (e.g.
+    # `junk_<slug>_backtest.md`, invalid HHMMSS like `_999999_`).
+    # Filter to writer-produced filenames ONLY before any sorting or
+    # parsing. Off-scheme files are ignored rather than refused: if
+    # the only files for this slug are off-scheme, the gate surfaces
+    # the normal "no backtest found" error since no valid capture
+    # exists. Keith cleans up off-scheme files manually.
+    raw_candidates = backtests_dir.glob(f"*_{slug}_backtest.md")
+    candidates = sorted(
+        (
+            p
+            for p in raw_candidates
+            if _is_writer_produced_filename(p.name, slug)
+        ),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    if not candidates:
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"no backtest found for strategy; run "
+                f"/backtest {slug} first"
+            ),
+        )
+
+    # Step 2: skip zero-byte files. All-empty => refuse loudly.
+    non_empty: list[Path] = []
+    for p in candidates:
+        try:
+            if p.stat().st_size > 0:
+                non_empty.append(p)
+        except OSError:
+            # Stat failure (race / permission) is treated as empty so
+            # the next iteration picks up the next candidate. A fully-
+            # unreadable directory fails below on the "none non-empty"
+            # branch.
+            continue
+    if not non_empty:
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"backtest files exist but all are empty (interrupted "
+                f"writes?); re-run /backtest {slug}"
+            ),
+        )
+
+    # Step 3: most recent. Codex R1 HIGH: the plan's "filename-suffix-
+    # deterministic sort" assumption is empirically wrong -- on same-
+    # day re-runs, the bare `<date>_<slug>` form sorts AFTER the
+    # `<date>_<HHMMSS>_<slug>` form (digits < lowercase in ASCII), so
+    # filename-descending picks the EARLIER run as "most recent". Fix:
+    # parse `backtest.last_run` from every non-empty candidate + pick
+    # the file with the maximum timestamp. Falls back to filename-
+    # descending order if last_run is missing / unparseable on all
+    # candidates (defensive: preserves behaviour for files written by
+    # a future writer that omitted last_run).
+    (
+        most_recent,
+        most_recent_fm,
+        newer_malformed,
+    ) = _select_most_recent_backtest(non_empty)
+    # Codex R2 #3 HIGH: if a lex-newer capture is malformed, REFUSE
+    # rather than silently selecting an older valid one. A failed or
+    # tampered latest run must block approval, not fall through to
+    # stale evidence.
+    if newer_malformed is not None:
+        p, reason = newer_malformed
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"newer backtest capture {p.name} is malformed "
+                f"({reason}); re-run /backtest {slug} -- a failed "
+                f"or tampered latest run must not fall back to an "
+                f"older valid capture"
+            ),
+        )
+    if most_recent is None:
+        # Fallback: no candidate has a valid last_run. Surface the
+        # lexically-first non-empty file so the downstream schema
+        # checks emit a specific malformed-capture error rather than
+        # a generic "no readable" message. Keith's specific failure
+        # (missing backtest: block, missing last_run, malformed YAML)
+        # still surfaces via the targeted checks below.
+        most_recent = non_empty[0]
+        try:
+            fm = sf.parse(most_recent.read_bytes())
+        except (OSError, ValueError) as exc:
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} unparseable "
+                    f"({exc}); re-run /backtest {slug}"
+                ),
+            )
+    else:
+        fm = most_recent_fm
+
+    backtest_block = fm.get("backtest")
+    if not isinstance(backtest_block, dict):
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"backtest {most_recent.name} has no `backtest:` "
+                f"mapping in frontmatter; re-run /backtest {slug}"
+            ),
+        )
+    # MiniMax R1 #1 HIGH: schema-enforce the required sub-fields so a
+    # hand-crafted capture with only `look_ahead_check: passed` and no
+    # metrics block cannot satisfy the gate. Mirrors the cycle-2 bear-
+    # case scanner's schema discipline (Codex R3 HIGH on cycle 2). We
+    # require `metrics:` to be a mapping + `last_run` to be present;
+    # run_backtest always populates both, so any capture missing them
+    # was not produced by the legitimate skill path.
+    metrics_block = backtest_block.get("metrics")
+    if not isinstance(metrics_block, dict):
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"backtest {most_recent.name} has no `metrics:` "
+                f"mapping in `backtest:` block; capture is malformed, "
+                f"re-run /backtest {slug}"
+            ),
+        )
+    # Codex R5 #2 HIGH: `last_run is None` catches the MISSING case
+    # but NOT the unparseable-string case (e.g. `last_run: "not a
+    # date"`). When the primary selection helper returns None (all
+    # candidates had unparseable last_run) and the caller falls
+    # back to non_empty[0], the fallback parse may succeed on the
+    # frontmatter overall while last_run still holds garbage. Use
+    # the same coercion helper as the selector so both paths agree
+    # on what counts as a usable timestamp.
+    last_run_raw = backtest_block.get("last_run")
+    if (
+        last_run_raw is None
+        or _parse_last_run_timestamp(last_run_raw) is None
+    ):
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"backtest {most_recent.name} has missing or "
+                f"unparseable `last_run` timestamp in `backtest:` "
+                f"block (got {last_run_raw!r}); capture is malformed, "
+                f"re-run /backtest {slug}"
+            ),
+        )
+    # Codex R1 MEDIUM: cross-verify the capture's `strategy_slug`
+    # frontmatter matches the requested slug. Without this, a hand-
+    # crafted or copied capture renamed to match the target glob
+    # could satisfy the gate while having been generated from a
+    # different strategy. Writer always populates strategy_slug;
+    # scan-time enforcement is defence-in-depth.
+    capture_slug = fm.get("strategy_slug")
+    if (
+        not isinstance(capture_slug, str)
+        or capture_slug.strip() != slug
+    ):
+        return BacktestScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"backtest {most_recent.name} has "
+                f"strategy_slug={capture_slug!r}, expected {slug!r}; "
+                f"capture appears to belong to a different strategy -- "
+                f"re-run /backtest {slug}"
+            ),
+        )
+    look_ahead = backtest_block.get("look_ahead_check")
+
+    # Step 5: passed.
+    if look_ahead == _BACKTEST_LOOK_AHEAD_PASSED:
+        return BacktestScanResult(verdict="PROCEED", reason="")
+
+    # Step 6: suspicious => check strategy body for the override.
+    if look_ahead == _BACKTEST_LOOK_AHEAD_SUSPICIOUS:
+        # Codex R6 #2 MEDIUM + R7 #2 MEDIUM: look_ahead_check_reason
+        # MUST be a non-empty string when look_ahead_check is
+        # suspicious. A non-string value would crash the substring-
+        # match below; an empty value silently bypasses the reason-
+        # binding check. Either shape defeats the gate's
+        # accountability invariant (the reason should pin down WHICH
+        # threshold tripped), so refuse the capture before any
+        # override parsing.
+        reason_val = backtest_block.get("look_ahead_check_reason")
+        if not isinstance(reason_val, str):
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious but `look_ahead_check_reason` is "
+                    f"{type(reason_val).__name__}, expected non-empty "
+                    f"string; capture is malformed, re-run "
+                    f"/backtest {slug}"
+                ),
+            )
+        if not reason_val.strip():
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious but `look_ahead_check_reason` is "
+                    f"empty; a suspicious verdict must name WHICH "
+                    f"threshold tripped, so an empty reason invalidates "
+                    f"the override-binding check. Re-run "
+                    f"/backtest {slug}"
+                ),
+            )
+        strategy_path = (
+            vault_root / "wiki" / "strategies" / f"strategy_{slug}.md"
+        )
+        try:
+            strategy_bytes = strategy_path.read_bytes()
+        except OSError as exc:
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} is suspicious but "
+                    f"cannot read strategy body at {strategy_path.name} "
+                    f"({exc}) to check for `## Backtest Override`"
+                ),
+            )
+        strategy_body = sf._split_body(strategy_bytes)  # type: ignore[attr-defined]
+        # Codex R1 HIGH #2 + R2 HIGH #1: require the override section
+        # to (a) have a non-empty `Why this is acceptable:` line, (b)
+        # reference the SELECTED capture's filename in `Backtest run:`,
+        # and (c) contain the current `look_ahead_check_reason` as a
+        # substring of `Suspicious flag reason:`. Stale overrides
+        # written for a prior capture / prior reason are rejected.
+        section = _extract_override_section(strategy_body)
+        reason_text = backtest_block.get("look_ahead_check_reason") or ""
+        if section is None:
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious ({reason_text}); add "
+                    f"'## Backtest Override' section to strategy body "
+                    f"with `Backtest run:`, `Suspicious flag reason:`, "
+                    f"and non-empty `Why this is acceptable:` lines, "
+                    f"then retry"
+                ),
+            )
+        if section.justification is None:
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious ({reason_text}); strategy body's "
+                    f"'## Backtest Override' section lacks a "
+                    f"`Why this is acceptable:` line, then retry"
+                ),
+            )
+        if not section.justification:
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious ({reason_text}); strategy body's "
+                    f"'## Backtest Override' section has an empty "
+                    f"`Why this is acceptable:` justification. Stale "
+                    f"or unfilled overrides are rejected -- fill in a "
+                    f"non-empty explanation, then retry"
+                ),
+            )
+        # Binding check: `Backtest run:` must reference the selected
+        # capture's basename so a stale override pointing at an older
+        # capture cannot clear a new suspicious run. Substring match
+        # (not byte-exact) so Keith can wrap the filename with backticks
+        # or prefix a relative path.
+        if (
+            section.backtest_run_line is None
+            or most_recent.name not in section.backtest_run_line
+        ):
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious ({reason_text}); strategy body's "
+                    f"'## Backtest Override' section's `Backtest run:` "
+                    f"line does not reference {most_recent.name}. "
+                    f"Stale overrides written for a prior capture are "
+                    f"rejected -- update the override to reference the "
+                    f"current capture, then retry"
+                ),
+            )
+        # Reason-binding check: `Suspicious flag reason:` must contain
+        # the current look_ahead_check_reason as a substring. Substring
+        # (not exact) so Keith can add commentary like "the total_return
+        # > 500% trip is because..." while still preserving the reason
+        # itself as the anchor.
+        if (
+            reason_text
+            and (
+                section.suspicious_reason_line is None
+                or reason_text not in section.suspicious_reason_line
+            )
+        ):
+            return BacktestScanResult(
+                verdict="REFUSE",
+                reason=(
+                    f"backtest {most_recent.name} has look_ahead_check:"
+                    f" suspicious ({reason_text}); strategy body's "
+                    f"'## Backtest Override' section's "
+                    f"`Suspicious flag reason:` line does not contain "
+                    f"the current reason string ({reason_text!r}). "
+                    f"Stale overrides written for a different reason "
+                    f"are rejected -- update the override to reference "
+                    f"the current reason, then retry"
+                ),
+            )
+        return BacktestScanResult(verdict="PROCEED", reason="")
+
+    # Step 7: unknown enum value.
+    return BacktestScanResult(
+        verdict="REFUSE",
+        reason=(
+            f"backtest {most_recent.name} has unknown "
+            f"look_ahead_check value: {look_ahead!r}"
         ),
     )
 
@@ -1295,6 +2154,18 @@ def handle_approve_strategy(
     )
     if bear_scan.verdict == "REFUSE":
         raise ValidationError(bear_scan.reason)
+
+    # Bundle 4 cycle 3: backtest sanity-gate. Per spec §3.5 LOCKED
+    # algorithm. Runs AFTER the bear-case scan (so a VETO or stale-
+    # bear case refuses first -- the ordering matches how Keith
+    # iterates: update the thesis, re-run bear-case, re-run backtest,
+    # retry approval) and BEFORE parent-sha capture so a REFUSE here
+    # leaves the working tree unchanged.
+    backtest_scan = scan_backtests_for_slug(
+        slug, vault_root=resolved_vault,
+    )
+    if backtest_scan.verdict == "REFUSE":
+        raise ValidationError(backtest_scan.reason)
 
     # Preemptive decision #5: capture parent sha FIRST, before touching
     # any file or staging. If caller already resolved it (test fixtures),
