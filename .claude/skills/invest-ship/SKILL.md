@@ -28,6 +28,13 @@ Keystone skill for shipping discipline. Replaces the manual Session Discipline c
 - `/ship --no-feature` -- ship code without touching feature notes or the roadmap (e.g. typo fix, config tweak)
 - `/ship status` -- show what would ship without actually shipping
 
+**Strategy + limits transition subcommands (Bundle 3 cycle 5):** mutually exclusive with each other and with each other; at most ONE per `/ship` invocation (attempting two fails immediately with usage help per spec §3.1). When any of these flags are present, route to the "Strategy + limits transition subcommands" section below BEFORE running the normal shipping flow.
+
+- `/ship --approve-strategy <path>` -- transition a strategy spec from `status: proposed` to `status: approved` (one file; cycle-5 §3.2 workflow)
+- `/ship --reject-strategy <path> --reason "<text>"` -- transition `proposed` to `rejected` (terminal; one file)
+- `/ship --retire-strategy <path> --reason "<text>"` -- transition `approved` to `retired` (terminal; post-commit hook atomically writes the retirement sentinel)
+- `/ship --approve-limits <path>` -- transition a limits-proposal `proposed` to `approved` AND apply its `## YAML Patch` to `execution/validators/config.yaml` in the same commit (pre-commit Check C enforces atomicity)
+
 ## Workflow
 
 ### 0. Active rules auto-promotion scan
@@ -124,6 +131,176 @@ When the script reports hits, surface them to Keith inline:
 Keith decides fix-inline / allowlist / defer. When he defers, append the drift summary to the ship commit body under a "Deferred:" trailer so the next session sees it.
 
 The audit is idempotent given stable inputs: re-running with no working-tree changes AND no allowlist edits prints `fork-drift-audit: clean`. If Keith adds an allowlist entry inline during this step, re-run the audit before continuing so the recorded outcome reflects the post-edit state. New drift typically arrives via skill-port work that copies a K2B file without swapping the path -- catching it at `/ship` time is much cheaper than catching it later as a runtime mailbox-validation failure.
+
+### 0c. Strategy + limits transition subcommand dispatch (Bundle 3 cycle 5)
+
+After the advisory audits finish (steps 0/0a/0b), before scope detection (step 1), check whether the `/ship` invocation carries one of the four strategy + limits transition flags:
+
+- `--approve-strategy <path>`
+- `--reject-strategy <path> --reason "<text>"`
+- `--retire-strategy <path> --reason "<text>"`
+- `--approve-limits <path>`
+
+**Mutual exclusion (spec §3.1):** at most ONE of these flags per `/ship` invocation. If more than one is present, fail immediately with the usage message:
+
+```
+error: --approve-strategy / --reject-strategy / --retire-strategy / --approve-limits
+are mutually exclusive; provide at most ONE per /ship invocation.
+```
+
+If none of the flags are present, skip this section and proceed directly to step 1. If exactly one is present, route to the matching workflow below. Each workflow executes Steps A through F; when Step F completes, rejoin the normal ship flow starting at step 4 (generate commit message) using the handler's JSON output to populate the commit message subject + trailers. Staging (step 5) stages the file(s) the handler wrote to; the rest of the ship flow (push, DEVLOG, wiki/log, deploy handoff) runs unchanged.
+
+**Shared helper (all four subcommands):** `python3 -m scripts.lib.invest_ship_strategy <subcommand> <args>` performs Step A (validation) and Step D (atomic frontmatter edit + parent-sha capture) in one shot. The helper emits a JSON object on stdout with the commit subject, trailers, file paths, and timestamps; exit 1 on validation error with the specific reason on stderr. The skill body forwards the stderr message verbatim to Keith when it fires. See `scripts/lib/invest_ship_strategy.py` for the full CLI.
+
+**Why this dispatch is mandatory even for `--skip-codex`:** Step D mutates the strategy/limits file on disk + captures parent sha. Skipping directly to `git commit` without running Step D would leave the file at its current status and miss the trailers, which the cycle-4 commit-msg hook would then reject. Even `--skip-codex` flows MUST run the helper first -- `--skip-codex` only bypasses Step B (the Codex plan review).
+
+#### `/ship --approve-strategy <path>`
+
+Spec §3.2 workflow A-F applied to a `wiki/strategies/strategy_<slug>.md` file.
+
+**Step A -- validate input file:**
+
+```bash
+python3 -m scripts.lib.invest_ship_strategy approve-strategy "<path>" > /tmp/invest_ship_result.json
+```
+
+The helper checks: file exists, frontmatter parses, `status: proposed`, all required frontmatter fields present (`name`, `strategy_type`, `risk_envelope_pct`, `regime_filter`, `order` with its six subkeys), filename stem matches `strategy_<frontmatter.name>`, `## How This Works` section non-empty, no pre-existing `approved_at` / `approved_commit_sha` fields. **On exit 1:** print the stderr message to Keith verbatim and stop -- do NOT proceed to Step B / commit.
+
+If the helper succeeded, it has ALREADY rewritten the file atomically with `status: approved` + the new frontmatter fields. Do NOT re-edit the file; the helper is the sole writer.
+
+**Step B -- Codex plan review on the strategy spec (Checkpoint 1; spec §3.2 Step B):**
+
+Run Codex against the strategy FILE, not the working-tree diff. Two Codex passes ship per `/ship --approve-strategy`: this one (spec review) plus the normal Checkpoint 2 pre-commit review in step 3 that covers the commit diff. They have different scopes.
+
+```bash
+CODEX_PLUGIN="$HOME/.claude/plugins/marketplaces/openai-codex/plugins/codex"
+if [ -f "$CODEX_PLUGIN/scripts/codex-companion.mjs" ]; then
+  CLAUDE_PLUGIN_ROOT="$CODEX_PLUGIN" \
+    node "$CODEX_PLUGIN/scripts/codex-companion.mjs" \
+    review --wait --scope file --path "<path>" \
+    --focus "Review this proposed strategy spec for: (1) look-ahead bias in the rules, (2) unrealistic assumptions in the order spec (stop_loss too tight, limit_price too aggressive for realistic fills), (3) regime_filter mismatch with strategy_type, (4) missing or weak 'How This Works' clarity from Keith's pedagogical perspective (learning-stage: novice)." 2>&1
+else
+  # Codex unavailable: fall back to MiniMax with plan-file scope
+  ./scripts/minimax-review.sh --scope plan --plan "<path>" \
+    --focus "Review this proposed strategy spec for look-ahead bias, unrealistic order spec, regime mismatch, and How This Works clarity."
+fi
+```
+
+Surface findings neutrally to Keith (no pre-filter). Keith decides fix / defer / accept. If he fixes, re-run Step A (the file may no longer be at status=proposed since we already edited it; in practice Keith amends the draft BEFORE the approval Step A, so this loop is rare -- more typically he catches issues during draft authorship). If `--skip-codex <reason>` was passed, skip Step B and record the reason in the commit footer.
+
+**Step C -- Keith final approve / reject / defer:**
+
+```
+Approve strategy <slug> at status=approved?
+  approve  -- continue to commit
+  reject   -- switch to --reject-strategy flow now (ask for --reason if not provided)
+  defer    -- exit 0 WITHOUT committing; strategy file stays at status=approved on disk
+              (Keith can `git checkout` to revert if needed, or re-run /ship later)
+```
+
+On `reject`: back out Step D's edit (`git checkout -- <path>`) to restore the proposed state, then route to the `--reject-strategy` workflow below.
+
+On `defer`: print a reminder that the file on disk is now at status=approved even though no commit has landed. Offer to `git checkout -- <path>` to revert. **Do NOT commit.**
+
+**Step D -- file mutation: already performed by Step A's helper invocation.**
+
+The helper captured the parent short-sha as the VERY FIRST action (`git rev-parse --short HEAD` before any staging or editing, per spec §6 Q1) and wrote it into the frontmatter as `approved_commit_sha`. Parent sha is NEVER the approval commit's own sha (that would require `--amend`, which `/ship` discipline forbids).
+
+**Step E -- stage + rejoin normal ship flow at step 3:**
+
+```bash
+# File already edited by Step A. Just stage it.
+git add "<path>"
+```
+
+Use the helper's JSON output for the commit message:
+
+```bash
+jq -r '.commit_subject' /tmp/invest_ship_result.json
+jq -r '.trailers[]'     /tmp/invest_ship_result.json
+```
+
+The trailers MUST appear on their own lines in the commit body (cycle-4 commit-msg hook uses `grep -qFx` which is byte-exact). Resume normal ship flow at step 3 (Codex pre-commit review of the diff -- Checkpoint 2). The commit message from step 4 appends the Approved-Strategy + Strategy-Transition + Co-Shipped-By trailers exactly as the helper emitted them.
+
+**Step F -- post-commit notice (spec §3.2 Step F UPDATED):**
+
+```
+Strategy <slug> approved at <commit sha>.
+
+Bundle 3 does NOT automate engine restart -- Bundle 6 (pm2) will.
+
+VERIFY the engine picked up the approval (or is still on stale state):
+
+    python -m execution.engine.main --diagnose-approved
+
+This Bundle 3 CLI reads the most recent engine_started journal entry and prints
+the approved-strategy set the engine booted with. If the output does NOT
+include strategy_<slug> with approved_commit_sha=<this-commit>, restart
+is required before this strategy fires any orders.
+
+End-to-end smoke test:
+
+    python -m execution.engine.main --once --account-id DU12345
+
+Verify the journal shows strategy_loaded + order_proposed + order_submitted
+for <slug> (or a clean validator-rejected outcome).
+```
+
+#### `/ship --reject-strategy <path> --reason "<text>"`
+
+Variant of the approve workflow; spec §3.2 "Reject-Strategy variant" note.
+
+- Step A: helper validates status=proposed + captures the reason text. No filename-stem or How-This-Works enforcement -- a draft that failed early review can be rejected regardless of polish. Helper exits 1 if `--reason` is blank, the path is wrong, or the status is not proposed.
+- Step B: **no Codex plan review.** Rejection is a decision, not a spec change; the reason Keith wrote is the audit trail.
+- Step C: helper already edited the file. Confirm with Keith before committing (last chance to back out).
+- Step D: performed by Step A's helper (status flip + add `rejected_at` + `rejected_reason`; no approved_commit_sha).
+- Step E: stage + run normal ship flow from step 3 with the helper's subject + trailers (`Strategy-Transition: proposed -> rejected`, `Rejected-Strategy: strategy_<slug>`, `Co-Shipped-By: invest-ship`).
+- Step F: brief notice. Rejection is terminal; next revision = new proposed draft.
+
+```bash
+python3 -m scripts.lib.invest_ship_strategy reject-strategy "<path>" --reason "<text>" > /tmp/invest_ship_result.json
+```
+
+#### `/ship --retire-strategy <path> --reason "<text>"`
+
+Variant of the approve workflow; spec §3.2 "Retire-Strategy variant" note.
+
+- Step A: helper validates status=approved + captures the reason text. Sets the retire transition.
+- Step B: **no Codex plan review.** Retirement is a decision.
+- Step C: confirm with Keith.
+- Step D: performed by Step A's helper. File rewrite touches ONLY status + appends `retired_at` + `retired_reason`. Body + all other frontmatter keys are preserved byte-identical per cycle-4 pre-commit Check D.
+- Step E: stage + run normal ship flow from step 3 with the helper's trailers (`Strategy-Transition: approved -> retired`, `Retired-Strategy: strategy_<slug>`, `Co-Shipped-By: invest-ship`).
+- Step F: cycle-4 post-commit hook will atomically write the retirement sentinel at `.retired-<sha16>.json` when the commit lands. Remind Keith:
+
+```
+Strategy <slug> retired at <commit sha>.
+
+The cycle-4 post-commit hook wrote the retirement sentinel atomically with
+the commit. The engine's next submit tick will refuse orders from <slug>
+synchronously via `assert_strategy_not_retired`. No restart required.
+
+Existing open orders / positions are NOT auto-flattened (kill semantics); close
+them manually via IB Gateway / TWS if needed.
+```
+
+```bash
+python3 -m scripts.lib.invest_ship_strategy retire-strategy "<path>" --reason "<text>" > /tmp/invest_ship_result.json
+```
+
+#### `/ship --approve-limits <path>`
+
+Applies a limits-proposal + its embedded YAML patch to `execution/validators/config.yaml` in a single gated commit. Spec §5.3 + §4.1 Check C.
+
+- Step A: helper validates the limits-proposal (frontmatter + `## Change` block + `## YAML Patch` before/after blocks), asserts `status: proposed`, and finds exactly one occurrence of the `before` block in config.yaml.
+- Step B: Codex plan review focused on safety-impact of the widened/tightened limit. Fall back to MiniMax `--scope plan --plan <proposal>` if Codex unavailable.
+- Step C: confirm with Keith.
+- Step D: helper applies the config.yaml edit AND the proposal frontmatter flip atomically (tempfile + os.replace for both files; config.yaml edit happens FIRST so a failure leaves the proposal in `status: proposed` rather than claiming an approved state that didn't land).
+- Step E: stage BOTH files. Rejoin normal ship flow with the helper's `feat(limits): approve <slug>` subject and trailers (`Limits-Transition: proposed -> approved`, `Approved-Limits: <slug>`, `Config-Change: <rule>:<change_type>`, `Co-Shipped-By: invest-ship`). Cycle-4 pre-commit Check C enforces that both files appear in the same staged commit diff with the proposal transitioning proposed -> approved.
+- Step F: remind Keith that `execution/validators/config.yaml` changes are hot-reload-safe only on engine restart (Phase 6 pm2; manual today).
+
+```bash
+python3 -m scripts.lib.invest_ship_strategy approve-limits "<path>" > /tmp/invest_ship_result.json
+```
 
 ### 1. Scope detection
 

@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -623,6 +625,21 @@ class Engine:
                 "reconciled_event_count": len(reco.events),
                 "mismatch_count": len(reco.mismatch_reasons),
                 "strategies_loaded": [s.name for s in self._strategies],
+                # Bundle 3 cycle 5: richer per-strategy metadata so
+                # `--diagnose-approved` can show the operator the exact
+                # approved_commit_sha + regime_filter + risk_envelope_pct
+                # the engine booted with. `strategies_loaded` is kept for
+                # backwards-compat with journals / tests that already
+                # expect it. Decimals stringify so JSON round-trips.
+                "strategies": [
+                    {
+                        "name": s.name,
+                        "approved_commit_sha": s.approved_commit_sha,
+                        "regime_filter": list(s.regime_filter),
+                        "risk_envelope_pct": str(s.risk_envelope_pct),
+                    }
+                    for s in self._strategies
+                ],
                 "resumed_awaiting": (
                     resumed.trade_id if resumed is not None else None
                 ),
@@ -2169,6 +2186,18 @@ def _parse_args(argv: list[str] | None = None):
         help="Run a single tick and exit (used by invest-execute).",
     )
     parser.add_argument(
+        "--diagnose-approved",
+        action="store_true",
+        help=(
+            "Diagnostic mode: read the newest `engine_started` event "
+            "from today's (falling back to yesterday's) decision journal "
+            "and print the approved-strategy set the engine booted "
+            "with (name, approved_commit_sha, regime_filter, "
+            "risk_envelope_pct). Does not connect to IBKR, does not "
+            "touch any file. Exits 0 even when no recent event exists."
+        ),
+    )
+    parser.add_argument(
         "--validator-config",
         type=Path,
         default=None,
@@ -2236,8 +2265,283 @@ async def _run_from_cli(args) -> None:
         await engine.run_forever()
 
 
+def _resolve_journal_dir_for_diagnose(
+    cli_journal_dir: Path | None,
+    validator_config_path: Path | None,
+) -> Path | None:
+    """Diagnose-specific journal-dir resolution.
+
+    Precedence (same shape as cycle-4's retired_dir resolver):
+      1. `--journal-dir` CLI flag.
+      2. `engine.journal_dir` in config.yaml if present.
+      3. None (JournalWriter falls back to its DEFAULT_BASE_DIR).
+
+    Returning None on the fall-through case lets JournalWriter own the
+    default; we do not hardcode the vault path here.
+    """
+    if cli_journal_dir is not None:
+        return cli_journal_dir
+    cfg_path = validator_config_path or (
+        Path("execution") / "validators" / "config.yaml"
+    )
+    if not cfg_path.exists():
+        return None
+    try:
+        raw = load_config(cfg_path)
+    except Exception:  # noqa: BLE001 -- best-effort; diagnose never crashes
+        return None
+    engine_cfg = raw.get("engine", {}) if isinstance(raw, dict) else {}
+    if not isinstance(engine_cfg, dict):
+        return None
+    jd = engine_cfg.get("journal_dir")
+    return Path(str(jd)).expanduser() if jd else None
+
+
+def _find_newest_engine_started(
+    journal_base: Path | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Read today's and yesterday's journal files; return the newest
+    engine_started event. Returns None if no such event appears in the
+    48h window.
+
+    Codex R7 P1 #2: this path must be strictly read-only. The earlier
+    implementation instantiated `JournalWriter(base_dir=journal_base)`,
+    which calls `mkdir(parents=True, exist_ok=True)` AND
+    `recover_trailing_partial()` in `__init__` -- both are on-disk
+    mutations that contradict the diagnose CLI's stated contract
+    ("does not touch any file"; see `--diagnose-approved` --help). For
+    example, pointing `--diagnose-approved --journal-dir /does/not/
+    exist` would create that directory as a side effect.
+
+    Instead, glob the jsonl files directly and parse one line at a
+    time. Use a shared advisory lock on the `.lock` sidecar while
+    reading each file so we still coexist safely with a concurrent
+    JournalWriter without taking any write action ourselves.
+    """
+    base = _resolve_diagnose_base_dir(journal_base)
+    if base is None or not base.exists() or not base.is_dir():
+        return None
+    cursor = now if now is not None else datetime.now(timezone.utc)
+    if cursor.tzinfo is None:
+        cursor = cursor.replace(tzinfo=timezone.utc)
+    best: dict[str, Any] | None = None
+    best_ts: str = ""
+    for day_offset in (0, 1):
+        when = cursor - timedelta(days=day_offset)
+        day_path = base / f"{when.strftime('%Y-%m-%d')}.jsonl"
+        if not day_path.exists():
+            continue
+        for record in _iter_journal_read_only(day_path):
+            # Codex R7 round 2 [medium]: `json.loads` can legitimately
+            # yield non-dict values (a scalar or list written by a
+            # recovery artifact, a manual edit, or a schema drift). The
+            # diagnose contract is "exits 0 always"; calling .get() on
+            # a non-dict would raise AttributeError before the
+            # formatter's isinstance guards ever run. Skip silently --
+            # the `-diagnose-approved` output will still render
+            # correctly for any well-formed engine_started records that
+            # appear elsewhere in the day's file, and `(none)` if
+            # everything is corrupt.
+            if not isinstance(record, dict):
+                continue
+            if record.get("event_type") != "engine_started":
+                continue
+            ts = str(record.get("ts", ""))
+            if ts > best_ts:
+                best_ts = ts
+                best = record
+    return best
+
+
+def _resolve_diagnose_base_dir(journal_base: Path | None) -> Path | None:
+    """Return the journal base dir to read.
+
+    Mirrors the JournalWriter default when journal_base is None but
+    does NOT create the directory -- the diagnose path is read-only by
+    contract (Codex R7 P1 #2).
+    """
+    if journal_base is not None:
+        return journal_base
+    # Same default JournalWriter uses; imported lazily to keep this
+    # function cheap when the caller supplies an override.
+    from ..journal.writer import DEFAULT_BASE_DIR
+
+    return DEFAULT_BASE_DIR
+
+
+def _iter_journal_read_only(path: Path):
+    """Yield each parsed JSON record from `path` under a shared flock.
+
+    Holding the same sidecar `.lock` file JournalWriter uses with
+    LOCK_SH means an in-flight concurrent write (LOCK_EX) blocks us
+    until it finishes, so we never read a half-written line. We
+    never take LOCK_EX ourselves: this entire function is strictly
+    read-only.
+    """
+    import fcntl
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fd: int | None = None
+    if lock_path.exists():
+        try:
+            lock_fd = os.open(str(lock_path), os.O_RDONLY)
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        except OSError:
+            if lock_fd is not None:
+                os.close(lock_fd)
+                lock_fd = None
+    try:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        # Skip corrupt lines. The writer's recovery
+                        # path cleans those up on its next append; we
+                        # must not touch disk from the diagnose read.
+                        continue
+        except OSError as exc:  # pragma: no cover -- advisory diagnose
+            LOG.warning("diagnose: could not read %s: %s", path, exc)
+            return
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
+def _format_diagnose_table(record: dict[str, Any]) -> str:
+    """Pretty-print a single engine_started record for operator eyes.
+
+    Codex R7 P1 #3: every accessor on `record` / `payload` / `strategies`
+    must defend against non-dict / non-list shapes. A corrupt journal
+    record (manual edit, schema drift, pre-cycle-5 payload with a
+    different shape) must cause graceful degradation, not an
+    AttributeError traceback. `record` may not even be a dict if the
+    caller hands us a list or scalar; guard at every hop.
+    """
+    if not isinstance(record, dict):
+        return "engine_started record is malformed (not a mapping)."
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        # Top-level metadata is still useful to surface even when the
+        # payload is unreadable -- Keith can at least see the record
+        # exists and its ts.
+        return (
+            f"engine_started at {record.get('ts', '(no ts)')}: "
+            "payload is malformed (not a mapping); rerun the engine "
+            "or inspect the journal file manually."
+        )
+
+    lines: list[str] = []
+    lines.append(
+        f"Most recent engine_started: {record.get('ts', '(no ts)')}"
+    )
+    pid = payload.get("pid")
+    if pid is not None:
+        lines.append(f"PID: {pid}")
+    cfg_hash = payload.get("validator_config_hash")
+    if cfg_hash:
+        lines.append(f"Validator config hash: {cfg_hash}")
+    retired_dir = payload.get("retired_dir")
+    if retired_dir:
+        lines.append(f"Retired sentinel dir: {retired_dir}")
+    lines.append("")
+
+    strategies = payload.get("strategies")
+    if not isinstance(strategies, list) or not strategies:
+        # Fall back to legacy `strategies_loaded` names if the richer
+        # block is missing (e.g. journal from before cycle 5 rolled
+        # out). Operator still gets the names; the cycle-5 additional
+        # fields are not reconstructable after the fact.
+        legacy_raw = payload.get("strategies_loaded")
+        legacy = legacy_raw if isinstance(legacy_raw, list) else []
+        if legacy:
+            lines.append(f"Approved strategies loaded ({len(legacy)}):")
+            for name in legacy:
+                lines.append(
+                    f"  - {name}  (pre-cycle-5 journal; rerun engine "
+                    "for full metadata)"
+                )
+        else:
+            lines.append("Approved strategies loaded: (none)")
+        return "\n".join(lines)
+
+    # Codex R7 P1 #3: each entry in strategies must be dict-typed
+    # before we call .get on it. Skip malformed entries with a warning
+    # line so the rest still renders.
+    well_formed = []
+    malformed = 0
+    for item in strategies:
+        if isinstance(item, dict):
+            well_formed.append(item)
+        else:
+            malformed += 1
+
+    lines.append(
+        f"Approved strategies loaded ({len(well_formed)}"
+        + (f"; {malformed} malformed entry/entries skipped" if malformed else "")
+        + "):"
+    )
+    header = (
+        f"  {'name':<24} {'approved_commit_sha':<20} "
+        f"{'regime_filter':<24} {'risk_envelope_pct':<18}"
+    )
+    lines.append(header)
+    lines.append(
+        "  " + "-" * 22 + "   " + "-" * 18 + "   "
+        + "-" * 22 + "   " + "-" * 16
+    )
+    for s in well_formed:
+        name = str(s.get("name", ""))[:24]
+        sha = str(s.get("approved_commit_sha") or "")[:20]
+        rf_raw = s.get("regime_filter")
+        rf = rf_raw if isinstance(rf_raw, list) else []
+        rf_str = "[" + ", ".join(str(x) for x in rf) + "]" if rf else "[]"
+        rf_str = rf_str[:24]
+        risk = str(s.get("risk_envelope_pct") or "")[:18]
+        lines.append(f"  {name:<24} {sha:<20} {rf_str:<24} {risk:<18}")
+    return "\n".join(lines)
+
+
+def _run_diagnose_approved(args) -> int:
+    """--diagnose-approved entry point.
+
+    Reads the journal, finds the newest engine_started, and prints the
+    approved-strategy set the engine booted with. Returns 0 on all
+    outcomes (diagnostic tool is non-blocking per spec §3.2 Step F);
+    absence of a recent event prints an operator hint.
+    """
+    journal_base = _resolve_journal_dir_for_diagnose(
+        args.journal_dir, args.validator_config
+    )
+    newest = _find_newest_engine_started(journal_base)
+    if newest is None:
+        print(
+            "engine not started in last 24h; run `--once` or "
+            "restart the daemon"
+        )
+        return 0
+    print(_format_diagnose_table(newest))
+    return 0
+
+
 def main() -> None:
     args = _parse_args()
+    if args.diagnose_approved:
+        # Diagnose path: no connector, no engine instantiation, no event
+        # loop. Just journal reads + table print.
+        logging.basicConfig(
+            level=getattr(logging, args.log_level.upper(), logging.INFO)
+        )
+        sys.exit(_run_diagnose_approved(args))
     asyncio.run(_run_from_cli(args))
 
 
