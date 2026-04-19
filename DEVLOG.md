@@ -3,6 +3,48 @@
 Session-by-session ship log. Append-only. New entries on top.
 
 
+## 2026-04-20 -- Bundle 4a SHIPPED: cumulative sweep + closure admin (14/22)
+
+**Commit:** `0ba1cae` chore(bundle-4a): closure -- cumulative MiniMax sweep + planning doc updates (14/22 shipped)
+
+**What shipped:** Bundle 4a sealed atomically in one closure commit following the Part A m2.23 ship at `b9f2ccc`. Cumulative sweep on `9f14dca..HEAD` via `scripts/review.sh diff --primary minimax` (MiniMax primary fell back to Codex on large-prompt sizing; the runner's fallback logic kicked in as designed). 2 findings labeled `R<N>-bundle-4a-sweep`:
+
+- **R1-bundle-4a-sweep [HIGH]** backtest approval gate does not verify the selected capture was generated from the current strategy revision. This is the **4th raise of the same vector** (cycle 3 Codex R2/R4/R9 pressed it 3×, architect held firm on Phase 4 deferral per cycle-3 DEVLOG entry for `e5540e9`). Deferral reaffirmed; un-defer trigger remains "first paper trade OR burn-in discipline-gap signal". Stop-rule precedent reading: cycle 3's L-2026-04-19-001 "each round surfacing different vectors" does NOT apply when the same vector recurs -- the 3×-raise holdpoint stood up to a 4th raise.
+- **R2-bundle-4a-sweep [MEDIUM]** `run_bear_case(refresh=True)` could not repair inconsistent pre-existing `bear_verdict` + `bear_conviction` frontmatter even though the consistency-check error message told the operator to use `--refresh` for recovery. **FIXED INLINE:** the check is now gated behind `refresh is False` so refresh requests actually overwrite the inconsistent state. Regression test `WriteTimeConsistencyCheckTests::test_refresh_repairs_inconsistent_existing_state` added.
+
+**Planning-doc updates** (atomic with this commit; files live in K2Bi-Vault which is a Syncthing-managed plain directory, not a git repo, so the vault edits do NOT appear in the commit diff):
+
+- **`wiki/planning/milestones.md`**: Phase 2 header counter 12 → 14; m2.15 row status → ✅ Bundle 4a shipped at `e5540e9` with artifact text corrected from the legacy "writes to `wiki/strategies/<name>.md` frontmatter" wording to the spec-§2.5-LOCK correct form "writes to `raw/backtests/<YYYY-MM-DD>_<slug>_backtest.md` per-run capture file; approval-gate scan via `scan_backtests_for_slug` per spec §3.5"; m2.23 row status → ✅ Bundle 4a shipped at `b9f2ccc`.
+- **`wiki/planning/phase-2-bundles.md`**: Ship Status table Bundle 4a → ✅ SHIPPED with 4-cycle commit list; Bundle 4a section status block → ✅ SHIPPED + closure summary block (Bundle 4a review totals: ~15 Codex rounds + ~8 MiniMax rounds across 4 cycles; 4 architect findings flagged as carry-forward to Bundle 4b + Bundle 5 + Phase 4 + Phase 5.1); Bundle 4 cycle ship log rows 3 + 4 added describing cycle-3 and cycle-4 scope.
+- **`wiki/planning/roadmap.md`**: Phase 2 progress counter 12 → 14; Bundle 4a session-log entry added with 4-cycle commit list + deferred-follow-up summary.
+- **`wiki/planning/index.md` Resume Card**: Current state → Bundle 4a SHIPPED with 4-cycle commit list + 894-test-suite passing; Next concrete action → **Phase 3.1 SPY rotational strategy spec** (architect recommendation per decide-don't-ask: Bundle 4a existed to unblock first ticket so Phase 3.1 is the natural next step; Bundle 4b is parallel-shippable anytime before a second strategy); Last session summary entry covering cycles 3 + 4 with architect Path A detail.
+
+**4 architect findings carry-forward (captured in phase-2-bundles.md Bundle 4a section + roadmap.md):**
+
+1. **Phase 5.1 kickoff: strict-reader + quarantine redesign.** m2.23 architect Path A keeps `JournalWriter.read_all` lenient; paired redesign (line-by-line resilient reader + recovery-quarantine protocol + Phase 5 aggregator isfinite guards) ships at Phase 5.1 kickoff OR first burn-in corruption event, whichever first.
+2. **Cycle-playbook addition: caller-semantics pass in surface audits.** When a contract-tightening pass widens the error contract (e.g. adding `ValueError` via `parse_constant` to a reader previously catching only `JSONDecodeError`), the surface audit MUST enumerate every caller and inspect each silent-catch block for newly-swallowed error families. The m2.23 R3→R4 escalation was triggered by missing this pass.
+3. **Phase 4 un-defer trigger: strategy_commit_sha gate binding.** Backtest approval gate does NOT tie the selected capture to the current strategy revision. Keith can override the Phase 4 deferral before first paper trade if the discipline gap concerns him.
+4. **Stop-rule precedent refinement (L-2026-04-20-001 candidate):** 3+ Codex rounds on "same surface" is not always the right stop trigger when each round closes a different NaN leak on a shared contract (coverage-bearing, converging). It IS the right trigger when the same deferred finding re-raises (spec-bearing, not converging). Cycle 3's strategy_commit_sha re-raise fit the latter (architect held firm); m2.23's R1→R2→R3 hardening fit the former (architect said continue, then escalated on R4's new semantic surface).
+
+**Review:** 1 cumulative MiniMax sweep call (fell back to Codex), 1 Codex finding fixed inline (R2), 1 Codex finding deferred with architect-adjudicated reason (R1 Phase 4). No separate post-fix Codex pass on R2 per the plan's "No separate Codex pass unless P1 with cross-skill semantic implications surfaces" rule (R2 is scoped to bear-case writer).
+
+**Tests:** Full suite 894 passed, 1 skipped, 33 subtests passed. R2-fix regression test added (`test_refresh_repairs_inconsistent_existing_state`).
+
+**Feature status change:** Bundle 4a SHIPPED. Phase 2 progress = **14 of 22 milestones shipped**. **Phase 3.1 SPY rotational strategy spec + Phase 3.3 sanity-check backtest + Phase 3.5 first paper ticket are all now UNBLOCKED.** Bundle 4b (m2.13 invest-screen + m2.14 invest-regime) remains parallel-shippable with Phase 3 and does NOT gate first paper ticket.
+
+**Next concrete action:** Phase 3.1 SPY rotational strategy spec (architect recommendation per decide-don't-ask). Alternate: Bundle 4b cycles in parallel with Phase 3. Architect call: Phase 3.1 first since Bundle 4a existed specifically to unblock the first ticket; Bundle 4b is parallel-shippable anytime.
+
+**Follow-ups:**
+- Phase 3.1 kickoff: write `wiki/strategies/strategy_spy-rotational.md` with rules + entry/exit/sizing/stop/risk envelope + `## How This Works` prose section (non-optional per CLAUDE.md Teach Mode).
+- Phase 5.1 kickoff: strict `read_all()` + line-by-line resilient reader + quarantine protocol redesign (full ship shape in the m2.23 cycle DEVLOG deferred-follow-up block).
+- Phase 5.1 kickoff: Phase 5 aggregator isfinite guards at every read-side consumer of the four new fields (paired ship).
+- Phase 4 (burn-in-triggered OR first-paper-trade-triggered): strategy_commit_sha git-log cross-check on backtest approval gate.
+- Cycle-playbook update: add caller-semantics pass to the surface-audit template for future contract-tightening work.
+- Bundle 4b (parallel with Phase 3): m2.13 invest-screen + m2.14 invest-regime.
+- Bundle 5 (pre-Phase-3.7): m2.9 Telegram + m2.19 pm2 + m2.20 tier frontmatter audit + m2.22 Codex full review.
+
+---
+
 ## 2026-04-20 -- Bundle 4 cycle 4 ships: journal schema v2 audit + Phase 5 metric fields (m2.23)
 
 **Commit:** `b9f2ccc` chore(journal-schema): v2 audit + Phase-5-metric field verification (m2.23)
