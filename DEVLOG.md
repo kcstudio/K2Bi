@@ -2,6 +2,28 @@
 
 Session-by-session ship log. Append-only. New entries on top.
 
+
+## 2026-04-19 -- Bundle 3 cycle 6 ships: invest-propose-limits MVP
+
+**Commit:** `dd10d9d` feat(invest-propose-limits): MVP -- structured delta + safety-impact + review/strategy-approvals output
+
+**What shipped:** Bundle 3 cycle 6 graduates `invest-propose-limits` from stub to shipped MVP, completing the input-producer side of Bundle 3's approval gate. Cycle 5 shipped the consumer (`--approve-limits` handler in `scripts/lib/invest_ship_strategy.py`); cycle 6 ships the skill that writes files the handler consumes. Core is `scripts/lib/propose_limits.py` (1970 lines): `parse_nl()` resolves Keith's NL ask to a `ParsedDelta` or `Clarification` across the 4-rule x 4-change-type matrix (`position_size`, `trade_risk`, `leverage`, `market_hours` widen/tighten + `instrument_whitelist` add/remove); `compute_safety_impact()` emits deterministic text per spec section 5.2 via four hardcoded heuristic templates keyed by `(rule, change_type)` (no LLM improvisation on safety-critical text); `build_yaml_patch()` extracts the exact `config.yaml` slice the change touches and synthesises a matching after-slice with boolean-casing preservation; `render_proposal()` serialises the spec-section-2.3 markdown; `write_proposal()` + `_atomic_write()` write to `review/strategy-approvals/` atomically with a path-tail guard that refuses any target whose last two parts are `validators/config.yaml` (the skill's hard rule as code, not prose). SKILL.md body documents the invocation contract, supported matrix, multi-turn clarification pattern, and integration contract with cycle-5's handler. `tests/test_propose_limits.py` covers 87 tests including 6 handler round-trip integration tests that write a proposal file + apply it via the real `handle_approve_limits` + verify `config.yaml` matches the encoded delta.
+
+**Codex review:** `/ship --skip-codex codex-r5-accepted-p2-fixed-inline-boolean-casing`. Three Codex rounds ran inline on cycle 6 via the background + poll pattern (`codex-companion.mjs` + `Bash run_in_background: true` + `Monitor`): R3 found 1 P2 + 1 P3 (lowercase-ticker normalization + CLI config-path rebase) fixed inline with regression tests; R4 found 2 new P2s (multi-ticker batched-ask silent drop + multi-rule silent parse) fixed by adding `_detect_multi_rule` + `_extract_all_tickers` + a shared `_TICKER_STOPWORDS` set that unified the two previously-diverged stopword copies (which had allowed `FROM` to leak through `_extract_all_tickers` while being caught in `_extract_ticker`); R5 found 1 P2 (boolean token casing assumption) fixed via `_format_value_matching` preserving existing `True` / `TRUE` / `False` / `FALSE` casing on the config line and `_patch_leverage_widen` routing `cash_only` tokens through the same helper. Per architect stop-rule (`Codex hits round 3 on the same surface: STOP`), R5's fix landed inline without a round-4 Codex pass on cycle 6. MiniMax R1-R4 ran iteratively (SSL timeouts at >250K char prompts, recovered via `--scope diff`) finding config guard case-sensitivity, multi-whitelist drop hint, safety-impact cash_only gap, market-hours duplicate-field-value concern (confirmed false-positive via added test), `os.link` EXDEV fallback, and `cash_only`-absent note; MiniMax R5 approve zero findings.
+
+**Feature status change:** no feature note (Bundle 3 cycle is tracked via the architect spec at `proposals/2026-04-19_k2bi-bundle-3-approval-gate-spec.md`, matching the cycle 2-5 pattern). Phase 2 Bundle 3 milestone m2.16 now substantially landed; milestone m2.17 already landed in cycle 5.
+
+**Follow-ups:**
+- Cycle 7: `tests/test_bundle_3_e2e.py` end-to-end paper-account integration test gated behind `K2BI_RUN_IBKR_TESTS=1`. Closes Bundle 3.
+- Bundle 6: multi-process file-lock guard on `handle_approve_limits` once pm2 automation makes concurrent invocations realistic (Q11 confirmed-deferred in architect spec).
+
+**Key decisions (cycle-level):**
+- Skill-side safety-impact text is DETERMINISTIC. The four heuristic categories from spec section 5.2 map to hardcoded templates keyed by `(rule, change_type)` with variable interpolation. No LLM improvisation on safety-critical text. Avoids the cycle-3-style `Codex finds Codex finds Codex` iteration pattern on subjective phrasing.
+- Hard-rule invariant via path-tail guard in `_atomic_write`: any write target whose last two path parts are `validators/config.yaml` is refused. The skill literally cannot write to the real `config.yaml` even if a refactor accidentally routes a config path through the writer. Belt-and-braces vs. the skill-level discipline + cycle-4 pre-commit Check C.
+- NL parser scope is the 20-combination matrix, not an open-ended parser. Multi-rule asks and multi-ticker asks route to `Clarification` rather than silently dropping the second rule / second ticker (the two P2 findings Codex R4 surfaced).
+- Shared stopword set: two previously-independent stopword copies (`_extract_ticker` vs `_extract_all_tickers`) drifted during R4 fix work; the R4 regression (`FROM` landing in one set but not the other) surfaced the risk. Unified into `_TICKER_STOPWORDS` frozenset as the single source of truth.
+- `K2BI_ALLOW_LOG_APPEND=1` used on the ship commit to bypass the direct-`>> wiki/log.md` pre-commit guard; the trigger was a documentation reference to the guard pattern inside `proposals/2026-04-19_k2bi-bundle-3-approval-gate-spec.md`, not an actual append operation.
+
 ---
 
 ## 2026-04-19 -- Remove stale NEXT_SESSION.md reference from CLAUDE.md
