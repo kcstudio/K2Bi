@@ -61,6 +61,7 @@ failure, prints the error to stderr and exits 1. Unexpected failures
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import os
 import re
@@ -74,6 +75,7 @@ from typing import Any
 
 import yaml
 
+from scripts.lib import invest_bear_case as ibc
 from scripts.lib import strategy_frontmatter as sf
 
 
@@ -141,6 +143,404 @@ DEFAULT_CONFIG_YAML = Path("execution") / "validators" / "config.yaml"
 
 class ValidationError(ValueError):
     """Step-A validation failure. Message is surfaced to Keith as-is."""
+
+
+# ---------- bear-case approval gate (Bundle 4 cycle 2 / m2.12) ----------
+
+
+@dataclass(frozen=True)
+class BearCaseScanResult:
+    """Outcome of `scan_bear_case_for_ticker` -- mirrors the ScanResult
+    shape cycle 5 will use for `scan_backtests_for_slug` (spec §3.5).
+    `verdict` is the single enum the gate consumes; `reason` is empty on
+    PROCEED and populated with a Keith-facing message on REFUSE.
+    """
+
+    verdict: str  # "PROCEED" | "REFUSE"
+    reason: str
+
+
+# Ticker format regex -- same contract as invest_bear_case.validate_symbol
+# + invest_thesis. Keeps gate-side and writer-side ticker validation in
+# lockstep so a value accepted by the writer is accepted by the scanner
+# (and vice versa). Codex R1 HIGH -- closes the path-traversal surface
+# where an order.ticker like `../../reference/foo` would otherwise make
+# the scan read an arbitrary markdown file under the vault.
+_SCAN_SYMBOL_RE = re.compile(r"^[A-Z0-9]+(?:\.[A-Z0-9]+)?$")
+
+
+def _validate_ticker_for_scan(ticker: str) -> str | None:
+    """Return None when `ticker` matches the K2Bi symbol format; a short
+    error string otherwise. Used by scan_bear_case_for_ticker to refuse
+    scanning for syntactically-invalid tickers BEFORE touching the
+    filesystem.
+    """
+    if not ticker:
+        return "ticker is empty"
+    if not _SCAN_SYMBOL_RE.match(ticker):
+        return (
+            f"ticker {ticker!r} is not a valid K2Bi symbol "
+            f"(expected [A-Z0-9]+(\\.[A-Z0-9]+)?)"
+        )
+    if not any(ch.isalpha() for ch in ticker):
+        return (
+            f"ticker {ticker!r} must contain at least one letter "
+            f"(digits-only strings are not valid tickers)"
+        )
+    return None
+
+
+def scan_bear_case_for_ticker(
+    ticker: str,
+    *,
+    vault_root: Path,
+    now: _dt.date | None = None,
+) -> BearCaseScanResult:
+    """Scan `wiki/tickers/<TICKER>.md` under `vault_root` for a fresh
+    PROCEED bear-case verdict. Returns PROCEED on success or REFUSE with
+    a specific reason on any gate condition (spec §3.2 + Codex cycle-2
+    R1/R2/R3 hardening):
+
+      1. Missing ticker file OR missing `bear_verdict` field.
+      2. `bear-last-verified` more than `FRESH_DAYS` ago (stale) OR in
+         the future (likely clock-skew / hand-edit).
+      3. `bear_verdict: VETO`.
+      4. Frontmatter parse error OR ticker path that escapes the vault.
+      5. Partial / malformed bear-case schema (any of the 5 bear_* fields
+         missing, conviction out of 0..100, wrong type).
+
+    `bear-last-verified` in the inclusive window `[now - FRESH_DAYS, now]`
+    is fresh. Values outside that window (stale OR future-dated) refuse.
+    `bear_verdict: PROCEED` is accepted; `VETO` refused. Any other value
+    refuses with the "run /invest bear-case" hint so drift cannot
+    silently approve.
+
+    The helper is `vault_root`-explicit so callers that compose strategy
+    paths with an arbitrary vault layout (tests in particular) can steer
+    the scan. Production callers (`handle_approve_strategy`) derive
+    `vault_root` from the strategy file path: a strategy at
+    `<root>/wiki/strategies/strategy_*.md` implies tickers at
+    `<root>/wiki/tickers/<SYMBOL>.md`. Symbol + containment checks
+    prevent a crafted `order.ticker` from redirecting the scan to an
+    arbitrary file outside the tickers directory.
+    """
+    if now is None:
+        now = _dt.date.today()
+
+    # Codex R1: validate ticker format BEFORE any filesystem touch.
+    format_err = _validate_ticker_for_scan(ticker)
+    if format_err is not None:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"cannot scan bear-case for invalid ticker: "
+                f"{format_err}. Fix the strategy's `order.ticker` "
+                f"field to a real K2Bi symbol and retry."
+            ),
+        )
+
+    try:
+        resolved_vault_root = vault_root.resolve(strict=False)
+        tickers_dir = (vault_root / "wiki" / "tickers").resolve(strict=False)
+    except OSError as exc:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"cannot resolve vault/tickers path ({exc}); refusing "
+                f"to scan bear-case for {ticker}."
+            ),
+        )
+    # Codex round-2 R1 HIGH: the tickers_dir itself must stay under the
+    # resolved vault_root. If `wiki/tickers` is a symlink pointing
+    # outside the vault, a well-formed ticker filename could still clear
+    # approval from a file outside the repository. Containment of the
+    # ticker PATH alone is not enough -- we also need the ANCESTOR dir
+    # to be inside the vault.
+    try:
+        tickers_dir.relative_to(resolved_vault_root)
+    except ValueError:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"wiki/tickers resolves to {tickers_dir!s}, outside "
+                f"vault_root {resolved_vault_root!s}; refusing to scan."
+            ),
+        )
+
+    ticker_path = vault_root / "wiki" / "tickers" / f"{ticker}.md"
+    # Codex round-1 R1: defence-in-depth containment check. The symbol
+    # regex above already rejects `/` and `..`; this second gate catches
+    # a future regex loosening or a symlink under wiki/tickers that
+    # redirects outside the intended directory.
+    try:
+        resolved = ticker_path.resolve(strict=False)
+        resolved.relative_to(tickers_dir)
+    except (ValueError, OSError):
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"ticker path {ticker_path!s} resolves outside "
+                f"wiki/tickers/; refusing to scan."
+            ),
+        )
+
+    if not ticker_path.exists():
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"run /invest bear-case {ticker} first; approval "
+                f"requires bear-case pass (no thesis at {ticker_path})"
+            ),
+        )
+    # Codex round-2 R3 MEDIUM: ticker_path.exists() returns True for
+    # directories, sockets, and other non-regular entries. read_bytes()
+    # on a directory raises IsADirectoryError (OSError). Catch that at
+    # the shape gate BEFORE the read so the failure surfaces as a
+    # deterministic REFUSE with guidance instead of an unhandled
+    # exception bubbling out of handle_approve_strategy.
+    if not ticker_path.is_file():
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"wiki/tickers/{ticker}.md is not a regular file "
+                f"(directory, socket, or special entry); cannot read "
+                f"bear-case. Replace with a thesis file or run "
+                f"/invest thesis {ticker} first."
+            ),
+        )
+
+    try:
+        raw_bytes = ticker_path.read_bytes()
+    except OSError as exc:
+        # Permission denied, device error, etc. -- same refuse-style
+        # response as the malformed-frontmatter path so Keith sees
+        # guidance, not a traceback.
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"could not read wiki/tickers/{ticker}.md ({exc}); "
+                f"check permissions then retry"
+            ),
+        )
+
+    try:
+        fm = sf.parse(raw_bytes)
+    except ValueError as exc:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"cannot parse wiki/tickers/{ticker}.md frontmatter "
+                f"({exc}); fix manually then retry"
+            ),
+        )
+
+    # Codex round-2 R2 HIGH: require the file to be a real thesis, not
+    # just a bear-case blob. `run_bear_case` already requires
+    # `thesis_score` at write time; mirror that at scan time so a
+    # hand-crafted file with only bear_* fields cannot satisfy the gate.
+    # Also require `symbol` to match the requested ticker so a
+    # mislabelled file (thesis for AAPL stored at wiki/tickers/NVDA.md)
+    # refuses rather than silently approving.
+    if fm.get("thesis_score") is None:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"wiki/tickers/{ticker}.md has no thesis_score; the "
+                f"file does not look like a thesis. Run /invest "
+                f"thesis {ticker} first."
+            ),
+        )
+    # Codex round-3 HIGH: `symbol:` is REQUIRED (must be present,
+    # must be a non-empty string, must byte-equal ticker). Previously
+    # the check only fired on mismatched strings -- missing, null, or
+    # non-string values (e.g. `symbol: 123` parsed as int) silently
+    # passed. Reasonable defensive construction here: reject any shape
+    # that is not "string equal to ticker".
+    symbol_field = fm.get("symbol")
+    if not isinstance(symbol_field, str) or symbol_field.strip() != ticker:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"wiki/tickers/{ticker}.md must have "
+                f"`symbol: {ticker}` in frontmatter to prove file "
+                f"identity; got {symbol_field!r}. Rename, regenerate, "
+                f"or run /invest thesis {ticker} first."
+            ),
+        )
+
+    bear_verdict_raw = fm.get("bear_verdict")
+    if bear_verdict_raw is None:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"run /invest bear-case {ticker} first; approval "
+                f"requires bear-case pass"
+            ),
+        )
+
+    # Codex round-1 R3: enforce the full persisted schema at scan time.
+    # Spec §2.2 mandates all 5 bear_* fields co-present with typed
+    # values; any drift lets corrupted state satisfy the gate. Reject
+    # BEFORE the verdict/freshness checks so the "schema broken" error
+    # is the message Keith sees first when hand-editing goes wrong.
+    schema_err = _validate_scan_bear_schema(fm, ticker)
+    if schema_err is not None:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=schema_err,
+        )
+
+    # Freshness -- stale bear-cases could reflect a very different market
+    # structure than today's. Future-dated values are also refused
+    # (clock-skew or hand-edit). Inclusive window [now - FRESH_DAYS, now].
+    last_raw = fm.get("bear-last-verified")
+    last_date: _dt.date | None = None
+    # Codex round-4 MEDIUM: YAML parses `2026-04-19T00:00:00Z` as
+    # datetime.datetime, and `datetime.datetime` IS-A `date` in Python
+    # -- so a naive `isinstance(x, date)` branch would accept it and
+    # then `date - datetime` would raise TypeError, crashing the scan
+    # instead of refusing cleanly. Check datetime FIRST and normalise
+    # to .date() so subtraction is always date-vs-date.
+    if isinstance(last_raw, _dt.datetime):
+        last_date = last_raw.date()
+    elif isinstance(last_raw, _dt.date):
+        last_date = last_raw
+    elif isinstance(last_raw, str):
+        try:
+            last_date = _dt.date.fromisoformat(last_raw.strip())
+        except ValueError:
+            last_date = None
+    if last_date is None:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"bear-last-verified missing or malformed on "
+                f"wiki/tickers/{ticker}.md; run /invest bear-case "
+                f"{ticker} --refresh"
+            ),
+        )
+    days_old = (now - last_date).days
+    # Codex R2: mirror invest_bear_case._is_fresh -- reject future dates
+    # AND stale dates so a hand-edit stamping next year does not
+    # permanently satisfy the freshness gate.
+    if days_old < 0:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"bear-last-verified on wiki/tickers/{ticker}.md is "
+                f"in the future ({last_date.isoformat()}); likely a "
+                f"clock-skew or hand-edit. Run /invest bear-case "
+                f"{ticker} --refresh to rewrite cleanly."
+            ),
+        )
+    if days_old > ibc.FRESH_DAYS:
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"bear-case stale ({last_date.isoformat()}); run "
+                f"/invest bear-case {ticker} --refresh"
+            ),
+        )
+
+    if bear_verdict_raw == "VETO":
+        conviction = fm.get("bear_conviction", "unknown")
+        return BearCaseScanResult(
+            verdict="REFUSE",
+            reason=(
+                f"bear-case VETO'd this thesis (conviction "
+                f"{conviction}); address top counterpoints + "
+                f"re-run bear-case"
+            ),
+        )
+    if bear_verdict_raw == "PROCEED":
+        return BearCaseScanResult(verdict="PROCEED", reason="")
+
+    return BearCaseScanResult(
+        verdict="REFUSE",
+        reason=(
+            f"unknown bear_verdict value {bear_verdict_raw!r} on "
+            f"wiki/tickers/{ticker}.md; run /invest bear-case "
+            f"{ticker} --refresh"
+        ),
+    )
+
+
+def _validate_scan_bear_schema(fm: dict[str, Any], ticker: str) -> str | None:
+    """Return a REFUSE-reason string when the persisted bear-case
+    frontmatter violates spec §2.2 schema. None when the on-disk shape
+    is consistent enough to trust downstream checks.
+
+    Enforces:
+      - bear_conviction present, int (bool excluded), 0 <= v <= 100.
+      - bear_top_counterpoints present, list of exactly 3 non-empty str.
+      - bear_invalidation_scenarios present, list of 2..5 non-empty str.
+      - bear-last-verified present (freshness check parses separately).
+
+    Codex R3 HIGH -- before this check, a hand-edited file with
+    `bear_verdict: PROCEED` + `bear_conviction: true` + no counterpoints
+    could clear approval. Scan-time schema enforcement is the authority;
+    writer-side enforcement is redundancy. Keep both.
+    """
+    conv = fm.get("bear_conviction")
+    # `bool` is a subclass of `int` in Python -- exclude explicitly so
+    # YAML `true` / `false` values do not masquerade as convictions.
+    if conv is None:
+        return (
+            f"bear_verdict set on wiki/tickers/{ticker}.md but "
+            f"bear_conviction is missing; the bear-case frontmatter "
+            f"is internally inconsistent -- run /invest bear-case "
+            f"{ticker} --refresh"
+        )
+    if not isinstance(conv, int) or isinstance(conv, bool):
+        return (
+            f"bear_conviction on wiki/tickers/{ticker}.md must be "
+            f"an integer 0..100, got {conv!r}; run /invest bear-case "
+            f"{ticker} --refresh"
+        )
+    if conv < 0 or conv > 100:
+        return (
+            f"bear_conviction on wiki/tickers/{ticker}.md must be "
+            f"in [0, 100], got {conv}; run /invest bear-case "
+            f"{ticker} --refresh"
+        )
+
+    cps = fm.get("bear_top_counterpoints")
+    if not isinstance(cps, list) or len(cps) != 3:
+        return (
+            f"bear_top_counterpoints on wiki/tickers/{ticker}.md "
+            f"must be a list of exactly 3 strings; run /invest "
+            f"bear-case {ticker} --refresh"
+        )
+    for cp in cps:
+        if not isinstance(cp, str) or not cp.strip():
+            return (
+                f"bear_top_counterpoints on wiki/tickers/{ticker}.md "
+                f"contains a non-string or empty entry; run /invest "
+                f"bear-case {ticker} --refresh"
+            )
+
+    scs = fm.get("bear_invalidation_scenarios")
+    if not isinstance(scs, list) or not (2 <= len(scs) <= 5):
+        return (
+            f"bear_invalidation_scenarios on wiki/tickers/{ticker}.md "
+            f"must be a list of 2..5 strings; run /invest bear-case "
+            f"{ticker} --refresh"
+        )
+    for sc in scs:
+        if not isinstance(sc, str) or not sc.strip():
+            return (
+                f"bear_invalidation_scenarios on "
+                f"wiki/tickers/{ticker}.md contains a non-string or "
+                f"empty entry; run /invest bear-case {ticker} --refresh"
+            )
+
+    if fm.get("bear-last-verified") is None:
+        return (
+            f"bear-last-verified missing on wiki/tickers/{ticker}.md; "
+            f"run /invest bear-case {ticker} --refresh"
+        )
+
+    return None
 
 
 # ---------- trailer builder (ONE seam per preemptive decision #6) ----------
@@ -847,12 +1247,20 @@ def handle_approve_strategy(
     *,
     parent_sha: str | None = None,
     now: datetime | None = None,
+    vault_root: Path | None = None,
+    today: _dt.date | None = None,
 ) -> StrategyCommitHints:
     """Execute Step A + Step D for `/invest-ship --approve-strategy`.
 
     Side effect: atomically rewrites `path` with status=approved plus the
     approved_at + approved_commit_sha fields. Returns commit hints for
     the skill body to splice into its commit message.
+
+    Bundle 4 cycle 2 addition: the bear-case gate refuses approval unless
+    the strategy's primary ticker has a fresh PROCEED verdict in
+    `wiki/tickers/<TICKER>.md` (spec §3.2 + §9.3). `vault_root` overrides
+    the path-derived vault for tests; `today` pins freshness comparisons
+    for test determinism.
     """
     content, fm = _parse_strategy(path)
     _require_status(fm, "proposed", path)
@@ -861,6 +1269,32 @@ def handle_approve_strategy(
     _require_no_fields(
         fm, ["approved_at", "approved_commit_sha"], path
     )
+
+    # Bundle 4 cycle 2: bear-case freshness gate. Runs AFTER syntactic
+    # validation (we need order.ticker to scan) and BEFORE capture_parent_
+    # sha + the atomic rewrite (so a REFUSE leaves the working tree
+    # unchanged). Cycle 5 will slot scan_backtests_for_slug(slug) in
+    # right after this block -- same shape, different surface.
+    order = fm.get("order") or {}
+    primary_ticker = order.get("ticker") if isinstance(order, dict) else None
+    if not isinstance(primary_ticker, str) or not primary_ticker.strip():
+        raise ValidationError(
+            f"{path}: frontmatter `order.ticker` must be a non-empty "
+            f"string for the bear-case gate"
+        )
+    primary_ticker = primary_ticker.strip()
+    resolved_vault = vault_root
+    if resolved_vault is None:
+        # Strategy lives at <vault_root>/wiki/strategies/strategy_*.md,
+        # so walk up two parents from the file (parents[2] = <vault_root>).
+        # Resolve the path first so symlinks do not redirect us outside
+        # the vault.
+        resolved_vault = path.resolve().parents[2]
+    bear_scan = scan_bear_case_for_ticker(
+        primary_ticker, vault_root=resolved_vault, now=today,
+    )
+    if bear_scan.verdict == "REFUSE":
+        raise ValidationError(bear_scan.reason)
 
     # Preemptive decision #5: capture parent sha FIRST, before touching
     # any file or staging. If caller already resolved it (test fixtures),

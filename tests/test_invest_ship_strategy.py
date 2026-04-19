@@ -57,6 +57,7 @@ Tests use tmp repos for handlers that call git (capture_parent_sha).
 
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -275,6 +276,56 @@ def _write_limits_proposal(
     return p
 
 
+def _seed_bear_case_proceed(
+    repo: Path,
+    ticker: str = "SPY",
+    *,
+    days_old: int = 0,
+    today: str | None = None,
+) -> Path:
+    """Seed wiki/tickers/<TICKER>.md with a minimal thesis + fresh
+    PROCEED bear-case so `handle_approve_strategy` passes the Bundle 4
+    cycle 2 bear-case freshness gate. `days_old` offsets bear-last-
+    verified backwards from `today` (default 0 = same-day fresh).
+
+    `today` default is the real calendar date so CLI subprocess tests
+    (which cannot pin `date.today()`) remain in the freshness window.
+    Fixed-clock tests that call handle_approve_strategy directly pass
+    both `today=` here AND `today=` to the handler so the scan and the
+    seed agree on the reference date.
+    """
+    from datetime import date as _date
+    from datetime import timedelta
+    base_date = _date.fromisoformat(today) if today else _date.today()
+    bear_date = (base_date - timedelta(days=days_old)).isoformat()
+    today_str = base_date.isoformat()
+    tickers_dir = repo / "wiki" / "tickers"
+    tickers_dir.mkdir(parents=True, exist_ok=True)
+    path = tickers_dir / f"{ticker}.md"
+    path.write_text(
+        "---\n"
+        f"tags: [ticker, {ticker}, thesis]\n"
+        f"date: {today_str}\n"
+        "type: ticker\n"
+        "origin: k2bi-extract\n"
+        'up: "[[tickers/index]]"\n'
+        f"symbol: {ticker}\n"
+        f"thesis-last-verified: {today_str}\n"
+        "thesis_score: 73\n"
+        f"bear-last-verified: {bear_date}\n"
+        "bear_conviction: 40\n"
+        "bear_top_counterpoints:\n"
+        "  - c1\n  - c2\n  - c3\n"
+        "bear_invalidation_scenarios:\n"
+        "  - s1\n  - s2\n"
+        "bear_verdict: PROCEED\n"
+        "---\n\n"
+        f"## Phase 1: Business Model\n\ndummy\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_config_yaml(
     repo: Path, content: str | None = None
 ) -> Path:
@@ -384,9 +435,12 @@ class HandleApproveStrategyTests(unittest.TestCase):
         subprocess.run(["rm", "-rf", str(self.repo)], check=False)
 
     def test_happy_path_rewrites_frontmatter(self):
+        _seed_bear_case_proceed(self.repo, ticker="SPY")
         path = _write_strategy(self.repo, slug="spy")
         now = datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc)
-        hints = iss.handle_approve_strategy(path, now=now)
+        hints = iss.handle_approve_strategy(
+            path, now=now, today=_dt.date(2026, 4, 19),
+        )
 
         self.assertEqual(hints.slug, "spy")
         self.assertEqual(hints.transition, "proposed -> approved")
@@ -427,6 +481,7 @@ class HandleApproveStrategyTests(unittest.TestCase):
         # immutability invariant.
         # NB: _write_strategy prepends `## How This Works\n\n` itself, so
         # `how_body` is just the prose after that heading.
+        _seed_bear_case_proceed(self.repo, ticker="SPY")
         body = (
             "Line one.\n"
             "\n"
@@ -434,7 +489,7 @@ class HandleApproveStrategyTests(unittest.TestCase):
         )
         path = _write_strategy(self.repo, how_body=body)
         original = path.read_bytes()
-        iss.handle_approve_strategy(path)
+        iss.handle_approve_strategy(path, today=_dt.date(2026, 4, 19))
         edited = path.read_bytes()
         # Body slice starts after the second `---\n` boundary.
         def body_bytes(b: bytes) -> bytes:
@@ -544,6 +599,117 @@ class HandleApproveStrategyTests(unittest.TestCase):
         )
         with self.assertRaises(iss.ValidationError):
             iss.handle_approve_strategy(path, parent_sha=self.parent_sha)
+
+
+# ---------- Bundle 4 cycle 2: bear-case gate through handle_approve_strategy ----------
+
+
+class BearCaseGateThroughApprovalTests(unittest.TestCase):
+    """MiniMax review finding #1 (critical): end-to-end tests that the
+    bear-case gate REFUSE path correctly propagates through
+    handle_approve_strategy -- exercising order.ticker extraction +
+    vault_root resolution + ValidationError surfacing.
+
+    The scan helper is unit-tested in test_approval_bear_case_gate.py;
+    these tests prove the WIRING (handler -> scan -> raise).
+    """
+
+    def setUp(self):
+        self.repo, self.parent_sha = _make_tmp_repo()
+        self.today = _dt.date(2026, 4, 19)
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", str(self.repo)], check=False)
+
+    def test_no_thesis_file_refuses_approval(self):
+        # No wiki/tickers/SPY.md at all -- gate must refuse.
+        path = _write_strategy(self.repo, slug="spy")
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path, parent_sha=self.parent_sha, today=self.today,
+            )
+        self.assertIn("bear-case", str(cm.exception).lower())
+        self.assertIn("SPY", str(cm.exception))
+
+    def test_stale_bear_case_refuses_approval(self):
+        # Seed bear-case 45 days old -- stale.
+        _seed_bear_case_proceed(
+            self.repo, ticker="SPY",
+            days_old=45, today=self.today.isoformat(),
+        )
+        path = _write_strategy(self.repo, slug="spy")
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path, parent_sha=self.parent_sha, today=self.today,
+            )
+        self.assertIn("stale", str(cm.exception).lower())
+
+    def test_veto_bear_case_refuses_approval(self):
+        # Seed bear_verdict: VETO with fresh date.
+        tickers_dir = self.repo / "wiki" / "tickers"
+        tickers_dir.mkdir(parents=True, exist_ok=True)
+        fresh = self.today.isoformat()
+        (tickers_dir / "SPY.md").write_text(
+            "---\n"
+            "tags: [ticker, SPY, thesis]\n"
+            f"date: {fresh}\n"
+            "type: ticker\n"
+            "origin: k2bi-extract\n"
+            'up: "[[tickers/index]]"\n'
+            "symbol: SPY\n"
+            f"thesis-last-verified: {fresh}\n"
+            "thesis_score: 73\n"
+            f"bear-last-verified: {fresh}\n"
+            "bear_conviction: 85\n"
+            "bear_verdict: VETO\n"
+            "bear_top_counterpoints:\n"
+            "  - c1\n  - c2\n  - c3\n"
+            "bear_invalidation_scenarios:\n"
+            "  - s1\n  - s2\n"
+            "---\n\n"
+            "## Phase 1: Business Model\n\ndummy\n",
+            encoding="utf-8",
+        )
+        path = _write_strategy(self.repo, slug="spy")
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path, parent_sha=self.parent_sha, today=self.today,
+            )
+        self.assertIn("VETO", str(cm.exception))
+        self.assertIn("85", str(cm.exception))
+
+    def test_malformed_ticker_frontmatter_refuses_approval(self):
+        # Unterminated frontmatter fence -- scan refuses with parse error.
+        tickers_dir = self.repo / "wiki" / "tickers"
+        tickers_dir.mkdir(parents=True, exist_ok=True)
+        (tickers_dir / "SPY.md").write_text(
+            "---\nsymbol: SPY\nno closing fence\n",
+            encoding="utf-8",
+        )
+        path = _write_strategy(self.repo, slug="spy")
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path, parent_sha=self.parent_sha, today=self.today,
+            )
+        self.assertIn("parse", str(cm.exception).lower())
+        self.assertIn("SPY", str(cm.exception))
+
+    def test_missing_order_ticker_refuses_approval(self):
+        # If the strategy's order.ticker is missing, the gate guard fires.
+        _seed_bear_case_proceed(
+            self.repo, ticker="SPY", today=self.today.isoformat(),
+        )
+        path = _write_strategy(
+            self.repo, slug="spy", missing_order_fields=["ticker"],
+        )
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path, parent_sha=self.parent_sha, today=self.today,
+            )
+        # `_validate_strategy_shape` fires FIRST with the missing-key
+        # message -- this proves the ordering: shape check precedes the
+        # bear-case scan so a malformed strategy does not hit the gate.
+        self.assertIn("ticker", str(cm.exception).lower())
 
 
 # ---------- handle_reject_strategy ----------
@@ -1055,7 +1221,21 @@ class CLISubprocessTests(unittest.TestCase):
             cwd=str(self.repo),
         )
 
+    def test_approve_strategy_cli_refuses_without_bear_case(self):
+        """MiniMax cycle-2 R1 finding: prove the bear-case REFUSE path
+        reaches the CLI exit code + stderr surface, not just the
+        in-process handler. No bear-case seed -> CLI must exit 1 with
+        a stderr message citing `bear-case`."""
+        _write_strategy(self.repo, slug="spy")
+        result = self._run(
+            "approve-strategy", "wiki/strategies/strategy_spy.md"
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("bear-case", result.stderr.lower())
+        self.assertIn("SPY", result.stderr)
+
     def test_approve_strategy_happy_path_emits_json(self):
+        _seed_bear_case_proceed(self.repo, ticker="SPY")
         _write_strategy(self.repo, slug="spy")
         result = self._run(
             "approve-strategy", "wiki/strategies/strategy_spy.md"

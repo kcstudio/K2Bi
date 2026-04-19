@@ -75,10 +75,52 @@ def _build_commit_message(
     return "\n".join(lines) + "\n"
 
 
+def _seed_bear_case_proceed(repo: Path, env: dict, ticker: str = "SPY") -> Path:
+    """Seed wiki/tickers/<TICKER>.md with a fresh PROCEED bear-case +
+    commit it so subsequent `handle_approve_strategy` calls pass the
+    Bundle 4 cycle 2 bear-case freshness gate. Idempotent-ish: later
+    calls overwrite the file but re-commit cleanly.
+    """
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    rel = f"wiki/tickers/{ticker}.md"
+    content = (
+        "---\n"
+        f"tags: [ticker, {ticker}, thesis]\n"
+        f"date: {today}\n"
+        "type: ticker\n"
+        "origin: k2bi-extract\n"
+        'up: "[[tickers/index]]"\n'
+        f"symbol: {ticker}\n"
+        f"thesis-last-verified: {today}\n"
+        "thesis_score: 73\n"
+        f"bear-last-verified: {today}\n"
+        "bear_conviction: 40\n"
+        "bear_top_counterpoints:\n"
+        "  - c1\n  - c2\n  - c3\n"
+        "bear_invalidation_scenarios:\n"
+        "  - s1\n  - s2\n"
+        "bear_verdict: PROCEED\n"
+        "---\n\n"
+        "## Phase 1: Business Model\n\ndummy\n"
+    )
+    path = write_file(repo, rel, content)
+    result = harness_commit(repo, env, f"chore: seed bear-case {ticker}", rel)
+    if result.returncode != 0:
+        raise AssertionError(f"bear-case seed commit failed: {result.stderr}")
+    return path
+
+
 def _seed_proposed_strategy(
     repo: Path, env: dict, slug: str = "spy"
 ) -> Path:
-    """Write a proposed strategy + commit it. Returns the file path."""
+    """Write a proposed strategy + commit it. Returns the file path.
+
+    Automatically seeds a PROCEED bear-case for the strategy's default
+    ticker (SPY) because `handle_approve_strategy` now refuses approval
+    without it (Bundle 4 cycle 2 gate, spec §3.2).
+    """
+    _seed_bear_case_proceed(repo, env, ticker=default_order()["ticker"])
     content = strategy_text(
         name=slug,
         status="proposed",

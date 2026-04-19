@@ -78,15 +78,55 @@ def _build_commit_message(subject: str, trailers: list[str]) -> str:
     return subject + "\n\n" + "\n".join(trailers) + "\n"
 
 
+def _seed_bear_case_proceed(
+    repo: Path, env: dict, ticker: str = "SPY"
+) -> Path:
+    """Seed wiki/tickers/<TICKER>.md with a fresh PROCEED bear-case +
+    commit it so subsequent `handle_approve_strategy` calls pass the
+    Bundle 4 cycle 2 bear-case freshness gate (spec §3.2).
+    """
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    rel = f"wiki/tickers/{ticker}.md"
+    content = (
+        "---\n"
+        f"tags: [ticker, {ticker}, thesis]\n"
+        f"date: {today}\n"
+        "type: ticker\n"
+        "origin: k2bi-extract\n"
+        'up: "[[tickers/index]]"\n'
+        f"symbol: {ticker}\n"
+        f"thesis-last-verified: {today}\n"
+        "thesis_score: 73\n"
+        f"bear-last-verified: {today}\n"
+        "bear_conviction: 40\n"
+        "bear_top_counterpoints:\n"
+        "  - c1\n  - c2\n  - c3\n"
+        "bear_invalidation_scenarios:\n"
+        "  - s1\n  - s2\n"
+        "bear_verdict: PROCEED\n"
+        "---\n\n"
+        "## Phase 1: Business Model\n\ndummy\n"
+    )
+    path = write_file(repo, rel, content)
+    result = harness_commit(repo, env, f"chore: seed bear-case {ticker}", rel)
+    assert result.returncode == 0, (
+        f"bear-case seed commit failed: {result.stderr}"
+    )
+    return path
+
+
 def _seed_proposed_strategy(
     repo: Path, env: dict, slug: str
 ) -> Path:
     """Write a proposed strategy under wiki/strategies/ + draft commit.
     Mirrors cycle-5's _seed_proposed_strategy but enforces the
-    e2e-test- prefix so cleanup is trivial."""
+    e2e-test- prefix so cleanup is trivial. Also seeds the PROCEED
+    bear-case required by Bundle 4 cycle 2's approval gate."""
     assert slug.startswith(E2E_SLUG_PREFIX), (
         f"e2e tests require slug prefix {E2E_SLUG_PREFIX!r}; got {slug!r}"
     )
+    _seed_bear_case_proceed(repo, env, ticker=default_order()["ticker"])
     content = strategy_text(
         name=slug,
         status="proposed",
