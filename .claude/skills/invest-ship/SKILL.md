@@ -168,22 +168,17 @@ The helper checks: file exists, frontmatter parses, `status: proposed`, all requ
 
 If the helper succeeded, it has ALREADY rewritten the file atomically with `status: approved` + the new frontmatter fields. Do NOT re-edit the file; the helper is the sole writer.
 
-**Step B -- Codex plan review on the strategy spec (Checkpoint 1; spec §3.2 Step B):**
+**Step B -- plan review on the strategy spec (Checkpoint 1; spec §3.2 Step B):**
 
-Run Codex against the strategy FILE, not the working-tree diff. Two Codex passes ship per `/ship --approve-strategy`: this one (spec review) plus the normal Checkpoint 2 pre-commit review in step 3 that covers the commit diff. They have different scopes.
+Run review against the strategy FILE, not the working-tree diff. Two review passes ship per `/ship --approve-strategy`: this one (spec review) plus the normal Checkpoint 2 pre-commit review in step 3 that covers the commit diff. They have different scopes.
+
+**Always invoke via `scripts/review.sh`** -- it backgrounds the call, writes heartbeat lines every ~5s, enforces a 6-minute wall-clock deadline, and auto-falls-back from Codex to MiniMax if Codex times out or wedges. Never call `codex-companion.mjs` or `scripts/minimax-review.sh` directly from the ship flow; the `.claude/hooks/review-guard.sh` PreToolUse hook will block those. See "Review wrapper contract" below for the full interface.
 
 ```bash
-CODEX_PLUGIN="$HOME/.claude/plugins/marketplaces/openai-codex/plugins/codex"
-if [ -f "$CODEX_PLUGIN/scripts/codex-companion.mjs" ]; then
-  CLAUDE_PLUGIN_ROOT="$CODEX_PLUGIN" \
-    node "$CODEX_PLUGIN/scripts/codex-companion.mjs" \
-    review --wait --scope file --path "<path>" \
-    --focus "Review this proposed strategy spec for: (1) look-ahead bias in the rules, (2) unrealistic assumptions in the order spec (stop_loss too tight, limit_price too aggressive for realistic fills), (3) regime_filter mismatch with strategy_type, (4) missing or weak 'How This Works' clarity from Keith's pedagogical perspective (learning-stage: novice)." 2>&1
-else
-  # Codex unavailable: fall back to MiniMax with plan-file scope
-  ./scripts/minimax-review.sh --scope plan --plan "<path>" \
-    --focus "Review this proposed strategy spec for look-ahead bias, unrealistic order spec, regime mismatch, and How This Works clarity."
-fi
+./scripts/review.sh plan --plan "<path>" --primary codex \
+  --focus "Review this proposed strategy spec for: (1) look-ahead bias in the rules, (2) unrealistic assumptions in the order spec (stop_loss too tight, limit_price too aggressive for realistic fills), (3) regime_filter mismatch with strategy_type, (4) missing or weak 'How This Works' clarity from Keith's pedagogical perspective (learning-stage: novice)."
+# Returns immediately with {job_id, log_path}. Poll every 30s:
+# ./scripts/review-poll.sh <job_id>   until status != running
 ```
 
 Surface findings neutrally to Keith (no pre-filter). Keith decides fix / defer / accept. If he fixes, re-run Step A (the file may no longer be at status=proposed since we already edited it; in practice Keith amends the draft BEFORE the approval Step A, so this loop is rare -- more typically he catches issues during draft authorship). If `--skip-codex <reason>` was passed, skip Step B and record the reason in the commit footer.
@@ -292,7 +287,7 @@ python3 -m scripts.lib.invest_ship_strategy retire-strategy "<path>" --reason "<
 Applies a limits-proposal + its embedded YAML patch to `execution/validators/config.yaml` in a single gated commit. Spec §5.3 + §4.1 Check C.
 
 - Step A: helper validates the limits-proposal (frontmatter + `## Change` block + `## YAML Patch` before/after blocks), asserts `status: proposed`, and finds exactly one occurrence of the `before` block in config.yaml.
-- Step B: Codex plan review focused on safety-impact of the widened/tightened limit. Fall back to MiniMax `--scope plan --plan <proposal>` if Codex unavailable.
+- Step B: plan review focused on safety-impact of the widened/tightened limit. Invoke via `./scripts/review.sh plan --plan "<proposal>" --primary codex --focus "safety impact of widened/tightened limit"`; the wrapper handles Codex -> MiniMax fallback automatically.
 - Step C: confirm with Keith.
 - Step D: helper applies the config.yaml edit AND the proposal frontmatter flip atomically (tempfile + os.replace for both files; config.yaml edit happens FIRST so a failure leaves the proposal in `status: proposed` rather than claiming an approved state that didn't land).
 - Step E: stage BOTH files. Rejoin normal ship flow with the helper's `feat(limits): approve <slug>` subject and trailers (`Limits-Transition: proposed -> approved`, `Approved-Limits: <slug>`, `Config-Change: <rule>:<change_type>`, `Co-Shipped-By: invest-ship`). Cycle-4 pre-commit Check C enforces that both files appear in the same staged commit diff with the proposal transitioning proposed -> approved.
@@ -343,79 +338,56 @@ For multi-ship features (e.g. `feature_mission-control-v3`), read the feature no
 
 **Mandatory unless `--skip-codex <reason>` is passed.** This is **Checkpoint 2** of the two K2B adversarial review checkpoints. (Checkpoint 1 is **plan review** -- see below -- and runs earlier, before implementation. `/ship` only owns Checkpoint 2.)
 
-Run Codex review on the uncommitted diff using the **background + poll** pattern, not a synchronous foreground slash invocation:
+### Review wrapper contract (mandatory entrypoint)
+
+**All review invocations from `/ship` MUST go through `scripts/review.sh`.** The `.claude/hooks/review-guard.sh` PreToolUse hook blocks direct Bash-tool calls to `codex-companion.mjs review` and `scripts/minimax-review.sh`. Direct calls are not a policy preference -- they are a correctness hazard. The 2026-04-19 timing audit (see devlog) measured 115-218s typical Codex reviews and 60-180s MiniMax reviews, with Codex showing 13-61s of pure-inference silence at the end of every call. Without the wrapper, those silences look identical to a wedge and cause Claude to keep polling a dead session or, worse, to re-invoke the review and double the wait.
+
+`scripts/review.sh` provides three guarantees that eliminate the disappear-and-wait failure mode:
+
+1. **Deadline.** Hard SIGTERM at `--deadline` seconds per reviewer (default 360). Soft warning injected into the log at 2/3 of that. After SIGTERM, 10s grace then SIGKILL if the child hasn't exited.
+2. **Fallback.** Primary is Codex by default. If the primary exits non-zero or hits the deadline, the wrapper automatically re-runs the same scope on the secondary reviewer (MiniMax M2.7). Only if BOTH fail does the wrapper exit with code 2.
+3. **Visibility.** A watchdog thread writes `HEARTBEAT elapsed=Xs stale=Ys` lines into the unified log every 5s regardless of what the reviewer is doing. After 30s of log-mtime staleness it escalates to `HEARTBEAT_STALE` (phase = final_inference). After 120s of staleness it escalates to `WEDGE_SUSPECTED`. This means `scripts/review-poll.sh` never returns "no change since last poll" -- the poll output always moves.
+
+**Invocation (Checkpoint 2 pre-commit review):**
 
 ```bash
-CODEX_PLUGIN="$HOME/.claude/plugins/marketplaces/openai-codex/plugins/codex"
-if [ ! -f "$CODEX_PLUGIN/scripts/codex-companion.mjs" ]; then
-  echo "Codex plugin not found at $CODEX_PLUGIN. Run /codex:setup or re-run with /ship --skip-codex <reason>." >&2
-  exit 2
-fi
-
-# Launch via Bash tool with run_in_background: true. This gives the assistant
-# a task_id + output file to tail, and prevents the review from blocking the
-# session turn when Codex's backend does a cold-start reconnect storm
-# (observed: 5 silent reconnect attempts ~= 10+ minutes before any output).
-CLAUDE_PLUGIN_ROOT="$CODEX_PLUGIN" \
-  node "$CODEX_PLUGIN/scripts/codex-companion.mjs" \
-  review --wait --scope working-tree 2>&1
-```
-
-**Polling protocol while the background task runs:**
-
-1. Read the task's output file every ~90 seconds (first poll at 90s is enough to catch fast completions, subsequent polls every 90-120s until `[codex] Turn completed.` or a terminal `# Codex Review` section appears).
-2. Surface progress to Keith at each poll: file count read, reconnect status, current Codex action (`grep`, `sed`, `nl`). "Codex actively reading N files, not hung" beats silent spinner.
-3. If the output shows 5 reconnect attempts with no recovery for >= 3 minutes after the last reconnect line, assume Codex CLI is wedged: stop the background task (`TaskStop`), report to Keith, and offer `--skip-codex codex-cli-wedged` as the recorded reason.
-4. When the review finishes, parse the output verbatim and present findings to Keith. Do NOT paraphrase, rank, or pre-filter. Codex's own prioritization (P0/P1/P2/P3) stays intact.
-
-Why this pattern instead of a foreground `/codex:review` slash call: the slash wrapper runs the companion script synchronously via Bash and echoes stdout when it finally returns. On a Codex cold-start the companion script silently retries its WebSocket connection up to 5 times before surfacing anything, during which the session appears hung with no visible progress. The background + poll pattern eliminates that failure mode -- the output file is always tailable, so "still working" is observable, not guessed.
-
-- Present findings neutrally to Keith. Do not argue with Codex. Let Keith decide.
-- Keith decides: fix now, defer, or accept. If he fixes, re-run the same background + poll pattern on the new diff.
-- Log the gate result: `reviewed / skipped:<reason>`, number of findings, fix verdict.
-
-If `codex-companion.mjs` is missing entirely (plugin not installed): fail loudly with "Run `/codex:setup` or re-run with `/ship --skip-codex <reason>`."
-
-**Fallback: MiniMax M2.7 when Codex is unavailable**
-
-If Codex cannot run (quota reset, CLI wedged, plugin missing, network hard-fail, auth error), the approved backup is `scripts/minimax-review.sh`. Same adversarial-review prompt (vendored locally at `scripts/lib/adversarial-review.md`), different vendor (MiniMax M2.7 on `api.minimaxi.com`), single-shot, ~90s per call, ~$0.06 per call, no subscription quota. Cross-vendor adversarial property preserved.
-
-```bash
-# Pre-commit (Checkpoint 2): scope review to the files the commit will actually touch.
-# Prevents unrelated working-tree bloat (e.g. an in-progress 900-line plan sitting
-# next to the commit) from consuming the prompt budget and diluting the review.
+# Default: background + poll. Returns immediately with job_id.
 FILES="$(git diff --name-only HEAD | paste -sd, -)"
-./scripts/minimax-review.sh --scope diff --files "$FILES" --focus "<specific concern>"
-./scripts/minimax-review.sh --scope diff --files "$FILES" --json > /tmp/review.json
-
-# Plan review (Checkpoint 1) via MiniMax -- see "Plan review fallback" below.
-./scripts/minimax-review.sh --scope plan --plan "<plan-path>" --focus "<specific concern>"
-
-# Broader options
-./scripts/minimax-review.sh                                  # working-tree scope (Phase A; pulls every dirty file)
-./scripts/minimax-review.sh --model MiniMax-M2.5             # fall further if M2.7 also misbehaves
+./scripts/review.sh diff --files "$FILES" --focus "<specific concern>"
+# Output: {"job_id":"2026-04-19T...Z_abc123","log_path":".code-reviews/...log",...}
 ```
 
-**Procedure when using the fallback:**
+**Polling protocol:**
 
-1. Run `./scripts/minimax-review.sh --scope diff --files "$FILES"` with `FILES` = `git diff --name-only HEAD | paste -sd, -` (or `--json` if you want to grep findings programmatically). Use `--scope plan --plan <path>` for Checkpoint 1 plan review via MiniMax.
-2. Present findings neutrally to Keith. Severity translation: `critical` ≈ P0, `high` ≈ P1, `medium` ≈ P2, `low` ≈ P3 -- apply the same architect stop-rule (e.g. "ship when P1=0 + P2 isolated") against MiniMax severities using this mapping.
-3. Keith decides fix now / defer / accept. If fixed, re-run the tool on the new diff. Re-runs label the round `R<N>-minimax` (not just `R<N>`) so the audit trail is honest about the reviewer switch.
-4. The `/ship` gate is **still bypassed via `--skip-codex <reason>`** -- this skill's behavior does not change. Use one of these reason strings so the audit trail reflects whether MiniMax ran:
-   - `codex-unavailable-minimax-verified` -- MiniMax ran clean (verdict `approve`, or residual findings accepted/deferred by Keith)
-   - `codex-quota-exhausted-minimax-verified` -- more specific sub-case
-   - `codex-unavailable` -- MiniMax was NOT run (escape hatch only; requires Keith's explicit override; strictly worse audit trail)
-5. Reference the archive file path (e.g. `.minimax-reviews/2026-04-18T13-40-19Z_working-tree.json`) in the commit footer or feature note so the gate path is reproducible later. Archives include the full prompt, raw response, parsed JSON, and token usage.
+1. Every 30s, run `./scripts/review-poll.sh <job_id>` and read the JSON.
+2. Surface `status`, `phase`, `elapsed_s`, `reviewer_current`, and the last line of `tail` to Keith. Example: "Codex running_commands at 47s, last: `sed -n '1,260p' scripts/...`". During the end_gap this becomes "Codex final_inference at 132s, no log activity for 28s -- normal for verdict generation." During a true wedge it becomes "Codex wedge_suspected at 254s, no activity for 141s -- fallback will trigger at 360s."
+3. Stop polling when `should_poll_again=false`. At that point read the full log tail and present findings to Keith. The log captures Codex's verbatim `# Codex Review` output or MiniMax's `# MiniMax ... review -- APPROVE|NEEDS-ATTENTION` block.
 
-**Does NOT cover:**
+**When the wrapper exits 2 (both reviewers failed):**
 
-- **Automatic `/ship` integration.** `/ship` does not detect Codex failure and auto-fallback. The assistant runs `minimax-review.sh` manually when Codex errors, inspects the output, then proceeds with `/ship --skip-codex <reason>`. Keeping the switch explicit preserves audit clarity.
+- Report which reviewer attempts were made and why each failed (read `reviewer_attempts` from poll output).
+- Offer `/ship --skip-codex <reason>` with one of the audit reason strings:
+  - `codex-timeout-minimax-timeout` -- both hit the deadline; the diff may be too large, consider narrowing scope.
+  - `codex-wedged-minimax-unavailable` -- Codex reconnect-stormed AND MiniMax key missing/network blocked.
+  - `codex-unavailable` (legacy) -- pre-wrapper escape hatch; strictly worse audit trail, avoid.
+- Reference the archive paths in the commit footer: `.code-reviews/<job_id>.log` and, if MiniMax ran, `.minimax-reviews/<archive-ts>_<scope>.json`.
 
-**Plan review via MiniMax (Phase B, 2026-04-19):** `scripts/minimax-review.sh --scope plan --plan <path>` parses wikilinks and inline path refs in the plan file and pulls the referenced source files into the review context. This replaces the previous limitation that required deferring to Codex for Checkpoint 1 -- both checkpoints are now MiniMax-eligible when Codex is unavailable.
+**Presenting findings:**
 
-**When to prefer waiting for Codex over running MiniMax:**
+- Verbatim. Do not paraphrase, rank, or pre-filter.
+- Severity translation when MiniMax ran: `critical` ≈ P0, `high` ≈ P1, `medium` ≈ P2, `low` ≈ P3. Apply the same architect stop-rule ("ship when P1=0 + P2 isolated") against MiniMax severities using this mapping.
+- Re-run rounds label as `R<N>` when same reviewer, `R<N>-minimax` when the fallback tripped mid-loop (so the audit trail is honest about the vendor switch).
+- Keith decides fix / defer / accept. If fixed, re-invoke `scripts/review.sh` on the new diff.
 
-- Iterative review loops (R1, R2, R3, ...) that were already started on Codex. Switching vendors mid-loop invalidates the convergence signal (different model, different blind spots, different finding baseline). Finish the loop on Codex if you can wait; relabel as `R<N>-minimax` if you switch.
+**Why this replaces the old manual background+poll pattern:**
+
+The old `/ship` flow handled Codex's WebSocket reconnect storm (5 silent retries ~= 10+ min before any output) by telling the assistant to launch `codex-companion.mjs` via `Bash(run_in_background=true)` and tail the state-dir log every 90s. That worked, but three assistant-side behaviors broke it:
+
+- The assistant sometimes called Codex synchronously (foreground), and the whole session hung.
+- When MiniMax was the reviewer, there was no tailable log at all -- the synchronous HTTP POST in `minimax-review.sh` had zero in-flight output, so polling returned nothing useful.
+- When Codex did finish running commands and entered pure inference (13-61s on typical reviews), the log stopped growing and the assistant mistook the silence for a wedge, terminated the job, and re-ran -- compounding the hang.
+
+`scripts/review.sh` fixes all three by making background execution non-optional (enforced by the hook), unifying the log format across reviewers (the watchdog writes its own HEARTBEAT lines so a poll can distinguish "in final inference" from "wedged"), and automating Codex -> MiniMax fallback so the assistant never has to diagnose vendor failure mid-ship.
 
 ### Codex Adversarial Review -- the two checkpoints
 

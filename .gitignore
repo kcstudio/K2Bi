@@ -40,3 +40,6 @@ build/
 
 # MiniMax review archive (local-only -- raw responses, prompts, usage log)
 .minimax-reviews/
+
+# Unified review-runner archive (heartbeat log + state JSON per job)
+.code-reviews/

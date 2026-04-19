@@ -53,6 +53,8 @@ excludes:
   - .claude/plans
   - .claude/projects
   - .claude/worktrees            # subagent worktrees -- local-only, never deployed
+  - .claude/hooks                # PreToolUse/PostToolUse hooks run on the MacBook where
+                                 # Claude Code runs; Mini is Trader tier (no Claude Code)
   - .claude/settings.local.json  # gitignored per-machine override
   # Python + node detritus
   - .venv
