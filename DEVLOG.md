@@ -4,6 +4,31 @@ Session-by-session ship log. Append-only. New entries on top.
 
 ---
 
+## 2026-04-19 -- MiniMax scope Phase B port + invest-ship wiring
+
+**Commits:**
+- `767856c` feat(minimax-review): port K2B Phase B scope flag (--scope diff/plan/files) (#3)
+- `e6bcb07` feat(invest-ship): use --scope flags from minimax-scope-phase-b
+
+**What shipped:** `scripts/lib/minimax_review.py` grows three new context gatherers (`gather_diff_scoped_context`, `gather_plan_context`, `gather_file_list_context`) behind a `--scope` flag (`working-tree` | `diff` | `plan` | `files`). Phase A working-tree scope stays the default for back-compat; byte-for-byte regression confirmed by direct main↔PR gatherer comparison against a shared fixture. Test harness lands at `tests/test_minimax_review_scope.py` (Python unittest, 19 tests, pytest-compatible). Full suite still green at 274/274. Follow-up commit rewires `invest-ship` SKILL.md Checkpoint 2 fallback example to `--scope diff --files "$FILES"` (prevents in-progress-plan bloat from diluting the review) and adds Checkpoint 1 support via `--scope plan --plan <path>` -- the prior "defer plan review to Codex" limitation is removed.
+
+**Review gate:** MiniMax M2.7 Checkpoint 2 on the PR diff returned APPROVE with zero findings. Archive: `.minimax-reviews/2026-04-19T00-37-32Z_working-tree.json`. Codex second opinion skipped (no HIGH/P1 to adjudicate; upstream K2B already reviewed this via Codex before the port).
+
+**Feature status change:** New K2Bi feature note at `K2Bi-Vault/wiki/planning/feature_minimax-scope-phase-b.md`, with a row added to `wiki/planning/index.md` pointing at it. Upstream K2B feature note at `~/Projects/K2B-Vault/wiki/concepts/Shipped/feature_minimax-scope-phase-b.md` holds the full design rationale and the 905-line-plan incident forensics that motivated the port.
+
+**Follow-ups:**
+- `/sync` delivered `.claude/skills/invest-ship/SKILL.md` + the pending-sync mailbox entry (`execution/engine/main.py` + `execution/risk/kill_switch.py` from commit `b5d7647`) to the Mac Mini; mailbox consumed. Skill-count verified at 23 folders on both machines.
+- `scripts/deploy-to-mini.sh` and `scripts/deploy-config.yml` already support the `execution` category; `invest-sync` SKILL.md still lists the stale K2B category allowlist (`{"skills", "code", "dashboard", "scripts"}`). Not blocking this ship -- filed as a drift to tighten when the skill is next touched.
+- Bundle 3 (approval gate, m2.16 + m2.17) plan review is the next prompt; held out of this session per explicit instruction.
+
+**Key decisions:**
+- Port landed on K2Bi's existing `tests/` (pytest / Python unittest) instead of K2B's bash test harness -- same scenarios, same assertions, same fixture strategy.
+- `/ship` invest-ship workflow was skipped on the wiring commit per explicit user instruction ("Commit separately. Push."); the DEVLOG / wiki-log / `/sync` obligations landed post-hoc in this follow-up prompt.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+---
+
 ## 2026-04-18 -- Phase 2 Bundle 2: order pipeline (m2.5, m2.6, m2.8)
 
 **Commit:** `530eb81` feat: Phase 2 Bundle 2 -- order pipeline (m2.5, m2.6, m2.8)
