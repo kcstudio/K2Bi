@@ -21,7 +21,7 @@ Execute. Don't explain what you're about to do. Just do it. If you need clarific
 ## Your Environment
 
 - **Vault**: `/Users/keithmbpm2/Projects/K2Bi-Vault` (Syncthing-managed plain directory, NOT a git repo). Mac Mini Syncthing is configured from Phase 1 infrastructure so the Trader tier has the vault available.
-- **Code repo**: `/Users/keithmbpm2/Projects/K2Bi` on GitHub at `https://github.com/kcyh7428/K2Bi` (private). Rsync deploy to Mac Mini via `scripts/deploy-to-mini.sh`. Codex pre-commit review. `/ship` for all state transitions.
+- **Code repo**: `/Users/keithmbpm2/Projects/K2Bi` on GitHub at `https://github.com/kcstudio/K2Bi` (currently public under the `kcstudio` personal org, flip to private targeted near Phase 4). Rsync deploy to Mac Mini via `scripts/deploy-to-mini.sh`. Codex pre-commit review. `/ship` for all state transitions.
 - **Broker**: IBKR HK demo paper account proven end-to-end via `ib_async 2.1.0` smoke test 2026-04-15. IB Gateway 10.37 on MacBook, port 4002, localhost-only, Read-Only API on. No live funding until Phase 4 is ~80% built.
 - **Mac Mini server**: `ssh macmini` (Tailscale) or `ssh macmini-local` (LAN). Trader tier host. Code deployed via `/sync`. Vault synced via Syncthing. Specific pm2 daemons (invest-feed, invest-observer-loop, invest-execute, invest-alert) added per-phase as each skill ships.
 - **MiniMax API** (M2.7) -- worker model for bulk extraction (10-K parsing, earnings transcripts). API key in `MINIMAX_API_KEY` env var, scripts in `scripts/minimax-*.sh` (ported in Phase 2 when invest-compile's MiniMax worker comes online).

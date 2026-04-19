@@ -123,7 +123,7 @@ When the script reports hits, surface them to Keith inline:
 
 Keith decides fix-inline / allowlist / defer. When he defers, append the drift summary to the ship commit body under a "Deferred:" trailer so the next session sees it.
 
-The audit is idempotent (re-running with no changes prints `fork-drift-audit: clean`). New drift typically arrives via skill-port work that copies a K2B file without swapping the path -- catching it at `/ship` time is much cheaper than catching it later as a runtime mailbox-validation failure.
+The audit is idempotent given stable inputs: re-running with no working-tree changes AND no allowlist edits prints `fork-drift-audit: clean`. If Keith adds an allowlist entry inline during this step, re-run the audit before continuing so the recorded outcome reflects the post-edit state. New drift typically arrives via skill-port work that copies a K2B file without swapping the path -- catching it at `/ship` time is much cheaper than catching it later as a runtime mailbox-validation failure.
 
 ### 1. Scope detection
 

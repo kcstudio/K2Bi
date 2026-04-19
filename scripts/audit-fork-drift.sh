@@ -35,7 +35,7 @@ check "K2B hardcoded categories" "['\"]skills['\"].*['\"]code['\"].*['\"]dashboa
 check "VALID_CATEGORIES hardcoded set" "VALID_CATEGORIES\s*=" .claude/ scripts/
 check "K2B pm2 process names" "k2b-remote|k2b-dashboard|k2b-observer-loop" .claude/ scripts/ execution/
 check "K2B skill invocations" "/k2b-(feedback|daily-capture|meeting-processor|tldr|review|improve|research|lint|observer|insight|compile|weave|autoresearch|youtube|linkedin|email|scheduler|ship|sync|vault-writer)" .claude/ scripts/
-check "K2B GitHub remote" "kcyh7428/K2B[^i]" .claude/ scripts/ CLAUDE.md
+check "K2B GitHub remote" "kcyh7428/K2B($|[^i])" .claude/ scripts/ CLAUDE.md
 check "K2B mailbox schema assumptions" "'code'|\"code\".*\"dashboard\"" .claude/skills/invest-*/SKILL.md
 
 if [ "$FINDINGS" -eq 0 ]; then
