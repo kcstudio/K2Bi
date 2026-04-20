@@ -3,6 +3,30 @@
 Session-by-session ship log. Append-only. New entries on top.
 
 
+## 2026-04-20 -- Session A Commit 2 of 2: Q31 protective-stop invariants
+
+**Commit:** `ba9fc99` feat(engine-recovery): Q31 protective-stop invariants (missing/drift/tag)
+
+**What shipped:** Completes the Session A Q31+Q32 engine recovery hardening pair by adding Phase B.3 to `recovery.reconcile()` with three protective-stop invariants. `missing_protective_stop`, `protective_stop_tag_mismatch`, and `protective_stop_price_drift` all emit into the existing `mismatches` list so recovery fails with `MISMATCH_REFUSED` when an adopted position's expected stop is absent, has a wrong tag, or has a drifted trigger -- the exact Codex R4 finding against the Phase 3.1 strategy spec (engine silently returning clean with an unprotected position). Intentionally-cancelled stops fail with `missing_protective_stop` per Decision 5 (no operator-intent journal event today; fail-closed is the MVP default until a Phase 4 `/invest unprotect-position` command exists). Trigger-price match is exact Decimal equality per Decision 6; any drift (even 1 cent) fails recovery. Expected entries are built from journal-tail order_submitted/order_filled (primary), Phase A's synthesized `recovery_reconciled` events for crash-window positions (Codex Commit-2 R1 P1 closure), and the prior engine_recovered checkpoint (Q32 carry-forward). MVP one-parent-per-ticker means a fresh journal parent supersedes ALL stale checkpoint entries on the same ticker so same-ticker exit-and-reenter recovers cleanly (Codex Commit-2 R2 P1 closure). `BrokerOpenOrder` extended with `aux_price: Decimal` (default `Decimal("0")` as fail-closed sentinel); live IBKR connector populates from `order.auxPrice`; mock connectors must set explicitly or stop-price-drift fires.
+
+**Codex review:** MiniMax R1-R3 iterative primary on Commit 2 diff (same-vector aux_price concern surfaced at HIGH across all three; addressed via explicit contract docstring + fail-closed test rather than defaulting to None, because fail-closed aligns with Decision 6 strict-MVP safety). Codex R1 (P1: crash-window recovery-discovered fills not scanned, FIXED via `events` iteration in Phase B.3), R2 (P1: stale checkpoint for same-ticker exit-reenter would falsely fail recovery, FIXED via per-ticker supersede), R3 CLEAN. Cumulative MiniMax sweep on Commit 1 + Commit 2: only 1 LOW false-positive (MiniMax misread the guard on `strategy=None`; the code does enforce fail-closed correctly).
+
+**Feature status change:** No feature note (infrastructure work; `--no-feature`). Q31 + Q32 both CLOSED. Engine recovery module now validates protective-stop safety on every restart for adopted positions with a journaled stop_loss, via either the current-window journal or prior-engine_recovered checkpoint. Phase 4 paper trading unblocked on this axis.
+
+**Tests:** Full suite 930 passed, 1 skipped, 33 subtests passed -- up from m2.23 baseline 894 (+36 new tests across Commits 1+2: 18 Q32 + 11 Q31 + 4 regression fixtures + 3 Codex-round-specific coverage). Local recovery suite at 61 tests. Coverage: three mismatch cases individually, intentionally-cancelled-stop, happy-path no-Q31-fires, no-position skips Q31, corrupt trigger_price fails-closed, journal-only (no prior checkpoint) still triggers Q31, operator-adjusted stop at broker (with and without `K2BI_ALLOW_RECOVERY_MISMATCH=1` override), default `aux_price=0` fails-closed contract test, crash-window recovery-discovered fill protected, same-ticker exit-reenter suppresses stale checkpoint entries.
+
+**Key decisions (divergent from claude.ai project specs):** Kept `aux_price` default `Decimal("0")` as fail-closed sentinel despite three rounds of MiniMax pressure to switch to `None`-means-skip. Decision 6's "no tolerance, strict MVP" maps directly to fail-closed semantics: an unpopulated aux_price on a real stop is a connector bug and recovery should refuse to start, not silently accept an unvalidated protective stop. MVP one-parent-per-ticker invariant upheld across Phase B.3 expected-entry-builder (fresh journal wins over stale checkpoint; no multi-parent layered validation). All three mismatch cases emit into the shared `mismatches` list rather than separate event streams, preserving the existing refuse-to-start flow without a new error-handling surface.
+
+**Follow-ups:**
+- Session B (separate session): Q30 approval-time atomic mirror between code repo `wiki/` and vault `wiki/`.
+- Session C (after Q30 lands): re-spin the Phase 3.1 SPY rotational / paper smoke strategy spec.
+- Architect-scope future work: mid-session checkpoint writes (>48h continuous no-restart edge; refuse-to-start outcome is safe but reduces availability for long holds).
+- Architect-scope future work: `/invest unprotect-position` command to record operator cancellation intent so Phase B.3 can distinguish "operator cancelled stop deliberately" from "broker lost stop unexpectedly". Currently both fail-closed identically.
+- Architect-scope future work: multi-parent layered-buy support (Codex R2 Commit 1 concern). Today MVP is one parent per ticker; multi-parent requires engine state-machine changes AND checkpoint shape negotiation -- out of scope for Session A.
+- Stop-rule precedent update: MiniMax R1-R3 all-rounds-same-vector (aux_price default) was handled via documentation + contract test rather than iteration toward MiniMax's preferred solution. Decision 6 (strict) governs; when the vendor-reviewer recommendation conflicts with a locked design decision, the design decision wins and the finding is resolved via explicit documentation of the intent. Captured here as L-2026-04-20-002 candidate.
+
+---
+
 ## 2026-04-20 -- Session A Commit 1 of 2: Q32 expected_stop_children checkpoint
 
 **Commit:** `fb46a3e` feat(engine-recovery): Q32 expected_stop_children checkpoint for multi-day holds
