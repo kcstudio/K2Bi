@@ -264,6 +264,35 @@ If Codex CLI is unavailable (quota exhausted, auth error, plugin missing, WebSoc
 - **Coverage is Checkpoint 2 only.** `scripts/minimax-review.sh` covers pre-commit (working-tree) review. Plan review (Checkpoint 1) remains Codex-only. If both Checkpoint 1 needs running AND Codex is unavailable, defer the ship until Codex is back rather than shipping unreviewed at the plan level.
 - **Not primary; stays fallback.** Codex is still the default reviewer when available. Shadow-run comparison data (multiple rounds reviewed by both) is the prerequisite for any future promotion to peer or primary reviewer.
 
+### Review discipline split (2026-04-20)
+
+Not every surface deserves the same review rigor. The split below applies to every bundle from the current cycle forward. Reviews still run at both plan and pre-commit checkpoints; this rule calibrates HOW AGGRESSIVELY reviewers iterate before ship.
+
+**Aggressive iteration (keep going until reviewer APPROVE zero findings OR 3+ rounds on same surface with architect adjudication):**
+
+- `execution/validators/**` -- position_size, trade_risk, leverage, market_hours, instrument_whitelist, any future validator
+- `execution/risk/**` -- circuit_breakers, kill_switch, cash_only, market_calendar
+- `execution/engine/**` -- main loop, recovery. Capital-path code; same rigor as validators.
+- `execution/journal/writer.py` -- write-time durability + strict-JSON contract
+- `execution/connectors/**` -- IBKR wrapper, mock, broker event types. Order-submission path.
+
+These are the surfaces where a bug is capital-destroying at $500-$5K scale. Review rigor is directly proportional to blast radius. The ~22 bugs Codex caught in Bundle 1 landed here; the rigor earned its keep and continues to.
+
+**One-pass then fix-on-observed-failure (one review round, address findings, ship; return only if real-use surfaces a defect):**
+
+- `scripts/**` -- helper libraries, deploy tooling, review runners, propose-limits NL parser, frontmatter helpers
+- `.githooks/**` -- pre-commit Checks A-D, commit-msg transition matrix, post-commit sentinel writer
+- `execution/strategies/**` -- loader and runner (data-read path, not capital-path)
+- `execution/journal/schema.py` evolution rules (additive-only contract) -- the writer enforces; schema doc is bookkeeping
+- Skill `SKILL.md` bodies and orchestrator prose
+- Vault tooling, index helpers, sync scripts
+
+These are surfaces where a bug costs a retest cycle on first use, not dollars. The discipline cost of 6-9 Codex rounds polishing them against hypothetical adversaries exceeds the value recovered. The `strategy_commit_sha` Codex finding raised 4 times across Bundle 4a is the canonical example: real concern at fund scale, not real concern at $500-$5K with one user reading his own diffs.
+
+**Decision rule for ambiguous cases:** if a bug in the module could place a wrong order, move money, or delete the kill switch, it is aggressive. If a bug causes a failed commit, a wrong index entry, or a confusing error message, it is one-pass. When truly uncertain, run it aggressive; the asymmetry favors paranoia in capital path.
+
+Reviewers still produce findings for both buckets. Reviewers don't get the final call on whether the loop keeps iterating; the bucket does.
+
 ## Session Discipline
 
 At the END of every Claude Code session in this repo, before closing, run `/ship`. The sync obligation must resolve to either "done now" or "entry recorded in `.pending-sync/` mailbox for later". If `/ship` is genuinely unavailable in the current harness, the ship-skill body documents the manual fallback.
