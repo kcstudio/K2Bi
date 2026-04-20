@@ -658,6 +658,24 @@ class Engine:
             recovery_mod.RecoveryStatus.CATCH_UP,
             recovery_mod.RecoveryStatus.MISMATCH_OVERRIDE,
         ):
+            # Q32: checkpoint the expected broker-held stop children so
+            # that multi-day holds restart cleanly even after the
+            # parent's order_submitted / order_filled records scroll
+            # out of the 48h journal lookback. Zero-length list when
+            # no adopted position has a journaled stop_loss -- always
+            # present as a list so downstream readers can treat
+            # absence and empty identically. Recovery events from THIS
+            # pass are included so recovery-discovered fills (crash
+            # between order_proposed and order_submitted) seed the
+            # checkpoint too -- they're already being journaled above
+            # but live in _journal_recovery_event's freshly-appended
+            # records, not in the stale journal_tail passed to
+            # reconcile() earlier (Codex R5 P1).
+            expected_stop_children = recovery_mod.build_expected_stop_children(
+                positions=self._positions,
+                journal_tail=journal_tail,
+                recovery_events=reco.events,
+            )
             self.journal.append(
                 "engine_recovered",
                 payload={
@@ -667,6 +685,7 @@ class Engine:
                         {"ticker": p.ticker, "qty": p.qty, "avg_price": str(p.avg_price)}
                         for p in self._positions
                     ],
+                    "expected_stop_children": expected_stop_children,
                 },
             )
 
@@ -1301,6 +1320,16 @@ class Engine:
                     "remaining_qty": pending.order.qty - pending.filled_qty,
                     "ticker": pending.order.ticker,
                     "side": pending.order.side,
+                    # Q32 precondition: recovery's expected_stop_children
+                    # checkpoint can source the protective-stop trigger
+                    # from the fill record in the window where the
+                    # original order_submitted aged out but order_filled
+                    # still sits in journal_tail.
+                    "stop_loss": (
+                        str(pending.order.stop_loss)
+                        if pending.order.stop_loss is not None
+                        else None
+                    ),
                 },
                 strategy=pending.strategy,
                 trade_id=pending.trade_id,
@@ -1437,6 +1466,12 @@ class Engine:
                         "cumulative_filled_qty": terminal.filled_qty,
                         "remaining_qty": terminal.remaining_qty,
                         "broker_status": terminal.status,
+                        # Q32 precondition (mirror of primary fill path).
+                        "stop_loss": (
+                            str(pending.order.stop_loss)
+                            if pending.order.stop_loss is not None
+                            else None
+                        ),
                     },
                     strategy=pending.strategy,
                     trade_id=pending.trade_id,

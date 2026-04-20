@@ -1271,5 +1271,976 @@ class IdentityMatchingTests(unittest.TestCase):
         self.assertIn("pending_no_broker_counterpart", cases)
 
 
+class ExpectedStopChildrenCheckpointTests(unittest.TestCase):
+    """Q32: the engine_recovered checkpoint carries the expected
+    broker-held stop-child identities so that multi-day holds restart
+    cleanly even after the parent order_submitted / order_filled
+    records age out of the 48h journal lookback window.
+
+    Covers:
+        - build_expected_stop_children payload shape (LOCKED schema)
+        - round-trip through a journal record
+        - day-3 / day-7 restart: prior checkpoint alone seeds stop-child
+          recognition when the parent records have scrolled out
+        - zero-length list when no adopted position has a journaled stop
+        - no prior checkpoint: behavior unchanged from pre-Q32
+    """
+
+    def test_build_from_submit_has_locked_shape(self):
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T-2026-04-21-0001",
+                "journal_entry_id": "J1",
+                "strategy": "spy-first-paper-smoke",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "700.00",
+                    "stop_loss": "697.13",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+        ]
+        positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("700.00"))
+        ]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(
+            set(entry.keys()),
+            {
+                "ticker",
+                "strategy",
+                "parent_trade_id",
+                "client_tag",
+                "trigger_price",
+            },
+        )
+        self.assertEqual(entry["ticker"], "SPY")
+        self.assertEqual(entry["strategy"], "spy-first-paper-smoke")
+        self.assertEqual(entry["parent_trade_id"], "T-2026-04-21-0001")
+        # Decision 2 canonical form: no CLIENT_TAG_PREFIX here. The
+        # checkpoint stores the semantic identity; broker matchers parse
+        # on-wire tags via parse_client_tag and compare components.
+        self.assertEqual(
+            entry["client_tag"],
+            "spy-first-paper-smoke:T-2026-04-21-0001:stop",
+        )
+        self.assertEqual(entry["trigger_price"], "697.13")
+
+    def test_build_skips_positions_without_stop(self):
+        """A ticker whose journaled parent had no stop_loss is absent
+        from the checkpoint -- there is no protective stop to expect."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T1",
+                "journal_entry_id": "J1",
+                "strategy": "no-stop-strategy",
+                "git_sha": "abc",
+                "ticker": "AAPL",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "200",
+                    "stop_loss": None,
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+        ]
+        positions = [
+            BrokerPosition(ticker="AAPL", qty=10, avg_price=Decimal("200"))
+        ]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+        )
+        self.assertEqual(out, [])
+
+    def test_build_empty_positions_returns_empty_list(self):
+        self.assertEqual(
+            recovery.build_expected_stop_children(
+                positions=[],
+                journal_tail=[{"event_type": "order_submitted"}],
+            ),
+            [],
+        )
+
+    def test_build_prefers_submit_stop_when_fill_lacks_it(self):
+        """Q32 precondition: order_filled now carries stop_loss, but an
+        older pre-precondition order_filled without the field must not
+        clobber the stop_loss that the earlier order_submitted carried."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T1",
+                "journal_entry_id": "J1",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "700",
+                    "stop_loss": "697.13",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_filled",
+                "trade_id": "T1",
+                "journal_entry_id": "J2",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "ticker": "SPY",
+                    "side": "buy",
+                    "qty": 10,
+                    "fill_price": "700",
+                    # Intentionally no stop_loss: simulates a v2-additive
+                    # record written before this commit's precondition.
+                },
+            },
+        ]
+        positions = [BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("700"))]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["trigger_price"], "697.13")
+
+    def test_checkpoint_round_trip_through_journal_record(self):
+        """The engine_recovered payload we write at checkpoint time
+        must round-trip through the journal back to the same structure
+        the seeding path reads."""
+        positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+        ]
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T1",
+                "journal_entry_id": "J1",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "500",
+                    "stop_loss": "497.25",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+        ]
+        built = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+        )
+        # Emulate the engine_recovered write from main.py.
+        checkpoint_record = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J2",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": built,
+            },
+        }
+        # Downstream reader pulls the same list back out.
+        recovered = recovery._latest_checkpoint_stop_children([checkpoint_record])
+        self.assertEqual(recovered, built)
+
+    def test_day3_restart_stop_child_recognized_via_checkpoint(self):
+        """Parent records aged out of the 48h lookback; only the prior
+        engine_recovered checkpoint and the broker-held stop child
+        remain. Recovery must recognize the stop child via the
+        checkpoint, not flag it as phantom."""
+        # Simulated state: a day-3 restart. Tail contains only the prior
+        # engine_recovered (checkpoint written on day-0) -- no
+        # order_submitted / order_filled records survive.
+        checkpoint_payload = {
+            "status": "catch_up",
+            "reconciled_event_count": 0,
+            "adopted_positions": [
+                {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+            ],
+            "expected_stop_children": [
+                {
+                    "ticker": "SPY",
+                    "strategy": "spy-strat",
+                    "parent_trade_id": "T1",
+                    "client_tag": "spy-strat:T1:stop",
+                    "trigger_price": "497.25",
+                }
+            ],
+        }
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": checkpoint_payload,
+            },
+        ]
+        stop_child = BrokerOpenOrder(
+            broker_order_id="1001",
+            broker_perm_id="2000001",
+            ticker="SPY",
+            side="sell",
+            qty=10,
+            filled_qty=0,
+            limit_price=Decimal("0"),
+            status="Submitted",
+            tif="GTC",
+            client_tag="k2bi:spy-strat:T1:stop",
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            broker_open_orders=[stop_child],
+            broker_order_status=[],
+            now=NOW,
+        )
+        self.assertEqual(result.status, recovery.RecoveryStatus.CATCH_UP)
+        phantoms = [
+            m for m in result.mismatch_reasons if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(phantoms, [])
+        cases = [e.payload.get("case") for e in result.events]
+        self.assertIn("stop_child_recognized", cases)
+
+    def test_day7_restart_uses_most_recent_checkpoint(self):
+        """When multiple engine_recovered events exist across bounces,
+        the MOST RECENT one's expected_stop_children wins."""
+        older_checkpoint = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J1",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": [
+                    # Stale trade_id from 7 days ago; no longer current.
+                    {
+                        "ticker": "SPY",
+                        "strategy": "spy-strat",
+                        "parent_trade_id": "T-old",
+                        "client_tag": "spy-strat:T-old:stop",
+                        "trigger_price": "480.00",
+                    }
+                ],
+            },
+        }
+        newer_checkpoint = {
+            "ts": datetime(2026, 5, 5, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J2",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": [
+                    {
+                        "ticker": "SPY",
+                        "strategy": "spy-strat",
+                        "parent_trade_id": "T-current",
+                        "client_tag": "spy-strat:T-current:stop",
+                        "trigger_price": "497.25",
+                    }
+                ],
+            },
+        }
+        tail = [older_checkpoint, newer_checkpoint]
+        stop_child = BrokerOpenOrder(
+            broker_order_id="1001",
+            broker_perm_id="2000001",
+            ticker="SPY",
+            side="sell",
+            qty=10,
+            filled_qty=0,
+            limit_price=Decimal("0"),
+            status="Submitted",
+            tif="GTC",
+            client_tag="k2bi:spy-strat:T-current:stop",
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            broker_open_orders=[stop_child],
+            broker_order_status=[],
+            now=NOW,
+        )
+        self.assertEqual(result.status, recovery.RecoveryStatus.CATCH_UP)
+        phantoms = [
+            m for m in result.mismatch_reasons if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(phantoms, [])
+        cases = [e.payload.get("case") for e in result.events]
+        self.assertIn("stop_child_recognized", cases)
+
+    def test_no_prior_checkpoint_falls_back_to_journal_tail(self):
+        """When no engine_recovered checkpoint exists in the tail, the
+        pre-Q32 journal-tail-only recognition path still applies."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T1",
+                "journal_entry_id": "J1",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "500",
+                    "stop_loss": "497.25",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_filled",
+                "trade_id": "T1",
+                "journal_entry_id": "J2",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "ticker": "SPY",
+                    "side": "buy",
+                    "qty": 10,
+                    "fill_price": "500",
+                    "stop_loss": "497.25",
+                },
+            },
+        ]
+        stop_child = BrokerOpenOrder(
+            broker_order_id="1001",
+            broker_perm_id="2000001",
+            ticker="SPY",
+            side="sell",
+            qty=10,
+            filled_qty=0,
+            limit_price=Decimal("0"),
+            status="Submitted",
+            tif="GTC",
+            client_tag="k2bi:spy-strat:T1:stop",
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            broker_open_orders=[stop_child],
+            broker_order_status=[],
+            now=NOW,
+        )
+        self.assertEqual(result.status, recovery.RecoveryStatus.CATCH_UP)
+        phantoms = [
+            m for m in result.mismatch_reasons if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(phantoms, [])
+
+    def test_latest_checkpoint_stop_children_empty_when_payload_missing(self):
+        """A pre-Q32 engine_recovered without expected_stop_children
+        must resolve to an empty list, not crash or raise."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": {
+                    "status": "catch_up",
+                    "reconciled_event_count": 0,
+                    "adopted_positions": [],
+                    # no expected_stop_children key
+                },
+            },
+        ]
+        self.assertEqual(
+            recovery._latest_checkpoint_stop_children(tail),
+            [],
+        )
+
+    def test_latest_checkpoint_stop_children_corrupt_payload_yields_empty(self):
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": {
+                    "expected_stop_children": "not-a-list",
+                },
+            },
+        ]
+        self.assertEqual(
+            recovery._latest_checkpoint_stop_children(tail),
+            [],
+        )
+
+    def test_build_carries_forward_prior_checkpoint_when_parent_aged_out(self):
+        """Codex R1 P1: when the parent records have scrolled out of
+        journal_tail but the prior engine_recovered still appears in
+        the tail, the freshly-built checkpoint must carry forward the
+        prior entry for adopted positions. Without this, recovery hop
+        #2 loses stop-child identity and falls back to phantom."""
+        # Simulated state at recovery hop #2: journal_tail has a prior
+        # engine_recovered (hop #1's checkpoint) but no order_submitted
+        # or order_filled for SPY (aged out).
+        prior_checkpoint = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J1",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": [
+                    {
+                        "ticker": "SPY",
+                        "strategy": "spy-strat",
+                        "parent_trade_id": "T1",
+                        "client_tag": "spy-strat:T1:stop",
+                        "trigger_price": "497.25",
+                    }
+                ],
+            },
+        }
+        positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+        ]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=[prior_checkpoint],
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["ticker"], "SPY")
+        self.assertEqual(entry["strategy"], "spy-strat")
+        self.assertEqual(entry["parent_trade_id"], "T1")
+        self.assertEqual(entry["client_tag"], "spy-strat:T1:stop")
+        self.assertEqual(entry["trigger_price"], "497.25")
+
+    def test_build_newest_parent_wins_on_same_ticker_reentry(self):
+        """Codex R6 P1 + MVP one-parent-per-ticker: when the same
+        ticker has been traded more than once within the lookback
+        window (exit-then-reenter), only the NEWEST buy parent is
+        emitted in the checkpoint. Older parents are assumed closed;
+        their orphaned stops (if any) fall through to phantom
+        detection rather than being silently recognized as protective
+        stops for the current position."""
+        tail = [
+            # T-old: the earlier buy (later closed).
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T-old",
+                "journal_entry_id": "J1",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1000",
+                "broker_perm_id": "2000000",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "500",
+                    "stop_loss": "495.00",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+            # T-new: the current buy.
+            {
+                "ts": datetime(2026, 5, 5, 11, 45, tzinfo=timezone.utc).isoformat(),
+                "event_type": "order_submitted",
+                "trade_id": "T-new",
+                "journal_entry_id": "J2",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "broker_order_id": "1010",
+                "broker_perm_id": "2000010",
+                "payload": {
+                    "status": "Submitted",
+                    "limit_price": "502",
+                    "stop_loss": "498.50",
+                    "submitted_at": datetime(2026, 5, 5, 11, 45, tzinfo=timezone.utc).isoformat(),
+                },
+            },
+        ]
+        positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("502"))
+        ]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["parent_trade_id"], "T-new")
+        self.assertEqual(out[0]["trigger_price"], "498.50")
+
+    def test_build_captures_recovery_discovered_fill(self):
+        """Codex R5 P1: a fill discovered during recovery
+        (recovery_reconciled with case=pending_filled) contributes its
+        stop_loss to the checkpoint via journal_view. Without this, a
+        crash between order_proposed and order_submitted leaves the
+        stop metadata ONLY in the recovery event, and subsequent
+        restarts would flag the live stop as phantom after aging out."""
+        # journal_tail has only order_proposed (crash before submit
+        # wrote broker IDs). Recovery will discover the filled status
+        # via broker order status history -- not in this test but
+        # simulated via a pre-built ReconciliationEvent.
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "order_proposed",
+                "trade_id": "T1",
+                "journal_entry_id": "J1",
+                "strategy": "spy-strat",
+                "git_sha": "abc",
+                "ticker": "SPY",
+                "side": "buy",
+                "qty": 10,
+                "payload": {
+                    "ticker": "SPY",
+                    "side": "buy",
+                    "qty": 10,
+                    "limit_price": "500",
+                    "stop_loss": "497.25",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            }
+        ]
+        reconciled_event = recovery.ReconciliationEvent(
+            event_type="recovery_reconciled",
+            payload={
+                "case": "pending_filled",
+                "broker_status": "Filled",
+                "filled_qty": 10,
+                "remaining_qty": 0,
+                "avg_fill_price": "500.00",
+                "broker_reason": None,
+                "journal_view": {
+                    "ticker": "SPY",
+                    "side": "buy",
+                    "qty": 10,
+                    "limit_price": "500",
+                    "stop_loss": "497.25",
+                    "submitted_at": EARLIER.isoformat(),
+                },
+            },
+            trade_id="T1",
+            strategy="spy-strat",
+            ticker="SPY",
+            broker_order_id="1000",
+            broker_perm_id="2000000",
+        )
+        positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500.00"))
+        ]
+        out = recovery.build_expected_stop_children(
+            positions=positions,
+            journal_tail=tail,
+            recovery_events=[reconciled_event],
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["ticker"], "SPY")
+        self.assertEqual(entry["parent_trade_id"], "T1")
+        self.assertEqual(entry["trigger_price"], "497.25")
+        self.assertEqual(entry["client_tag"], "spy-strat:T1:stop")
+
+    def test_build_fresh_journal_supersedes_prior_checkpoint_different_trade_id(self):
+        """When journal_tail carries a NEW buy parent for a ticker
+        (different trade_id than the prior checkpoint), the fresh
+        journal is authoritative and the prior entry does not carry
+        forward. This is the exit-then-reenter case under MVP one-
+        parent-per-ticker: the old parent is assumed closed."""
+        prior_checkpoint = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J0",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": [
+                    {
+                        "ticker": "SPY",
+                        "strategy": "spy-strat",
+                        "parent_trade_id": "T-old",
+                        "client_tag": "spy-strat:T-old:stop",
+                        "trigger_price": "495.00",
+                    }
+                ],
+            },
+        }
+        fresh_parent = {
+            "ts": datetime(2026, 5, 5, 11, 45, tzinfo=timezone.utc).isoformat(),
+            "event_type": "order_submitted",
+            "trade_id": "T-new",
+            "journal_entry_id": "J1",
+            "strategy": "spy-strat",
+            "git_sha": "abc",
+            "ticker": "SPY",
+            "side": "buy",
+            "qty": 10,
+            "broker_order_id": "2000",
+            "broker_perm_id": "3000000",
+            "payload": {
+                "status": "Submitted",
+                "limit_price": "502",
+                "stop_loss": "498.50",
+                "submitted_at": datetime(2026, 5, 5, 11, 45, tzinfo=timezone.utc).isoformat(),
+            },
+        }
+        out = recovery.build_expected_stop_children(
+            positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("502"))
+            ],
+            journal_tail=[prior_checkpoint, fresh_parent],
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["parent_trade_id"], "T-new")
+        self.assertEqual(out[0]["trigger_price"], "498.50")
+
+    def test_build_journal_overrides_prior_checkpoint_for_same_trade_id(self):
+        """When the fresh journal's order_submitted / order_filled for
+        a trade_id has stop_loss=None, the journal's "no stop" view
+        wins over the prior checkpoint's entry for that same trade_id.
+        Carry-forward only applies to trade_ids that do NOT appear in
+        the current journal (they've aged out, so the prior checkpoint
+        is the only surviving signal)."""
+        prior_checkpoint = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "engine_recovered",
+            "trade_id": None,
+            "journal_entry_id": "J1",
+            "strategy": None,
+            "git_sha": "abc",
+            "payload": {
+                "status": "catch_up",
+                "reconciled_event_count": 0,
+                "adopted_positions": [
+                    {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                ],
+                "expected_stop_children": [
+                    {
+                        "ticker": "SPY",
+                        "strategy": "spy-strat",
+                        "parent_trade_id": "T1",
+                        "client_tag": "spy-strat:T1:stop",
+                        "trigger_price": "497.25",
+                    }
+                ],
+            },
+        }
+        # Same trade_id T1, explicit stop_loss=None in the fresh journal
+        # (e.g. operator cleared the stop).
+        journal_removes_stop = {
+            "ts": EARLIER.isoformat(),
+            "event_type": "order_submitted",
+            "trade_id": "T1",
+            "journal_entry_id": "J2",
+            "strategy": "spy-strat",
+            "git_sha": "abc",
+            "ticker": "SPY",
+            "side": "buy",
+            "qty": 10,
+            "broker_order_id": "1000",
+            "broker_perm_id": "2000000",
+            "payload": {
+                "status": "Submitted",
+                "limit_price": "500",
+                "stop_loss": None,
+                "submitted_at": EARLIER.isoformat(),
+            },
+        }
+        out = recovery.build_expected_stop_children(
+            positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            journal_tail=[prior_checkpoint, journal_removes_stop],
+        )
+        # Journal's T1 view (no stop) overrides the prior checkpoint's
+        # T1 entry; no entries emitted.
+        self.assertEqual(out, [])
+
+    def test_checkpoint_seeding_requires_position_still_open(self):
+        """Codex R3 P1: a stop child left behind at the broker after
+        the position was closed must NOT be recognized via checkpoint
+        seeding. The checkpoint only protects currently-held
+        positions; an orphaned sell stop on a closed ticker could
+        open an unintended short on trigger and must be flagged."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": {
+                    "status": "catch_up",
+                    "reconciled_event_count": 0,
+                    "adopted_positions": [],
+                    "expected_stop_children": [
+                        {
+                            "ticker": "SPY",
+                            "strategy": "spy-strat",
+                            "parent_trade_id": "T1",
+                            "client_tag": "spy-strat:T1:stop",
+                            "trigger_price": "497.25",
+                        }
+                    ],
+                },
+            },
+        ]
+        orphan_stop = BrokerOpenOrder(
+            broker_order_id="1001",
+            broker_perm_id="2000001",
+            ticker="SPY",
+            side="sell",
+            qty=10,
+            filled_qty=0,
+            limit_price=Decimal("0"),
+            status="Submitted",
+            tif="GTC",
+            client_tag="k2bi:spy-strat:T1:stop",
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[],  # position closed; nothing to protect
+            broker_open_orders=[orphan_stop],
+            broker_order_status=[],
+            now=NOW,
+        )
+        phantoms = [
+            m for m in result.mismatch_reasons
+            if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["ticker"], "SPY")
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+
+    def test_checkpoint_seeding_requires_ticker_match(self):
+        """Checkpoint seeds stop-child recognition only when the broker
+        open order's ticker matches the checkpoint entry. A trade_id
+        collision across tickers (e.g. replayed checkpoint vs a new
+        stop on a different symbol) must not silently recognize the
+        wrong-ticker stop."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": {
+                    "status": "catch_up",
+                    "reconciled_event_count": 0,
+                    "adopted_positions": [
+                        {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                    ],
+                    "expected_stop_children": [
+                        {
+                            "ticker": "SPY",
+                            "strategy": "spy-strat",
+                            "parent_trade_id": "T1",
+                            "client_tag": "spy-strat:T1:stop",
+                            "trigger_price": "497.25",
+                        }
+                    ],
+                },
+            },
+        ]
+        # Broker has a stop child with matching trade_id T1 but on QQQ,
+        # not SPY. Must flag as phantom, not recognize.
+        wrong_ticker_stop = BrokerOpenOrder(
+            broker_order_id="1001",
+            broker_perm_id="2000001",
+            ticker="QQQ",  # mismatched ticker
+            side="sell",
+            qty=10,
+            filled_qty=0,
+            limit_price=Decimal("0"),
+            status="Submitted",
+            tif="GTC",
+            client_tag="k2bi:spy-strat:T1:stop",
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            broker_open_orders=[wrong_ticker_stop],
+            broker_order_status=[],
+            now=NOW,
+        )
+        phantoms = [
+            m for m in result.mismatch_reasons
+            if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["ticker"], "QQQ")
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+
+    def test_checkpoint_seeding_does_not_recognize_non_stop_order(self):
+        """MiniMax R2 Finding 2: checkpoint-seeded trade_ids must NOT
+        suppress phantom detection on non-stop broker orders. A
+        corrupt / replayed checkpoint entry with trade_id T1 cannot
+        reclassify a k2bi-tagged parent order with the same trade_id
+        as recognized -- parent recognition lives in pending_trade_ids
+        (journal-backed) only."""
+        tail = [
+            {
+                "ts": EARLIER.isoformat(),
+                "event_type": "engine_recovered",
+                "trade_id": None,
+                "journal_entry_id": "J1",
+                "strategy": None,
+                "git_sha": "abc",
+                "payload": {
+                    "status": "catch_up",
+                    "reconciled_event_count": 0,
+                    "adopted_positions": [
+                        {"ticker": "SPY", "qty": 10, "avg_price": "500"}
+                    ],
+                    "expected_stop_children": [
+                        {
+                            "ticker": "SPY",
+                            "strategy": "spy-strat",
+                            "parent_trade_id": "T1",
+                            "client_tag": "spy-strat:T1:stop",
+                            "trigger_price": "497.25",
+                        }
+                    ],
+                },
+            },
+        ]
+        # A broker-side order tagged with T1 but NOT a stop (e.g. a
+        # replayed parent tag somehow surfacing). Must be flagged as
+        # phantom, not suppressed via checkpoint seeding.
+        non_stop_with_matching_trade_id = BrokerOpenOrder(
+            broker_order_id="9999",
+            broker_perm_id="8888",
+            ticker="SPY",
+            side="buy",
+            qty=5,
+            filled_qty=0,
+            limit_price=Decimal("499"),
+            status="Submitted",
+            tif="DAY",
+            client_tag="k2bi:spy-strat:T1",  # parent tag, no :stop suffix
+        )
+        result = recovery.reconcile(
+            journal_tail=tail,
+            broker_positions=[
+                BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            broker_open_orders=[non_stop_with_matching_trade_id],
+            broker_order_status=[],
+            now=NOW,
+        )
+        phantoms = [
+            m for m in result.mismatch_reasons
+            if m["case"] == "phantom_open_order"
+        ]
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["client_tag"], "k2bi:spy-strat:T1")
+        # And the engine refuses to start on this mismatch.
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

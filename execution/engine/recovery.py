@@ -66,6 +66,7 @@ from ..connectors.types import (
     BrokerOrderStatusEvent,
     BrokerPosition,
     CLIENT_TAG_PREFIX,
+    CLIENT_TAG_STOP_SUFFIX,
     LIVE_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
     parse_client_tag,
@@ -360,6 +361,66 @@ def reconcile(
             if tid:
                 pending_trade_ids.add(tid)
 
+    # Q32: seed from the most recent engine_recovered checkpoint's
+    # expected_stop_children. Rationale: a spec that allows multi-day
+    # holds (e.g. 5-session window) will see the parent's
+    # order_submitted / order_filled records scroll out of the 48h
+    # lookback on day-3 restarts while the GTC stop child is still live
+    # at the broker. Without this seed, the stop would be flagged as a
+    # phantom_open_order and block startup. The checkpoint is written
+    # at every prior engine_recovered moment, so even a day-7 restart
+    # finds the most recent hop's record inside journal_tail as long as
+    # the engine has been bounced at least once per lookback window.
+    #
+    # Checkpoint seeding is INTENTIONALLY separated from
+    # pending_trade_ids so that a corrupt or historical checkpoint
+    # cannot silently reclassify arbitrary broker-side managed orders
+    # as recognized (MiniMax R2 Finding 2). The restricted set below
+    # only suppresses the phantom-open-order flag for STOP children
+    # (is_stop=True after parse_client_tag) whose trade_id appears in
+    # the checkpoint. Non-stop broker orders never match this path --
+    # they still flow through pending_trade_ids (journal-backed) or
+    # fall through to phantom detection.
+    #
+    # Scope note (Q31/Commit 2 follow-on): seeding ONLY expands stop-
+    # child RECOGNITION for broker-present orders. It does NOT detect
+    # "checkpoint expects stop, broker has no stop" -- that gap is
+    # closed by Commit 2's missing_protective_stop / price_drift /
+    # tag_mismatch invariants in Phase B.2. Q32 alone is necessary but
+    # not sufficient for full protective-stop safety; Decision 1 of the
+    # Session A kickoff commits both commits together.
+    #
+    # Operational constraint: the checkpoint is only written in
+    # main.py::_run_init() after recovery. An engine that opens a
+    # position, runs continuously >48h, then crashes, will find neither
+    # the original fill nor a post-fill checkpoint in journal_tail.
+    # IBKR HK's ~24h re-auth cycle forces reconnects but not engine
+    # restarts; a longer outage + crash is the edge case. In that
+    # case the broker-side stop is flagged as phantom_open_order and
+    # the position as phantom_position, so recovery returns
+    # MISMATCH_REFUSED and the engine REFUSES TO START -- not a silent
+    # failure. The broker's GTC stop remains live and protects the
+    # position; operator must investigate before relaunching.
+    # Mitigation (mid-session checkpoint writes or longer retention
+    # for stop_loss-bearing records) is architect-scope beyond this
+    # commit and is on the Session-A-follow-on list alongside Q31.
+    checkpoint_stop_children = _latest_checkpoint_stop_children(journal_tail)
+    # Map trade_id -> expected ticker for cross-check at recognition
+    # time. Defense against the rare case where a checkpoint entry
+    # outlives its position and a broker-side stop child on a different
+    # ticker happens to carry a matching trade_id (broker reuse, replay,
+    # or manual edit). Recognition requires ticker agreement, not just
+    # trade_id agreement.
+    checkpoint_stop_trade_ids: set[str] = set()
+    checkpoint_stop_tickers: dict[str, str] = {}
+    for entry in checkpoint_stop_children:
+        tid = entry.get("parent_trade_id")
+        ticker = entry.get("ticker")
+        if tid:
+            checkpoint_stop_trade_ids.add(tid)
+            if ticker:
+                checkpoint_stop_tickers[tid] = ticker
+
     for open_order in broker_open_orders:
         matched = False
         perm = open_order.broker_perm_id
@@ -373,9 +434,39 @@ def reconcile(
 
         # Client-tag based recognition for k2bi-managed orders.
         strategy, trade_id, is_stop = parse_client_tag(open_order.client_tag)
-        if strategy is not None and trade_id is not None and trade_id in pending_trade_ids:
+        # Codex R3 P1: checkpoint-seeded recognition additionally
+        # requires the broker to still hold a position in the order's
+        # ticker. If the position was closed after the checkpoint was
+        # written but the broker's GTC stop was left behind, the stop
+        # is orphaned and MUST be flagged as phantom -- otherwise the
+        # engine could restart with a live unintended sell stop that
+        # might open a short on trigger.
+        broker_position_tickers = {p.ticker for p in broker_positions}
+        checkpoint_recognized = (
+            is_stop
+            and trade_id is not None
+            and trade_id in checkpoint_stop_trade_ids
+            # Ticker cross-check: a broker-side stop child with a
+            # matching trade_id but a different ticker is NOT the stop
+            # the checkpoint expected. Let it fall through to phantom
+            # detection rather than silently recognize.
+            and checkpoint_stop_tickers.get(trade_id, open_order.ticker)
+            == open_order.ticker
+            # Position-still-open gate (Codex R3 P1): the checkpoint
+            # only protects positions we currently hold.
+            and open_order.ticker in broker_position_tickers
+        )
+        if strategy is not None and trade_id is not None and (
+            trade_id in pending_trade_ids or checkpoint_recognized
+        ):
             # Emit a reconciled event so the audit trail records the
             # child's presence; continue -- not a phantom.
+            # Q32 checkpoint-seeded recognition is STOP-ONLY by design
+            # (see comments above where checkpoint_stop_trade_ids is
+            # built): a regular-order trade_id from the checkpoint
+            # cannot reclassify arbitrary broker orders, and a
+            # ticker-mismatched stop or a stop without a current
+            # position do not count as recognition.
             events.append(
                 ReconciliationEvent(
                     event_type="recovery_reconciled",
@@ -964,6 +1055,280 @@ def _parse_ts(raw: Any) -> datetime | None:
         return None
 
 
+def _latest_checkpoint_stop_children(
+    journal_tail: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the expected_stop_children list from the most recent
+    engine_recovered event in journal_tail, or an empty list if absent.
+
+    Q32: engine_recovered is the recovery checkpoint. Its payload now
+    carries expected_stop_children so that stop-child recognition can
+    span multiple restarts even after the original order_submitted /
+    order_filled records age out of the 48h lookback. Multiple
+    engine_recovered events can exist in journal_tail across bounces;
+    the latest wins.
+
+    Defensive defaults: any shape other than a list resolves to empty
+    (old v1-style checkpoints emitted before this field existed, or a
+    corrupt write). Callers must treat an empty list as "no prior
+    stop-child expectations" -- same as the pre-Q32 behavior.
+    """
+    latest: list[dict[str, Any]] = []
+    for rec in journal_tail:
+        if rec.get("event_type") != "engine_recovered":
+            continue
+        payload = rec.get("payload") or {}
+        entries = payload.get("expected_stop_children")
+        if isinstance(entries, list):
+            latest = [e for e in entries if isinstance(e, dict)]
+        else:
+            latest = []
+    return latest
+
+
+def build_expected_stop_children(
+    *,
+    positions: list[BrokerPosition],
+    journal_tail: list[dict[str, Any]],
+    recovery_events: list[ReconciliationEvent] | None = None,
+) -> list[dict[str, Any]]:
+    """Compute the expected_stop_children checkpoint for engine_recovered.
+
+    Q32 (LOCKED shape per Session A kickoff Design Decision 2):
+
+        [
+            {
+                "ticker": str,
+                "strategy": str,
+                "parent_trade_id": str,
+                "client_tag": f"{strategy}:{parent_trade_id}:stop",
+                "trigger_price": str(Decimal),
+            },
+            ...
+        ]
+
+    For each adopted position, locate the parent buy order in
+    journal_tail and, if that order carried a non-null stop_loss,
+    emit a canonical expected-stop-child entry. When the parent has
+    aged out of journal_tail, carry forward the matching entry from
+    the most recent prior engine_recovered checkpoint so the
+    multi-day chain does not lose protective-stop identity after
+    one hop (Codex R1 P1).
+
+    Source priority:
+        1. Latest order_submitted/order_filled in journal_tail for
+           this ticker (fresh journal view wins, even if it drops the
+           stop -- trust current intent).
+        2. Prior engine_recovered checkpoint entry for this ticker
+           (carry-forward path, unreachable when the journal has any
+           current parent record for the ticker).
+
+    Sources for stop_loss within the journal path, in walk order
+    (later wins):
+        - order_submitted.payload.stop_loss (primary; written by
+          engine/main.py:_submit_order)
+        - order_filled.payload.stop_loss (Q32 precondition; mirrors
+          the parent's stop_loss onto the fill record so a window
+          where order_submitted scrolled out but order_filled didn't
+          still yields the correct trigger)
+
+    Never emit None trigger_price: if stop_loss resolves to None/"None"
+    on the latest record, treat the position as "no expected stop"
+    (the same outcome as a strategy that never configured one).
+    """
+    if not positions:
+        return []
+    position_tickers = {p.ticker for p in positions}
+
+    # Per-ticker, track ONLY the most recently-journaled buy parent.
+    # MVP enforces one live parent per ticker (engine single-in-flight
+    # guard); multi-parent layered buys are architect-escalation per
+    # the Session A kickoff Decision notes. Taking the newest-wins
+    # view also handles the same-ticker exit-and-reenter case cleanly
+    # (Codex R6 P1): an older buy parent whose position was closed
+    # and replaced with a new buy on the same ticker is superseded,
+    # and its stop (if orphaned at broker) falls through to phantom
+    # detection rather than being silently recognized.
+    latest_parent_by_ticker: dict[str, dict[str, Any]] = {}
+    # Per-ticker, the trade_id of the newest journaled buy parent.
+    # Used to decide prior-checkpoint carry-forward: only carry
+    # forward a prior entry when the ticker has NO newer journaled
+    # parent (aged-out single-parent case).
+    newest_journal_trade_id_by_ticker: dict[str, str] = {}
+
+    def _consider_record(
+        *,
+        ticker: str | None,
+        trade_id: str | None,
+        strategy: str | None,
+        side: str,
+        stop_loss: Any,
+    ) -> None:
+        """Shared intake for journal records and
+        recovery-event-synthesized records. Later calls OVERWRITE
+        earlier ones per ticker -- callers pass records in journal
+        order so newest wins."""
+        if not ticker or ticker not in position_tickers:
+            return
+        if not trade_id:
+            return
+        if side and side.lower() != "buy":
+            # Sell-side reduces inventory; not a parent for stop-child
+            # identity. But still mark the ticker as having a fresh
+            # journal record so the carry-forward check can decide
+            # based on "any activity".
+            return
+        # Preserve prior stop_loss when the newer record for the SAME
+        # trade_id has None (e.g. order_filled written pre-Q32
+        # precondition without stop_loss). Stop_loss travels forward
+        # with its trade_id through the parent's lifecycle. Only
+        # applies within the same trade_id; a new trade_id supersedes
+        # regardless of stop_loss comparison (Codex R6 P1).
+        prior = latest_parent_by_ticker.get(ticker)
+        effective_stop_loss = stop_loss
+        if (
+            prior is not None
+            and prior.get("trade_id") == trade_id
+            and effective_stop_loss in (None, "None", "")
+            and prior.get("stop_loss") not in (None, "None", "")
+        ):
+            effective_stop_loss = prior["stop_loss"]
+        latest_parent_by_ticker[ticker] = {
+            "trade_id": trade_id,
+            "strategy": strategy,
+            "stop_loss": effective_stop_loss,
+        }
+        newest_journal_trade_id_by_ticker[ticker] = trade_id
+
+    for rec in journal_tail:
+        event_type = rec.get("event_type")
+        if event_type not in {"order_submitted", "order_filled"}:
+            continue
+        payload = rec.get("payload") or {}
+        _consider_record(
+            ticker=rec.get("ticker") or payload.get("ticker"),
+            trade_id=rec.get("trade_id"),
+            strategy=rec.get("strategy"),
+            side=(rec.get("side") or payload.get("side") or ""),
+            stop_loss=payload.get("stop_loss"),
+        )
+
+    # Codex R5 P1: include recovery-discovered fills. When recovery
+    # finds an in-flight parent that actually filled at the broker
+    # during the outage, the ONLY stop metadata may live in the
+    # freshly-emitted recovery_reconciled event's journal_view (for
+    # crashes between order_proposed and order_submitted, that's
+    # where stop_loss survives). Without this pass, the engine_recovered
+    # checkpoint written immediately after recovery would be empty for
+    # such positions, and the next restart would flag the live stop
+    # child as phantom_open_order.
+    if recovery_events:
+        parent_fill_cases = {"pending_filled", "pending_partially_filled"}
+        for ev in recovery_events:
+            if ev.event_type != "recovery_reconciled":
+                continue
+            payload = ev.payload or {}
+            if payload.get("case") not in parent_fill_cases:
+                continue
+            journal_view = payload.get("journal_view") or {}
+            _consider_record(
+                ticker=ev.ticker or journal_view.get("ticker"),
+                trade_id=ev.trade_id,
+                strategy=ev.strategy,
+                side=str(journal_view.get("side") or ""),
+                stop_loss=journal_view.get("stop_loss"),
+            )
+
+    # Codex R1 P1 carry-forward: when journal_tail no longer contains
+    # the parent for an adopted position, fall back to the prior
+    # checkpoint's entries so successive restarts do not lose stop-
+    # child identity. Without this, recovery hop #1 reads the prior
+    # checkpoint to seed recognition (correct), but writes a fresh
+    # engine_recovered with EMPTY expected_stop_children (because
+    # journal_tail has no parent records). Hop #2 then has no
+    # checkpoint to seed from and falls back to phantom_open_order --
+    # the multi-day chain breaks after one hop.
+    #
+    # The prior-checkpoint map is list-per-ticker to preserve the
+    # multi-parent case (Codex R2 P1): an older checkpoint with two
+    # stop children on the same ticker must carry both forward when
+    # the underlying parents have aged out.
+    prior_checkpoint_entries = _latest_checkpoint_stop_children(journal_tail)
+    prior_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for entry in prior_checkpoint_entries:
+        t = entry.get("ticker")
+        if t and t in position_tickers:
+            prior_by_ticker.setdefault(t, []).append(entry)
+
+    required_fields = (
+        "ticker",
+        "strategy",
+        "parent_trade_id",
+        "client_tag",
+        "trigger_price",
+    )
+
+    result: list[dict[str, Any]] = []
+    for pos in positions:
+        # Step 1: if journal_tail (or recovery events) carried a buy
+        # parent for this ticker, emit a fresh entry from the newest
+        # one. That supersedes any prior-checkpoint entry even if the
+        # prior one had a stop and the fresh one doesn't (Codex R6 P1:
+        # an exit-and-reenter cycle on the same ticker drops the old
+        # parent's orphan stop from the checkpoint).
+        parent = latest_parent_by_ticker.get(pos.ticker)
+        newest_journal_tid = newest_journal_trade_id_by_ticker.get(pos.ticker)
+        if parent is not None:
+            strategy = parent.get("strategy")
+            parent_trade_id = parent.get("trade_id")
+            stop_loss = parent.get("stop_loss")
+            if (
+                strategy
+                and parent_trade_id
+                and stop_loss not in (None, "None", "")
+            ):
+                trigger = str(stop_loss)
+                # Session A Design Decision 2 locks the canonical
+                # client_tag format: f"{strategy}:{trade_id}:stop".
+                # Semantic identity, not the full broker-on-wire tag
+                # (which includes CLIENT_TAG_PREFIX). Matchers parse
+                # broker tags via parse_client_tag and compare
+                # components; the stored form is prefix-free.
+                client_tag = (
+                    f"{strategy}:{parent_trade_id}{CLIENT_TAG_STOP_SUFFIX}"
+                )
+                result.append(
+                    {
+                        "ticker": pos.ticker,
+                        "strategy": strategy,
+                        "parent_trade_id": parent_trade_id,
+                        "client_tag": client_tag,
+                        "trigger_price": trigger,
+                    }
+                )
+            # Whether or not we emitted, the fresh journal is the
+            # authoritative view for this ticker. Do NOT fall through
+            # to prior-checkpoint carry-forward.
+            continue
+        # Step 2: no fresh journal parent for this ticker. Carry
+        # forward the prior checkpoint's entry (if any) so the
+        # multi-day restart chain does not lose stop-child identity
+        # after the parent records age out (Codex R1 P1). MVP one-
+        # parent-per-ticker means at most one prior entry per ticker
+        # should exist; if the prior has multiple, we still carry
+        # only the one matching the newest-journaled trade_id (which
+        # is None here since there's no fresh journal parent), which
+        # collapses to "carry the first valid entry for this ticker".
+        prior_entries = prior_by_ticker.get(pos.ticker, [])
+        for prior in prior_entries:
+            if any(not prior.get(k) for k in required_fields):
+                continue
+            # Shallow copy: decouple from journal_tail record identity.
+            result.append({k: prior[k] for k in required_fields})
+            break  # MVP: one entry per ticker
+    return result
+
+
 __all__ = [
     "DEFAULT_LOOKBACK",
     "PendingFromJournal",
@@ -972,5 +1337,6 @@ __all__ = [
     "ReconciliationEvent",
     "ReconciliationResult",
     "RecoveryStatus",
+    "build_expected_stop_children",
     "reconcile",
 ]
