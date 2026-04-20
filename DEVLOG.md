@@ -3,6 +3,29 @@
 Session-by-session ship log. Append-only. New entries on top.
 
 
+## 2026-04-20 -- Session A Commit 1 of 2: Q32 expected_stop_children checkpoint
+
+**Commit:** `fb46a3e` feat(engine-recovery): Q32 expected_stop_children checkpoint for multi-day holds
+
+**What shipped:** First commit of the Session A Q31+Q32 engine recovery hardening pair. Extends the `engine_recovered` journal payload with an `expected_stop_children` list so broker-held protective stops remain recognizable on restart even after their parent `order_submitted` / `order_filled` records age out of the 48h journal lookback -- the exact failure mode Codex R4 flagged on the Phase 3.1 strategy spec for any spec that declares `max holding days > 1`. A prior `engine_recovered` entry now seeds stop-child recognition in `recovery.py::reconcile()` (STOP-ONLY, gated on ticker cross-check and still-held position) so day-3 / day-5 / day-7 restarts on multi-session holds no longer falsely trip `phantom_open_order` and refuse startup. A new helper `recovery.build_expected_stop_children()` computes the checkpoint list from journal parents (newest buy per ticker wins per the MVP one-parent invariant) with carry-forward from the prior checkpoint when parents age out so the multi-day chain does not lose stop-child identity after one hop. `order_filled` payloads now carry `stop_loss` (primary fill path + status-history recovery path) as the Q32 precondition, using the m2.23 additive-evolution pattern (no `SCHEMA_VERSION` bump). Recovery-discovered fills (crash between `order_proposed` and `order_submitted`) also contribute their stop_loss to the fresh checkpoint via `reco.events`' `journal_view` -- captured pre-journal so the first post-recovery checkpoint is never empty for an in-flight parent found at broker during restart.
+
+**Codex review:** MiniMax R1-R3 iterative primary + Codex R1-R7 final gate (wiki/ intent-to-add applied temporarily to clear the EISDIR heuristic for R1-R7; unstaged before commit). 7 different-vector P1 findings across the Codex rounds, all addressed inline: (R1a) carry-forward across recovery hops; (R1b) trigger-price validation deferred to Commit 2 / Q31 per its designed scope; (R2) multi-parent per ticker reverted to MVP-newest-wins per kickoff Decision; (R3) orphan-stop-after-position-closed (broker_position_tickers gate); (R4) mixed aged-out/fresh same-ticker parents (superseded by newest-wins simplification); (R5) recovery-discovered fills surface via `reco.events`; (R6) exit-and-reenter same ticker (newest-wins); (R7) P2 noteworthy only -- multi-parent theoretical, MVP-out-of-scope per kickoff. Final Codex verdict: P2 only (no P1 blockers).
+
+**Feature status change:** No feature note (infrastructure work; `--no-feature`). Engine recovery module hardened for Phase 4 paper trading readiness. Q32 resolved pending Commit 2 landing in the same session.
+
+**Tests:** Full suite 912 passed, 1 skipped, 33 subtests passed -- up from m2.23 baseline 894 (+18 new Q32 tests). Coverage: LOCKED checkpoint shape per Design Decision 2, round-trip through journal record, day-3 / day-7 restart recognition via checkpoint alone, ticker-match gate, position-still-open gate, non-stop-order gate (regular trade_id collisions fall through), carry-forward across hops when parents age out, newest-wins on same-ticker reentry, fresh-journal supersedes prior checkpoint for same trade_id, recovery-discovered fill capture from `journal_view`, corrupt checkpoint payload yields empty list, empty-positions returns empty list.
+
+**Key decisions (divergent from claude.ai project specs):** Design Decision 2 locks the `client_tag` canonical form in the checkpoint to `f"{strategy}:{trade_id}:stop"` without the `k2bi:` broker-on-wire prefix (semantic identity, not on-wire form). Ticker cross-check on checkpoint-seeded recognition catches replayed / cross-ticker-collision entries. Position-still-open gate catches orphan stops after position exits. MVP one-parent-per-ticker invariant held despite Codex R2 multi-parent objection (per kickoff Decision: multi-parent is architect-escalation territory). Per Decision 5, intentionally-cancelled stops fail recovery with `missing_protective_stop` on Commit 2 -- the engine has no way to read "operator intent" today, so fail-closed is the correct MVP default.
+
+**Follow-ups:**
+- Commit 2 (Q31) lands in the same session: missing_protective_stop / protective_stop_price_drift / protective_stop_tag_mismatch invariants in `recovery.py` Phase B.2. Commit 2 closes the remaining Q32 safety gap (trigger-price validation) via its `price_drift` invariant.
+- Session B (separate session): Q30 approval-time atomic mirror between code repo `wiki/` and vault `wiki/`.
+- Session C (after Q30 lands): re-spin the Phase 3.1 SPY rotational / paper smoke strategy spec.
+- Architect-scope future work: mid-session checkpoint writes (address the ">48h continuous no-restart" edge flagged by MiniMax R1/R2/R3 and Codex R5; not a safety regression -- refuse-to-start is the outcome -- but a usability improvement for long holds).
+- Architect-scope future work: surface `auxPrice` on `BrokerOpenOrder` so stop-trigger validation can compare against broker-observed trigger (Codex R1b deferral; currently the IBKR connector populates `limit_price=0` for STP orders and the engine model has no auxPrice field).
+
+---
+
 ## 2026-04-20 -- Bundle 4a SHIPPED: cumulative sweep + closure admin (14/22)
 
 **Commit:** `0ba1cae` chore(bundle-4a): closure -- cumulative MiniMax sweep + planning doc updates (14/22 shipped)
