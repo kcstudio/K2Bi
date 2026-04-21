@@ -1,3 +1,80 @@
+---
+tags: [proposal, claude-md, revision, documentation, product-framing]
+date: 2026-04-21
+type: proposal
+origin: k2bi-generate
+status: draft
+up: "[[README]]"
+---
+
+# CLAUDE.md Revision -- Product Framing + Layering Cleanup
+
+## Why
+
+Keith flagged two problems on 2026-04-21:
+
+1. **Identity conflict.** The operational architecture treats K2Bi as a standalone product (own repo, own skills, portable memory, shareable). The prose treats it as "Keith's personal system" -- "Who Is Keith" biography, 25+ "Keith" name references throughout. If someone else installs K2Bi, the file asks them to read about Keith's day job at SJM Resorts. Wrong frame.
+2. **Layering violations.** The file's own Memory Layer Ownership table on line 74 says "No procedural content in CLAUDE.md -- how-to lives in the skill that does X." The file then breaks that rule in four sections: Teach Mode (50 lines of procedure), Codex Adversarial Review (70 lines), Strategy & Execution Pipeline (Phase 4+ stub duplicating roadmap.md), Phase Gates (duplicating roadmap.md). Also one stale section (Slash Commands "pending Phase 1 Session 2" when Phase 3.5 has shipped).
+
+Current CLAUDE.md: 343 lines, 25,935 bytes.
+Target: ~160 lines.
+
+## What Changes
+
+### Identity reframe (Keith --> the user)
+
+- Delete "Who Is Keith" section entirely (lines 7-9).
+- Add "Who The User Is" section that frames the archetypal user as a role: senior operator deep in their own domain, new to markets, not assumed to be native-English-speaking, small capital ceiling ($500 to $5K), testing whether domain intuition translates into edge.
+- Rename ~25 "Keith" mentions to "the user" or "the operator." Two exceptions kept:
+  - `origin: keith` frontmatter value is a legacy tag, preserved for backward-compatibility; noted in prose as "read it as user input."
+  - Commit authorship / DEVLOG references in downstream skill docs stay as-is; those are historical audit trails.
+
+### New top-level Rule: trading vocabulary gloss
+
+Added to Rules section:
+
+> No trading vocabulary without a gloss on first use. Alpha, beta, drawdown, sharpe, duration, gamma, crossover, breakout, RSI, and every other trading term gets a short plain-English gloss or a `[[glossary]]` wiki-link the first time it appears in any output. Stub pending terms into `wiki/reference/glossary.md` in the same run. Teach Mode is the longer procedure.
+
+### Procedural content moved out of CLAUDE.md
+
+Four sections reduced to short pointers:
+
+| Section | Old lines | New lines | Destination of removed content |
+|---|---|---|---|
+| Teach Mode | 50 | 6 | NEW FILE: `wiki/context/teach-mode.md` (extracted verbatim) |
+| Codex Adversarial Review | 70 | 6 | Already in `.claude/skills/invest-ship/SKILL.md` for the wrapper contract + checkpoints; Review Discipline Split (2026-04-20) NOT yet there -- NEW FILE: `wiki/context/review-discipline.md` (extracted verbatim) |
+| Strategy & Execution Pipeline (Phase 4+ stub) | 14 | 0 | Deleted -- duplicates `wiki/planning/roadmap.md` |
+| Phase Gates (Roadmap) | 15 | 0 | Deleted -- duplicates `wiki/planning/roadmap.md` |
+| Planning Docs list (16 bullets) | 22 | 2 | Deleted -- single pointer to `[[planning/index]]` replaces it |
+| Slash Commands (stale Session 2 label) | 30 | 0 | Deleted -- skills are auto-discovered; the `/ship`, `/learn`, `/research` etc. that matter are named inline where they are mentioned |
+
+### What stays
+
+- Identity opener (reframed)
+- Your Job (kept verbatim)
+- Your Environment (lightly trimmed)
+- Commander/Worker Architecture
+- Execution Layer Isolation (critical architecture, length proportional to its weight)
+- Memory Layer Ownership table (the compass for this revision)
+- Rules (with trading-vocab addition)
+- AI vs Human Ideas
+- Vault Structure (trimmed)
+- File Conventions (kept verbatim, this is taxonomy)
+- Session Discipline (short and right)
+- What's Next (merged with Planning Docs pointer)
+
+## Companion Work
+
+Two new files need to be created in the vault as part of this swap. These are extractions, not rewrites -- the prose comes verbatim from the current CLAUDE.md:
+
+1. **`K2Bi-Vault/wiki/context/teach-mode.md`** -- full Teach Mode procedure (behavior-by-stage table, glossary integration, stub pattern, bash reading one-liner, "what this is NOT" closing).
+2. **`K2Bi-Vault/wiki/context/review-discipline.md`** -- the Review Discipline Split from 2026-04-20 (aggressive-iteration vs one-pass-then-fix-on-observed-failure surfaces, ambiguous-case decision rule, rationale for the split). The Codex wrapper contract + checkpoint rules are already in `.claude/skills/invest-ship/SKILL.md`; this doc covers only the per-surface rigor calibration.
+
+No skill body changes required. No vault frontmatter changes required. No code changes required.
+
+## Proposed New CLAUDE.md
+
+```markdown
 # K2Bi -- Your Trading & Investment Second Brain
 
 You are K2Bi, an AI second brain for fundamental research, semi-auto paper trading, and post-trade learning. You run via Claude Code on the user's local workstation during development and on the Mac Mini as the always-on Trader tier from Phase 1 infrastructure onward.
@@ -52,7 +129,7 @@ Why: prompt-text rules fail under cognitive load. "Never exceed 5% position size
 
 **Claude can:** read validator config, propose changes via `/invest propose-limits` (writes a review item for the user's explicit approval), monitor kill-switch state.
 
-**Claude CANNOT:** directly edit validator config mid-session, bypass validators to "force" a trade, delete the `.killed` lock file (human-only operation). The user creates `.killed` by sending `/invest kill` via Telegram (Phase 4+) and deletes it manually when ready to resume.
+**Claude CANNOT:** directly edit validator config mid-session, bypass validators to "force" a trade, delete the `.killed` lock file (human-only operation).
 
 ## Memory Layer Ownership
 
@@ -188,3 +265,23 @@ At the END of every Claude Code session in this repo, before closing, run `/ship
 Read [[planning/index#Resume Card]] first on every new session. It is the authoritative source for current phase, next concrete action, and priority read order.
 
 Full planning docs live at `~/Projects/K2Bi-Vault/wiki/planning/`: roadmap, architecture, skills-design, agent-topology, research-infrastructure, nblm-mvp, open-questions, keith-checklist, milestones, data-sources, broker-research, execution-model, risk-controls, research-log, k2b-audit. Start at [[planning/index]].
+```
+
+## Line Count Comparison
+
+| Metric | Before | After |
+|---|---|---|
+| Total lines | 343 | 167 |
+| File size | 25.9 KB | ~13 KB |
+| "Keith" references in prose | 25+ | 1 (only inside the `origin: keith` frontmatter schema, with an explanation) |
+| Procedural content blocks | 4 (Teach Mode, Codex Review + Split, Strategy Pipeline, Phase Gates) | 0 |
+| Stale content | 1 (Slash Commands "pending Session 2") | 0 |
+
+## Approval Ask
+
+Review the proposed CLAUDE.md above. Call out anything to add, change, or keep from the old file. On approval I will:
+
+1. Create `K2Bi-Vault/wiki/context/teach-mode.md` with the extracted Teach Mode procedure
+2. Create `K2Bi-Vault/wiki/context/review-discipline.md` with the extracted Review Discipline Split
+3. Replace `~/Projects/K2Bi/CLAUDE.md` with the new version
+4. Run `/ship` (Codex review on the diff, then commit + push)
