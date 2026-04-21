@@ -85,6 +85,12 @@ EVENT_TYPES_V2_ADDITIONS = frozenset(
         # end-of-day session boundary
         "eod_cancel",
         "eod_complete",
+        # Q33 (2026-04-21): --once pre-exit barrier. Emitted when the
+        # engine deliberately exits mid-wait after a submit body
+        # without observing terminal broker status. Q39-B recovery
+        # promotes evidence=barrier_timeout for matching trade_ids in
+        # the pending_orders payload on subsequent restart.
+        "once_exit_barrier_timeout",
     }
 )
 

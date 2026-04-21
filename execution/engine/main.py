@@ -89,6 +89,11 @@ RECONNECT_CAP_SECONDS = 300.0
 DISCONNECT_STATUS_INTERVAL = timedelta(minutes=5)
 DEFAULT_TICK_SECONDS = 30.0
 DEFAULT_FILL_TIMEOUT_SECONDS = 60.0
+# Q33 (MiniMax R1 finding #3, 2026-04-21): cap the pre-exit barrier
+# wait so a misconfigured deployment cannot hang --once indefinitely.
+# 300s is generous vs the 10s default but firmly rules out accidental
+# 86400 or float('inf') values surfacing in production.
+ONCE_EXIT_WAIT_SECONDS_MAX = 300.0
 # Codex round-11 P1: the EOD cutoff must be DST-safe. NYSE closes at
 # 16:00 US/Eastern year-round, which is 20:00 UTC in summer (EDT) and
 # 21:00 UTC in winter (EST). A naive UTC-only default is wrong for
@@ -160,6 +165,25 @@ class EngineConfig:
     # custom kill_path either, falls back to kill_switch.DEFAULT_RETIRED_DIR.
     retired_dir: Path | None = None
     allow_recovery_mismatch_env: str = recovery_mod.RECOVERY_OVERRIDE_ENV
+    # Q33 (2026-04-21): wall-clock window `run_once()` waits for
+    # broker terminal status after the submit body leaves the engine
+    # in AWAITING_FILL. Covers the Session F fill-callback race where
+    # --once exited before IBKR's fill callback reached the journal.
+    # On timeout, the engine journals `once_exit_barrier_timeout`
+    # with the pending-order trade_ids so Q39-B's recovery can
+    # promote evidence to barrier_timeout on the next restart.
+    once_exit_wait_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        # Q33 MiniMax R1 finding #3 (2026-04-21): clamp once_exit_wait_seconds
+        # at ONCE_EXIT_WAIT_SECONDS_MAX. Zero / negative values keep
+        # their meaning (barrier disabled); anything above the cap is
+        # clamped down. __post_init__ runs whether EngineConfig was
+        # built by hand or by _engine_config_from_dict, so both paths
+        # are covered.
+        if self.once_exit_wait_seconds > ONCE_EXIT_WAIT_SECONDS_MAX:
+            self.once_exit_wait_seconds = ONCE_EXIT_WAIT_SECONDS_MAX
+
     # Codex round-12 P1: regime source for strategy gating. The file
     # is vault-side + populated by invest-regime (Phase 2 manual
     # classification, Phase 4 auto). Missing file -> current_regime
@@ -338,6 +362,11 @@ class Engine:
 
         Caps at 3 ticks so a repeat-disconnect doesn't loop forever.
         Tests that want finer control call tick_once() directly.
+
+        Q33 (2026-04-21): if the body tick leaves the engine in
+        AWAITING_FILL, enter a bounded pre-exit barrier before
+        returning. Covers the Session F fill-callback race where
+        --once exited between broker fill and journal write.
         """
         result = await self.tick_once()
         for _ in range(2):
@@ -353,6 +382,15 @@ class Engine:
                 if result.state_after in _TERMINAL_STATES:
                     return result
                 body_result = await self.tick_once()
+                if body_result.state_after == EngineState.AWAITING_FILL:
+                    await self._once_exit_barrier(body_result)
+                    # Q33 MiniMax R2 finding #2 (2026-04-21): the
+                    # barrier can transition self.state (kill, fill,
+                    # disconnect). Refresh body_result.state_after so
+                    # callers see the post-barrier state rather than
+                    # the stale AWAITING_FILL snapshot taken before
+                    # the barrier ran.
+                    body_result.state_after = self.state
                 return body_result
             if result.state_after == EngineState.DISCONNECTED:
                 # Still trying to reconnect -- caller knows from state.
@@ -361,6 +399,123 @@ class Engine:
             # defensive): run again.
             result = await self.tick_once()
         return result
+
+    async def _once_exit_barrier(self, result: TickResult) -> None:
+        """Q33 (2026-04-21) pre-exit wait for pending-order resolution.
+
+        Called by run_once() after the submit body returns with
+        state_after=AWAITING_FILL. Polls broker state via tick_once
+        (which routes through _poll_awaiting) until either:
+            - the pending resolves (state transitions out of
+              AWAITING_FILL, _pending_order is cleared), or
+            - wall-time reaches EngineConfig.once_exit_wait_seconds.
+
+        On timeout, journals `once_exit_barrier_timeout` with the
+        architect-specified payload so Q39-B's next-restart recovery
+        can promote evidence to `barrier_timeout`. The pending is NOT
+        cancelled by the barrier -- it stays at the broker and
+        recovery will reconcile it on the next run.
+        """
+        if (
+            self._pending_order is None
+            or self.state != EngineState.AWAITING_FILL
+        ):
+            return
+
+        wait_seconds = float(self.engine_config.once_exit_wait_seconds)
+        if wait_seconds <= 0:
+            # Explicitly disabled; behave like pre-Q33 and just exit.
+            return
+
+        # Use monotonic wall-clock for the barrier window. datetime.now
+        # can be monkey-patched in tests for session-time simulation
+        # (see test_engine_main._PatchedDT); the barrier's timeout is
+        # real wall time, not simulated time.
+        start = time.monotonic()
+        deadline = start + wait_seconds
+        # Brief inner-poll spacing: tick_once() has its own i/o waits,
+        # but the broker mock path can resolve synchronously. A small
+        # sleep between polls keeps cpu usage sane while staying well
+        # under the barrier window.
+        poll_interval = min(0.25, wait_seconds / 4.0)
+
+        # Pin the original pending trade_id. If _poll_awaiting clears
+        # this pending and the engine's tick body re-entered and
+        # submitted a fresh one, the barrier is done: we waited on the
+        # specific order that run_once submitted, not on arbitrary
+        # future orders.
+        original_trade_id = self._pending_order.trade_id
+        while (
+            self._pending_order is not None
+            and self._pending_order.trade_id == original_trade_id
+            and self.state == EngineState.AWAITING_FILL
+            and time.monotonic() < deadline
+        ):
+            # Q33 MiniMax R1 finding #2 (2026-04-21): kill-file check
+            # inside the barrier loop. _poll_awaiting bypasses
+            # tick_once's kill check, so a human writing .killed
+            # during the barrier would be ignored for the full wait
+            # window without this poll. Delegating to tick_once honors
+            # the kill transition naturally, without disturbing the
+            # barrier's narrow scope (no strategy submission because
+            # the pending is still set at that point).
+            if self._kill_file_present():
+                kill_result = TickResult(
+                    state_before=self.state, state_after=self.state
+                )
+                await self._transition_to_killed(kill_result)
+                break
+            # _poll_awaiting handles disconnect via _enter_disconnected
+            # (state transitions out of AWAITING_FILL on failure); we
+            # intentionally skip strategy-eval since the barrier's job
+            # is narrow: poll the one pending order.
+            poll_result = TickResult(
+                state_before=self.state, state_after=self.state
+            )
+            await self._poll_awaiting(poll_result)
+            if (
+                self._pending_order is None
+                or self._pending_order.trade_id != original_trade_id
+                or self.state != EngineState.AWAITING_FILL
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+
+        if (
+            self._pending_order is None
+            or self._pending_order.trade_id != original_trade_id
+            or self.state != EngineState.AWAITING_FILL
+        ):
+            return
+
+        elapsed = time.monotonic() - start
+        pending = self._pending_order
+        self.journal.append(
+            "once_exit_barrier_timeout",
+            payload={
+                "barrier_seconds_elapsed": elapsed,
+                "last_known_state": self.state.value,
+                "pending_orders": [
+                    {
+                        "trade_id": pending.trade_id,
+                        "broker_order_id": pending.broker_order_id,
+                        "broker_perm_id": pending.broker_perm_id,
+                        "ticker": pending.order.ticker,
+                        "side": pending.order.side,
+                        "qty": pending.order.qty,
+                        "limit_price": str(pending.order.limit_price),
+                        "stop_loss": (
+                            str(pending.order.stop_loss)
+                            if pending.order.stop_loss is not None
+                            else None
+                        ),
+                    }
+                ],
+            },
+        )
 
     async def tick_once(self) -> TickResult:
         """One unit of engine work.
@@ -1936,6 +2091,13 @@ def _engine_config_from_dict(raw: dict[str, Any]) -> EngineConfig:
             Path(raw["retired_dir"]) if raw.get("retired_dir") else None
         ),
         allow_recovery_mismatch_env=str(override_env_name),
+        # Q33 (2026-04-21): deployments can tune the --once pre-exit
+        # barrier via YAML. EngineConfig.__post_init__ clamps any
+        # oversized value at ONCE_EXIT_WAIT_SECONDS_MAX so a typo in
+        # config cannot hang --once indefinitely.
+        once_exit_wait_seconds=float(
+            raw.get("once_exit_wait_seconds", 10.0)
+        ),
         # Codex round-13 P2: deployments that remap the regime file
         # now flow through to the engine instead of silently reverting
         # to the vault default.
