@@ -3,6 +3,41 @@
 Session-by-session ship log. Append-only. New entries on top.
 
 
+## 2026-04-24 -- Q43 hotfix: marketPrice is a method not an attribute (Mac Mini engine cold-start crash)
+
+**Commit:** `89bfd6b` fix(connectors): Q43 marketPrice is a method not an attribute (defense-in-depth Decimal convert)
+
+**What shipped:** Mac Mini engine cold-start on 2026-04-24 crashed on the first market-data tick with `decimal.InvalidOperation` in `execution/connectors/ibkr.py::get_marks` at line 554 (pre-fix). Root cause: `ib_async` 2.1.0 exposes `Ticker.marketPrice` as a **method**, not an attribute. The other price fields (`last`, `bid`, `ask`, `close`) ARE float attributes; only `marketPrice` and `midpoint` are computed-method accessors. When `getattr(ticker_row, "marketPrice", None)` returned a bound method object, the subsequent `Decimal(str(mark))` raised `ConversionSyntax` because the None-check and NaN-check (`mark != mark`) both passed on a method reference (method is not None, and Python bound-method `__eq__` is identity-based returning True for self-comparison).
+
+**Why MacBook shipped 3 days without crashing:** pre-Q35-fix, the mark-fetch path failed earlier (no `conId`, raised exception caught by the surrounding `try/except` and skipped the ticker). Post-Q35 (commit `4a126c1`), mark-fetch now successfully returns a `Ticker` object, exposing this latent bug. Q35 fix is correct in isolation; Q43 is a pre-existing latent bug that Q35 unmasked. Mac Mini was the first machine to reach live market-data territory post-Q35 via the migration restart -- the MacBook engine had been quiescent (no trades Days 2-3; `get_marks` returned empty before reaching the crash line for all quiet symbols).
+
+**Fix shape (`execution/connectors/ibkr.py` lines 37, 550-587):**
+- Added `InvalidOperation` to the existing `from decimal import Decimal` (one-line import change, no new top-level imports).
+- Replaced attribute-only extraction with a `callable()` branch: if `raw_mark` is callable, invoke it (`raw_mark()`); else pass through for back-compat with hypothetical future library shapes or alternate ib_async versions.
+- Wrapped the `raw_mark()` call in `try/except Exception -> LOG.warning + continue` so a broker-side failure on one ticker does not propagate and crash the engine tick.
+- Wrapped the `Decimal(str(mark))` conversion in `try/except (InvalidOperation, TypeError, ValueError) -> LOG.warning + continue` for defense-in-depth: if a future ib_async version returns a non-numeric mark that slips past the None/NaN guards (e.g. a diagnostic string), log + skip rather than crash.
+- Inline comment pins the Q43 + Q35 causal chain and names the specific ib_async version shape so future readers see why the callable-branch exists.
+
+**Tests shipped:** `tests/test_ibkr_marketprice_q43.py` with 5 cases: `test_get_marks_calls_method_when_marketprice_is_method` (happy path, ib_async 2.1.0 shape), `test_get_marks_handles_method_returning_nan` (nan from method call -> skip), `test_get_marks_handles_method_raising` (method raises -> warn + skip), `test_get_marks_handles_attribute_value_for_back_compat` (float attribute shape -> still works), `test_get_marks_decimal_conversion_failure_skipped` (non-numeric return value -> warn + skip, defense path). Pattern lifted from `tests/test_ibkr_qualify.py` (Q35 test fixture structure): `_FakeContract` + `_IBShim` + sys.modules `ib_async` shim + `IBKRConnector` injection.
+
+**Test counts:** suite 1026 -> 1031 (+5 new Q43 cases). Pre-existing 8 failures in `tests/test_engine_once_barrier.py` (5) and `tests/test_engine_main.py` (3) are **unrelated to Q43** -- verified pre-existing on main HEAD `20511b0` by branch-switch + re-run. Q43 fix does not touch their code paths.
+
+**Review:** MiniMax M2.7 single pass via `scripts/review.sh diff --files execution/connectors/ibkr.py,tests/test_ibkr_marketprice_q43.py --deadline 360`. Codex routed to unavailable with reason `codex --scope working-tree would EISDIR on 'logs'; routing to MiniMax until the path is removed or committed` (known tooling issue -- stale `logs/` dir from Phase 3.6 shakedown). MiniMax archive at `.minimax-reviews/2026-04-24T01-26-34Z_diff.json`: **APPROVE, no findings.** Two "Next steps" suggestions recorded but not blocking (general observations about `get_marks` caller patterns; out of scope for this fix). One-pass bucket per Phase 3.7 scope doc + L-2026-04-20-002: tightly-scoped 5-line bug fix with explicit test coverage. Never skipped both reviewers (MiniMax is the recorded reviewer; Codex path documented as tooling-blocked, not skipped).
+
+**Feature status change:** no feature note (`/ship --no-feature` semantic for Q43 hotfix). Mac Mini migration Phase 4 (engine cold-start on Mini) remains **blocked pending this fix landing + `/invest-sync`**.
+
+**Follow-ups:**
+- **Validate Q43 fix in production:** `/invest-sync execution` to Mac Mini, restart engine via `ssh macmini 'cd ~/Projects/K2Bi && K2BI_ALLOW_RECOVERY_MISMATCH=1 nohup .venv/bin/python -m execution.engine.main ...'`, watch first 3 ticks (~90s) of journal for absence of `decimal.InvalidOperation` crash. Success signal: engine survives first 3 ticks without exiting.
+- **Planning doc updates (post-validation):** add finding (v) Q43 to `wiki/planning/upcoming-sessions.md` architect-call-worthy list with root cause + MacBook-3-day-no-crash explanation + fix SHA `89bfd6b` + validation timestamp. Mark Mac Mini migration Phase 4 complete in `wiki/planning/index.md` Resume Card.
+- **Midpoint proactive-fix NOT NEEDED:** grep of entire codebase for `midpoint` returned zero hits. Engine does not call `Ticker.midpoint`; no other attribute-access bugs to fix.
+- **Architect ping (separate session at `~/Projects/K2B`):** verify Phase 5 (24h stability monitoring) sequencing, update Phase 3.7 invest-screen kickoff pre-flight gate to cleared.
+
+**Key decisions:**
+- **Bucket call: one-pass, not aggressive.** `execution/connectors/ibkr.py` is in the aggressive bucket per `pre-phase-3.7-engine-fix-scope.md`, but this Q43 hotfix is a 5-line bug fix with explicit 5-test coverage and a clear root cause (verified via `/tmp/q43_marketprice_probe.py` on Mac Mini before coding). Architect-locked as one-pass via L-2026-04-20-002: "scoped bug fix with test coverage = one-pass". No reviewer pushback on bucket classification (Codex unavailable; MiniMax APPROVEd with zero findings in one pass).
+- **Defense-in-depth beyond the minimum fix.** Minimum fix would be just the `callable()` branch. Added the `try/except` around `Decimal(str(...))` so a future ib_async version that returns a non-numeric mark slipping past None/NaN guards logs + skips rather than crashes the engine tick. Cheap to add, compounds fault-tolerance, same pattern as the Q34 read-path fix philosophy.
+- **K2BI_ALLOW_RECOVERY_MISMATCH=1 stays needed** on Mac Mini restart because of the orphan STOP `1888063981` from Phase 3.6 Day 1 Portal submission (external STOP; engine's recovery declares mismatch without override). Eventually wants an "adopt orphan STOP" workflow designed by the architect, but for now the override is the right call.
+
+
 ## 2026-04-23 -- Phase 3.6 retro: 3-day shakedown complete + engine-fix branch ready to ship
 
 **Commits consolidated:** 5 engine-fix commits held since 2026-04-21 HKT afternoon on branch `engine-fix-pre-phase-3.7`, ready to ship with this retro (oldest → newest):
