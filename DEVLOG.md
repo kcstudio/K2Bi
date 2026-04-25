@@ -1,4 +1,4 @@
-## 2026-04-26 -- Q42 orphan-STOP adoption SHIPPED -- Phase 3.6 Day 1 STOP permId=1888063981 now first-class journal event; VPS Step 4 production validation pending (will eliminate K2BI_ALLOW_RECOVERY_MISMATCH=1 requirement for permId=1888063981 on cold-start)
+## 2026-04-26 -- Q42 orphan-STOP adoption SHIPPED -- Phase 3.6 Day 1 STOP permId=1888063981 now first-class journal event; K2BI_ALLOW_RECOVERY_MISMATCH=1 no longer required for permId=1888063981 on VPS cold-start (Step 4 production validation PASSED 2026-04-25T18:02:07Z)
 
 **Commit:** `39a7234` feat: Q42 orphan-STOP adoption workflow (K2BI_ADOPT_ORPHAN_STOP)
 
@@ -30,7 +30,19 @@
 
 **Stop rule:** P1=0, P2 isolated, both Codex rounds clear. Capital-path aggressive bucket satisfied.
 
-**VPS production validation:** pending post-ship per plan §Step 5. Adoption env var injection on systemd unit, restart, journal verify, override removal, clean-restart confirmation. Rollback path = re-add `K2BI_ALLOW_RECOVERY_MISMATCH=1` if validation fails. After Step 4 passes clean, this DEVLOG entry will be amended via a separate small follow-up commit (mirrors `c0c3d18` style) confirming "Step 4 production validation PASSED [timestamp]; K2BI_ALLOW_RECOVERY_MISMATCH=1 confirmed not required for permId=1888063981 on VPS cold-start."
+**VPS production validation: PASSED 2026-04-25T18:02:07Z.**
+
+Sequence executed against the live VPS engine post-`/sync execution`:
+
+1. `/sync execution` deployed Q42 commit `39a7234` to `/home/k2bi/Projects/K2Bi/`; Path-3 hardened deploy script restarted `k2bi-engine.service` cleanly at 17:55:57Z. First post-Q42-deploy restart still tripped `recovery_state_mismatch mc=1 res=proceeding_with_override` (expected: orphan still in journal-as-unknown, K2BI_ALLOW_RECOVERY_MISMATCH=1 still in base unit).
+2. Created drop-in `/etc/systemd/system/k2bi-engine.service.d/q42-adopt.conf` setting `K2BI_ADOPT_ORPHAN_STOP=1888063981:Phase-3.6-Day-1-Portal-submitted-STOP-permId-1888063981-broker-safe-no-duplicate-risk-confirmed-by-3-day-shakedown-2026-04-20-to-04-22`; `daemon-reload`; restarted engine at 18:00:33Z.
+3. Journal at `/home/k2bi/Projects/K2Bi-Vault/raw/journal/2026-04-25.jsonl` recorded the adoption: `orphan_stop_adopted perm=1888063981 ticker=SPY qty=2 stop_price=697.13 source=operator-portal` followed by `engine_started` + `engine_recovered status=catch_up`. NO `recovery_state_mismatch` event for this restart -- adoption resolved the only orphan and Phase B emitted no other mismatches.
+4. Removed the `q42-adopt.conf` drop-in (one-shot use; the journal event persists the adoption).
+5. Removed `K2BI_ALLOW_RECOVERY_MISMATCH=1` from the base unit file `/etc/systemd/system/k2bi-engine.service` (sed `/K2BI_ALLOW_RECOVERY_MISMATCH/d` with `.bak` backup retained); `daemon-reload`.
+6. Restarted engine at 18:02:06Z. `systemctl show -p Environment` confirms only `K2BI_VAULT_ROOT=/home/k2bi/Projects/K2Bi-Vault` remains (NEITHER override env var set).
+7. Final journal verification at 18:02:07Z: `engine_started` + `engine_recovered status=catch_up`. NO `recovery_state_mismatch`. Proposition validated.
+
+**Q42 proposition confirmed:** the engine cold-starts cleanly on VPS for the Phase 3.6 Day 1 orphan STOP `permId=1888063981` without `K2BI_ALLOW_RECOVERY_MISMATCH=1`. The architect-mandated methodology binding ("every use of `K2BI_ALLOW_RECOVERY_MISMATCH=1` MUST include a DEVLOG line OR a journal comment stating the specific mismatch description") no longer applies to THIS orphan; the orphan_stop_adopted event provides the durable, auditable record. The general override remains available as escape hatch for OTHER unknown broker state per Q42 design.
 
 **Follow-ups (architect-filed; NOT blocking Q42):**
 
