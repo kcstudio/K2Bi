@@ -22,6 +22,14 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
   set +a
 fi
 
+# Mac Mini location requires Clash Verge proxy for Telegram delivery
+# (Phase 7 / L-2026-03-30-007). Cron does NOT source ~/.zshenv where this
+# is set for interactive shells, so export it here. Idempotent on hosts
+# that already have HTTPS_PROXY set.
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"
+export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:7897}"
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}"
+
 # Run classifier WITHOUT saving state yet.
 # State is only committed after all Telegram sends succeed.
 ALERTS_JSON="$(mktemp -t invest-alert-json.XXXXXX)"
