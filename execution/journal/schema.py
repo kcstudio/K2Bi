@@ -31,10 +31,24 @@ v2 additive (2026-04-20, m2.23 Phase 5 metric audit):
         fees_total_usd            -> Phase 5.6 fee erosion (incl regulatory)
         correlation_vs_portfolio  -> Phase 5.7 correlation check
       Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
+
+v2 additive (2026-04-26, Q42 orphan-STOP adoption):
+    - Added event type `orphan_stop_adopted` so operator-portal-submitted
+      STOPs that pre-date the engine's awareness can be recorded as
+      first-class journal events. Future recovery passes recognize them
+      as KNOWN broker state instead of re-flagging on every cold-start.
+      Required payload fields: permId (int), ticker (str), qty (int),
+      stop_price (Decimal as str), source (enum), adopted_at (ISO8601 UTC),
+      justification (non-empty str). Field-level validation lives in
+      validate_orphan_stop_adopted_payload() (kept separate from
+      validate() to preserve its cheap-checks-only contract).
+      Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -94,9 +108,30 @@ EVENT_TYPES_V2_ADDITIONS = frozenset(
     }
 )
 
-EVENT_TYPES = EVENT_TYPES_V1 | EVENT_TYPES_V2_ADDITIONS
+# Q42 (2026-04-26): orphan-STOP adoption workflow. Operator-portal-submitted
+# STOPs that pre-date the engine's awareness can be adopted as first-class
+# journal events so future recovery passes recognize them as KNOWN broker
+# state. Kept as its own frozenset so the v2-additive history stays
+# traceable session-by-session (mirrors the spirit of m2.23's separation,
+# even though m2.23 added optional top-level fields rather than event
+# types). Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
+EVENT_TYPES_V2_ADDITIVE_Q42 = frozenset({"orphan_stop_adopted"})
+
+EVENT_TYPES = (
+    EVENT_TYPES_V1
+    | EVENT_TYPES_V2_ADDITIONS
+    | EVENT_TYPES_V2_ADDITIVE_Q42
+)
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
+
+# Q42: source enum for orphan_stop_adopted.source. Only operator-portal is
+# wired in this ship (matches the Phase 3.6 Day 1 use case); operator-tws
+# and external-api are reserved for Phase 4+ when arbitrary external STOP
+# adoption gets generalized.
+ORPHAN_STOP_ADOPTED_SOURCES = frozenset(
+    {"operator-portal", "operator-tws", "external-api"}
+)
 
 REQUIRED_TOP_LEVEL = (
     "ts",
@@ -170,4 +205,97 @@ def validate(record: dict[str, Any]) -> None:
         raise JournalSchemaError(
             f"unknown schema_version: {record['schema_version']}; "
             f"known={sorted(KNOWN_SCHEMA_VERSIONS)}"
+        )
+
+
+def validate_orphan_stop_adopted_payload(payload: dict[str, Any]) -> None:
+    """Field-level validation for orphan_stop_adopted event payloads.
+
+    Q42: called by recovery.py when constructing the event so a malformed
+    payload never lands in the journal. NOT called from validate() above
+    -- that helper stays cheap-checks-only per its existing contract.
+    Raises JournalSchemaError on any violation.
+
+    Required fields and their constraints:
+        permId          positive int (bool excluded -- Python's
+                        isinstance(True, int) trap)
+        ticker          non-empty str
+        qty             non-zero int (bool excluded; sign carries
+                        broker-side direction)
+        stop_price      parseable as finite Decimal > 0
+        source          one of ORPHAN_STOP_ADOPTED_SOURCES
+        adopted_at      ISO8601 string with explicit timezone
+        justification   non-empty after whitespace strip
+    """
+    required = (
+        "permId",
+        "ticker",
+        "qty",
+        "stop_price",
+        "source",
+        "adopted_at",
+        "justification",
+    )
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted payload missing fields: {missing}"
+        )
+    perm = payload["permId"]
+    # bool subclasses int in Python; reject explicitly so True/False
+    # cannot sneak past the type guard.
+    if isinstance(perm, bool) or not isinstance(perm, int) or perm <= 0:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted permId must be positive int, got {perm!r}"
+        )
+    ticker = payload["ticker"]
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise JournalSchemaError(
+            f"orphan_stop_adopted ticker must be non-empty str, got {ticker!r}"
+        )
+    qty = payload["qty"]
+    if isinstance(qty, bool) or not isinstance(qty, int) or qty == 0:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted qty must be non-zero int, got {qty!r}"
+        )
+    raw_stop = payload["stop_price"]
+    try:
+        stop = Decimal(str(raw_stop))
+    except (InvalidOperation, ValueError, TypeError):
+        raise JournalSchemaError(
+            f"orphan_stop_adopted stop_price not parseable as Decimal: "
+            f"{raw_stop!r}"
+        )
+    if not stop.is_finite() or stop <= 0:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted stop_price must be finite > 0, "
+            f"got {raw_stop!r}"
+        )
+    src = payload["source"]
+    if src not in ORPHAN_STOP_ADOPTED_SOURCES:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted source must be one of "
+            f"{sorted(ORPHAN_STOP_ADOPTED_SOURCES)}, got {src!r}"
+        )
+    adopted = payload["adopted_at"]
+    if not isinstance(adopted, str):
+        raise JournalSchemaError(
+            f"orphan_stop_adopted adopted_at must be str, "
+            f"got {type(adopted).__name__}"
+        )
+    try:
+        parsed = datetime.fromisoformat(adopted)
+    except ValueError:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted adopted_at not ISO8601: {adopted!r}"
+        )
+    if parsed.tzinfo is None:
+        raise JournalSchemaError(
+            f"orphan_stop_adopted adopted_at must include timezone, "
+            f"got {adopted!r}"
+        )
+    just = payload["justification"]
+    if not isinstance(just, str) or not just.strip():
+        raise JournalSchemaError(
+            "orphan_stop_adopted justification must be non-empty string"
         )

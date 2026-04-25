@@ -74,10 +74,96 @@ from ..connectors.types import (
 
 
 RECOVERY_OVERRIDE_ENV = "K2BI_ALLOW_RECOVERY_MISMATCH"
+# Q42: per-permId adoption of an orphan STOP (operator-portal-submitted
+# pre-engine-awareness). Format: "<permId>:<justification>". When set
+# AND a broker open order matches the permId AND that order is a STOP
+# (aux_price > 0), the orphan_stop_adopted journal event is written
+# and the matching mismatch is removed -- adoption resolves THAT
+# permId only. OTHER unknown broker state still trips MISMATCH_REFUSED.
+# Wire-up lives in engine/main.py; engine refuses to start with
+# sys.exit(78) on malformed input (fail-closed config error).
+ADOPT_ORPHAN_STOP_ENV = "K2BI_ADOPT_ORPHAN_STOP"
 # How far back to walk journal + broker history on restart. A full
 # calendar day covers overnight crashes; longer outages trip the
 # weekly_cap breaker first anyway.
 DEFAULT_LOOKBACK = timedelta(hours=48)
+
+
+@dataclass(frozen=True)
+class OrphanStopAdoptionRequest:
+    """Architect-issued instruction to adopt a specific broker permId
+    as a known STOP order. Constructed by `_parse_adopt_orphan_stop()`
+    from the K2BI_ADOPT_ORPHAN_STOP env var; passed to `reconcile()`
+    as a pure-function input (mirrors the override_env pattern)."""
+
+    perm_id: int
+    justification: str
+
+
+def _parse_adopt_orphan_stop(raw: str | None) -> OrphanStopAdoptionRequest | None:
+    """Parse K2BI_ADOPT_ORPHAN_STOP=<permId>:<justification>.
+
+    Returns None if env var is unset/empty (engine proceeds normally,
+    K2BI_ALLOW_RECOVERY_MISMATCH stays as the general escape hatch).
+    Raises ValueError if set but malformed -- engine main treats this
+    as fatal at startup with sys.exit(78), same fail-closed posture as
+    the existing mismatch-refused path. A silently-ignored parse error
+    would let the operator believe adoption is happening when it is
+    not, and the orphan would re-flag on the next cold start.
+    """
+    if not raw or not raw.strip():
+        return None
+    if ":" not in raw:
+        raise ValueError(
+            f"{ADOPT_ORPHAN_STOP_ENV} format is <permId>:<justification>; "
+            f"got {raw!r} (no colon)"
+        )
+    # Split on FIRST colon so a justification containing colons is
+    # preserved verbatim.
+    perm_str, _, just = raw.partition(":")
+    perm_str = perm_str.strip()
+    just = just.strip()
+    try:
+        perm_id = int(perm_str)
+    except ValueError:
+        raise ValueError(
+            f"{ADOPT_ORPHAN_STOP_ENV} permId must be int, got {perm_str!r}"
+        )
+    if perm_id <= 0:
+        raise ValueError(
+            f"{ADOPT_ORPHAN_STOP_ENV} permId must be positive, got {perm_id}"
+        )
+    if not just:
+        raise ValueError(
+            f"{ADOPT_ORPHAN_STOP_ENV} justification must be non-empty"
+        )
+    return OrphanStopAdoptionRequest(perm_id=perm_id, justification=just)
+
+
+def _adopted_orphan_perm_ids(records: Iterable[dict[str, Any]]) -> set[str]:
+    """Permanent IDs adopted by any prior orphan_stop_adopted journal event.
+
+    The orphan check at the Phase B.1 loop treats these permIds as
+    KNOWN broker state so future cold starts don't re-flag them after
+    the architect has explicitly adopted them. Values are stringified
+    so they collide cleanly with the `f"perm:{...}"` namespace used
+    throughout reconcile().
+
+    NOTE: bounded by journal_tail's lookback window (currently 48h via
+    DEFAULT_LOOKBACK). Long-tail carry-forward via engine_recovered
+    checkpoint is Phase 4+ work; in practice the VPS engine restarts
+    continuously so adopted permIds stay in tail. See DEVLOG Q42 for
+    the long-tail caveat and Phase 4+ home.
+    """
+    out: set[str] = set()
+    for rec in records:
+        if rec.get("event_type") != "orphan_stop_adopted":
+            continue
+        payload = rec.get("payload") or {}
+        perm = payload.get("permId")
+        if perm is not None:
+            out.add(str(perm))
+    return out
 
 
 class RecoveryStatus(str, Enum):
@@ -161,6 +247,8 @@ def reconcile(
     now: datetime,
     override_env: str | None = None,
     override_env_name: str = RECOVERY_OVERRIDE_ENV,
+    adopt_orphan_stop: OrphanStopAdoptionRequest | None = None,
+    adopt_orphan_stop_env_name: str = ADOPT_ORPHAN_STOP_ENV,
 ) -> ReconciliationResult:
     """Classify broker state against journal-implied state.
 
@@ -204,6 +292,13 @@ def reconcile(
     status_index = _index_status_events(broker_order_status)
     open_index = _index_open_orders(broker_open_orders)
     seen_broker_ids: set[str] = set()
+    # Q42: orphan_stop_adopted events from prior recovery passes pre-mark
+    # their permIds as known so the Phase B.1 orphan loop skips them.
+    # Same recognition mechanism Phase A's perm/oid matching uses.
+    # Bounded by journal_tail's 48h lookback; see _adopted_orphan_perm_ids
+    # docstring for the long-tail caveat.
+    for adopted_perm in _adopted_orphan_perm_ids(journal_tail):
+        seen_broker_ids.add(f"perm:{adopted_perm}")
     # Per-ticker (signed_qty_delta, last_broker_avg_fill_price).
     # Positive qty means the pending was a buy that filled, growing
     # inventory; negative means a sell that filled, reducing it.
@@ -1053,6 +1148,111 @@ def reconcile(
                     }
                 )
 
+    # ---- Q42: orphan-STOP adoption resolution ----
+    #
+    # Architect-issued K2BI_ADOPT_ORPHAN_STOP request resolves the
+    # SPECIFIC permId mismatch when the broker holds a STOP order the
+    # engine has never seen before. Adoption fails closed: malformed
+    # request, no matching permId, or matched-order-is-not-a-STOP all
+    # emit a NEW mismatch entry that keeps status=MISMATCH_REFUSED.
+    # Defense in depth: adoption removes ONLY the matching mismatch
+    # entry; OTHER unknown broker state still trips MISMATCH_REFUSED.
+    if adopt_orphan_stop is not None:
+        target_perm = str(adopt_orphan_stop.perm_id)
+        matched_open: BrokerOpenOrder | None = None
+        for o in broker_open_orders:
+            if str(o.broker_perm_id or "") == target_perm:
+                matched_open = o
+                break
+        if matched_open is None:
+            mismatches.append(
+                {
+                    "case": "adopt_orphan_stop_perm_not_found",
+                    "requested_perm_id": adopt_orphan_stop.perm_id,
+                    "env": adopt_orphan_stop_env_name,
+                    "reason": (
+                        f"{adopt_orphan_stop_env_name} requested adoption of "
+                        f"permId {adopt_orphan_stop.perm_id} but no matching "
+                        "broker open order was found. Refusing to silently "
+                        "swallow the request -- operator must verify the "
+                        "permId or unset the env var."
+                    ),
+                }
+            )
+        else:
+            # Codex R1 P1: aux_price > 0 alone is too weak -- TRAIL and
+            # TRAIL LIMIT orders also populate auxPrice (with the trail
+            # amount/percent, NOT a stop trigger). Require an explicit
+            # STP order type so a TRAIL cannot sneak through. An empty
+            # order_type (connector that doesn't surface this field)
+            # also fails closed -- adoption refuses rather than guessing.
+            order_type_norm = (matched_open.order_type or "").upper().strip()
+            is_stop_order = order_type_norm in ("STP", "STP LMT")
+            if not is_stop_order:
+                mismatches.append(
+                    {
+                        "case": "adopt_orphan_stop_not_a_stop",
+                        "requested_perm_id": adopt_orphan_stop.perm_id,
+                        "matched_order_type": matched_open.order_type,
+                        "matched_aux_price": str(matched_open.aux_price),
+                        "matched_client_tag": matched_open.client_tag,
+                        "matched_limit_price": str(matched_open.limit_price),
+                        "reason": (
+                            f"Broker order at permId "
+                            f"{adopt_orphan_stop.perm_id} is not a STOP "
+                            f"order (order_type={matched_open.order_type!r}; "
+                            "adoption is restricted to STP / STP LMT this "
+                            "ship). Operator must verify the permId targets "
+                            "the intended broker-side STOP."
+                        ),
+                    }
+                )
+            else:
+                # Codex R1 P1: adoption resolves the phantom-open-order
+                # mismatch for THIS permId only. The previous filter
+                # also removed protective_stop_price_drift entries
+                # carrying the same broker_perm_id, which would silently
+                # erase a Q31 safety failure if the operator pointed
+                # K2BI_ADOPT_ORPHAN_STOP at an existing broker stop with
+                # the wrong trigger. Narrow to case=phantom_open_order
+                # so all OTHER cases (Q31 protective-stop integrity, etc.)
+                # remain in mismatches and continue to trip
+                # MISMATCH_REFUSED.
+                mismatches = [
+                    m
+                    for m in mismatches
+                    if not (
+                        m.get("case") == "phantom_open_order"
+                        and str(m.get("broker_perm_id") or "") == target_perm
+                    )
+                ]
+                from ..journal.schema import (
+                    validate_orphan_stop_adopted_payload,
+                )
+
+                adoption_payload = {
+                    "permId": adopt_orphan_stop.perm_id,
+                    "ticker": matched_open.ticker,
+                    "qty": matched_open.qty,
+                    "stop_price": str(matched_open.aux_price),
+                    "source": "operator-portal",
+                    "adopted_at": now.isoformat(),
+                    "justification": adopt_orphan_stop.justification,
+                }
+                # Programmer-error guard: a malformed payload built by
+                # our own code is a bug, not operator error -- raise so
+                # the test suite catches it and the journal stays clean.
+                validate_orphan_stop_adopted_payload(adoption_payload)
+                events.append(
+                    ReconciliationEvent(
+                        event_type="orphan_stop_adopted",
+                        payload=adoption_payload,
+                        ticker=matched_open.ticker,
+                        broker_order_id=matched_open.broker_order_id,
+                        broker_perm_id=str(adopt_orphan_stop.perm_id),
+                    )
+                )
+
     # ---- 4. status assembly ----
 
     if not mismatches and not events and not broker_positions and not broker_open_orders:
@@ -1877,7 +2077,9 @@ def build_expected_stop_children(
 
 
 __all__ = [
+    "ADOPT_ORPHAN_STOP_ENV",
     "DEFAULT_LOOKBACK",
+    "OrphanStopAdoptionRequest",
     "PendingFromJournal",
     "PositionFromJournal",
     "RECOVERY_OVERRIDE_ENV",

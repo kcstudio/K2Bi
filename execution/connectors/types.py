@@ -121,6 +121,16 @@ class BrokerOpenOrder:
     tif: str = "DAY"
     client_tag: str = ""
     aux_price: Decimal = Decimal("0")
+    # Q42 (2026-04-26): IBKR order type (STP, STP LMT, TRAIL, TRAIL
+    # LIMIT, MKT, LMT, etc). Disambiguates STP from auxPrice-bearing
+    # non-stop orders such as TRAIL when the recovery layer needs to
+    # decide whether an order is a protective stop. Default "" is a
+    # FAIL-CLOSED sentinel: the orphan-STOP adoption gate
+    # (recovery.py Q42) refuses to adopt orders whose order_type is
+    # not explicitly "STP" or "STP LMT", so a connector that drops
+    # this field cannot accidentally let a TRAIL order through.
+    # IBKR connector pulls from ib_async's `order.orderType`.
+    order_type: str = ""
 
 
 CLIENT_TAG_PREFIX = "k2bi:"

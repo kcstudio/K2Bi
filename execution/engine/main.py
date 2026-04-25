@@ -165,6 +165,16 @@ class EngineConfig:
     # custom kill_path either, falls back to kill_switch.DEFAULT_RETIRED_DIR.
     retired_dir: Path | None = None
     allow_recovery_mismatch_env: str = recovery_mod.RECOVERY_OVERRIDE_ENV
+    # Q42 (2026-04-26): per-permId orphan-STOP adoption env var name.
+    # Configurable for testability (mirrors allow_recovery_mismatch_env).
+    # When os.environ[<this name>] is set to "<permId>:<justification>"
+    # AND a broker open order matches that permId AND the order is a
+    # STOP, recovery writes an orphan_stop_adopted journal event and
+    # the matching mismatch is removed (engine starts cleanly without
+    # K2BI_ALLOW_RECOVERY_MISMATCH=1). Malformed input is fatal at
+    # startup with sys.exit(78). See execution.engine.recovery for
+    # the parser + adoption logic.
+    adopt_orphan_stop_env: str = recovery_mod.ADOPT_ORPHAN_STOP_ENV
     # Q33 (2026-04-21): wall-clock window `run_once()` waits for
     # broker terminal status after the submit body leaves the engine
     # in AWAITING_FILL. Covers the Session F fill-callback race where
@@ -642,6 +652,20 @@ class Engine:
             self.engine_config.allow_recovery_mismatch_env, ""
         )
 
+        # Q42: parse K2BI_ADOPT_ORPHAN_STOP if set. Malformed input
+        # is fatal -- silently ignoring it would let the operator
+        # believe adoption is happening when it is not, and the
+        # orphan would re-flag on the next cold start. sys.exit(78)
+        # matches sysexits.h EX_CONFIG (operator config error before
+        # any engine state mutates).
+        try:
+            adopt_request = recovery_mod._parse_adopt_orphan_stop(
+                os.environ.get(self.engine_config.adopt_orphan_stop_env)
+            )
+        except ValueError as exc:
+            LOG.error("FATAL: %s", exc)
+            sys.exit(78)
+
         reco = recovery_mod.reconcile(
             journal_tail=journal_tail,
             broker_positions=broker_positions,
@@ -650,6 +674,8 @@ class Engine:
             now=datetime.now(timezone.utc),
             override_env=override_env_value,
             override_env_name=self.engine_config.allow_recovery_mismatch_env,
+            adopt_orphan_stop=adopt_request,
+            adopt_orphan_stop_env_name=self.engine_config.adopt_orphan_stop_env,
         )
 
         for event in reco.events:

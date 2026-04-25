@@ -468,6 +468,11 @@ class IBKRConnector:
                     # their trigger in auxPrice; LMT parents leave
                     # it at 0 and Q31's price-drift check skips them.
                     aux_price=Decimal(str(getattr(order, "auxPrice", "0") or "0")),
+                    # Q42: surface orderType so recovery's adoption
+                    # gate can distinguish STP from other auxPrice-
+                    # bearing types (TRAIL, TRAIL LIMIT). Empty default
+                    # is FAIL-CLOSED for the adoption check.
+                    order_type=str(getattr(order, "orderType", "") or ""),
                 )
             )
         return out
