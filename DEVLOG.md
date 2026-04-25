@@ -1,3 +1,46 @@
+## 2026-04-25 -- Phase 3.9 Stage 2 SHIPPED -- skill+script retargeting Mac Mini -> Hostinger VPS + Kimi-backed reviewer prose consistency + finding #2 backport (${VAR:-} -> ${VAR-} cron-env trap fix); R2 P1 #1 fixed (AGENTS.md back to excludes), R2 P1 #2 defended via documentation (false positive, verified via executable bash test), R2 #3 escalated by R3 to P1 -> Path 3 hardening applied (restart failure now FATAL to deploy, sentinel does not advance on failed restart); R2 P2 #4 + #5 documented as design decisions
+
+**Commit:** `a6cc226` Phase 3.9 Stage 2 SHIPPED -- skill+script retargeting Mac Mini -> Hostinger VPS + Kimi-backed reviewer prose consistency + finding #2 backport (${VAR:-} -> ${VAR-} cron-env trap fix); R2 P1 #1 fixed (AGENTS.md back to excludes), R2 P1 #2 defended via documentation (false positive, verified via executable bash test), R2 #3 escalated by R3 to P1 -> Path 3 hardening applied (restart failure now FATAL to deploy, sentinel does not advance on failed restart); R2 P2 #4 + #5 documented as design decisions
+
+**What shipped:**
+- Renamed `scripts/deploy-to-mini.sh` -> `scripts/deploy-to-vps.sh`, retargeted from Mac Mini to Hostinger KL VPS (`ssh hostinger`)
+- Updated `scripts/deploy-config.yml` categories, added `scripts/lib/deploy_config.py` preflight drift detection
+- Backported cron-env trap fix: `${VAR:-}` -> `${VAR-}` in `scripts/invest-alert-tick.sh` (Stage 1 finding cc)
+- Added defensive comment in `invest-alert-tick.sh` documenting why no-colon form is correct under `set -u`
+- Reverted `AGENTS.md` from deploy targets back to excludes (content references MacBook paths, not VPS-safe)
+- Path 3 hardening in `deploy-to-vps.sh`: `RESTART_FAILED` flag blocks `record-sync` and exits 3 if any `systemctl restart` fails
+- Review runner (`scripts/lib/review_runner.py`) and wrapper (`scripts/review.sh`, `scripts/review-poll.sh`) updated for Kimi-backed reviewer prose consistency and Codex EISDIR fallback
+- `tests/test_deploy_coverage.py` updated for VPS retargeting
+- `CLAUDE.md` + `AGENTS.md` context updated for Phase 3.9 Stage 2
+
+**R2 + R3 review trail and architect dispositions:**
+
+| Round | Reviewer | Verdict | Findings |
+|-------|----------|---------|----------|
+| R1 | MiniMax M2.7 (legacy) | NEEDS-ATTENTION | 2 P2/P3 findings addressed inline |
+| R2 | Kimi-backed reviewer (Codex EISDIR-skipped) | NEEDS-ATTENTION | 5 findings |
+| R3 | Codex | NEEDS-ATTENTION | P1 restart non-atomicity + sentinel-advance |
+| R4 | Codex | NEEDS-ATTENTION | P2 same vector, recommendation for full refactor deferred |
+
+- **R2 #1 (HIGH) AGENTS.md MacBook-paths-on-VPS:** VALID. Fixed by reverting to excludes. Prior "parity" reasoning anchored on form not content; corrected.
+- **R2 #2 (HIGH) `${VAR-default}` claimed unbound under `set -u`:** FALSE POSITIVE. Verified via executable bash test (`set -euo pipefail; echo "${UNSET-default}"` expands cleanly to `default`). Defended per L-2026-04-20-002 (locked design wins over reviewer pressure when reviewer is incorrect about facts); defensive comment added to `invest-alert-tick.sh`.
+- **R2 #3 (MEDIUM) Silent systemd restart on failure:** Documented as design decision in original ruling. **R3 escalated to P1** with sharper analysis (non-atomicity + sentinel-advance combination = new information, not 3rd-round same-vector pressure). Path 3 hardening applied: restart failure now fatal to deploy (`exit 3`), sentinel does not advance. Full queue-and-batch refactor (Path 1) deferred -- non-atomicity is theoretical for current K2Bi categories (no pm2 category yet).
+- **R2 #4 (MEDIUM) `# MiniMax` log header literal:** Preserved per original kimi-handoff spec. Downstream parsers depend on it. Not a bug.
+- **R2 #5 (MEDIUM) `k2bi@$VPS` explicit SSH user prefix:** Deliberate per Kimi pre-flight `ssh hostinger 'whoami' = root` finding. Documented in `deploy-to-vps.sh`; not a bug.
+
+**Cross-model review path:** Codex unreachable on Stage 2 base attempt (EISDIR `logs/`) -> MiniMax M2.7 (legacy via `K2B_LLM_PROVIDER=minimax`) returned R1 NEEDS-ATTENTION 2 P2/P3 (addressed); `/invest-ship` built-in pass = R2 (Codex EISDIR-skipped, Kimi-backed reviewer surfaced 5 findings); R3 = Codex on R2-resolution diff (P1 restart finding); R4 = Codex on Path-3-hardened diff (P2 same vector).
+
+**Three-Kimi-handoff pattern:** (1) Stage 2 base diff at `.kimi/archive/2026-04-25_201535_job.md`; (2) MiniMax R1 fix at `.kimi/archive/2026-04-25_202410_job.md`; (3) R2 resolution + Path 3 hardening + ship at `.kimi/job.md` (this job).
+
+**Sudoers rule:** Landed on VPS evening 2026-04-25 enabling clean post-sync auto-restart hook for `k2bi` user.
+
+**Bucket:** One-pass per CLAUDE.md scope-doc. Architect-locked via L-2026-04-20-002 for tightly-scoped infrastructure retargeting with explicit test coverage.
+
+**Follow-ups:**
+- Path 1 queue-and-batch refactor for `deploy-to-vps.sh` if pm2 category populates or if non-atomicity becomes concrete in production.
+- K2Bi-Vault/wiki/planning/upcoming-sessions.md tracks Path 1 hardening as deferred follow-up if architect prioritizes.
+- `/sync` deferred; entry created in `.pending-sync/` mailbox.
+
 # K2Bi DEVLOG
 
 Session-by-session ship log. Append-only. New entries on top.
