@@ -205,8 +205,60 @@ Ship 1 is a **pure prompt-engineering scaffold with zero Python validators**. Ev
 
 If any of the above is unacceptable for a given narrative, wait for Ship 2.
 
+## Ship 2 Two-Call Architecture
+
+Ship 2 replaces the single-call prompt with a two-call decomposition pipeline implemented in `scripts/lib/invest_narrative_pipeline.py`.
+
+**Call 1** -- sub-theme identification:
+- Input: Keith's narrative text
+- Output: 4-6 sub-themes with one-line reasoning each
+- Routed through `scripts.lib.minimax_common.chat_completion` (Kimi K2.6 default)
+
+**Call 2** -- ticker extraction per sub-theme:
+- Input: narrative + one sub-theme
+- Output: 2-3 candidate tickers with symbol, reasoning chain, citation URL, order of beneficiary, and ARK 6-metric scores
+- One separate LLM call per sub-theme (sequential, not parallel)
+
+The pipeline assembles the final theme file from Call 1 + Call 2 outputs, runs the validator chain, and writes the file atomically.
+
+## Ship 2 Validators
+
+Four hardcoded Python validators in `scripts/lib/invest_narrative_validators.py`:
+
+1. `validate_ticker_exists(symbol)` -- looks up the canonical NASDAQ+NYSE registry at `K2Bi-Vault/wiki/tickers/canonical-registry.json`. Rejects hallucinated symbols.
+2. `validate_market_cap(symbol, threshold=2_000_000_000)` -- queries yfinance. Rejects below $2B.
+3. `validate_liquidity(symbol, adv_threshold=10_000_000)` -- queries yfinance for 30-day average daily dollar volume. Rejects below $10M.
+4. `validate_priced_in(symbol, gain_threshold=0.9, lookback_days=90)` -- queries yfinance for 90-day price change. FLAGS (never auto-rejects) if gain >90%. Flagged tickers appear in `priced-in-warnings` frontmatter but stay in the candidate table.
+
+Additionally, `validate_citation_url(url)` performs an HTTP HEAD request (5s timeout, follows redirects, GET fallback on 405). Candidates with dead citations are dropped.
+
+**Graceful degradation**: when yfinance is unreachable or returns empty data, the validator raises `ValidatorSkipped`. The pipeline records the skip in the theme file's "Validator results" section instead of auto-rejecting.
+
+**Canonical registry refresh**: run `python3 -m scripts.build_canonical_registry` from the repo root. Refresh quarterly or when unknown_ticker rate exceeds 5% over 10 runs.
+
+## Ship 2 --promote flag
+
+After reviewing a theme file, Keith can promote any candidate to the watchlist:
+
+```bash
+python3 -m scripts.lib.invest_narrative_pipeline --promote LRCX --theme-file K2Bi-Vault/wiki/macro-themes/theme_<slug>.md
+```
+
+This atomically writes `K2Bi-Vault/wiki/watchlist/LRCX.md` with the Stage-1 frontmatter per the watchlist schema:
+- `tags: [watchlist, k2bi]`
+- `type: watchlist`, `origin: k2bi-extract`
+- `symbol`, `status: promoted`, `schema_version: 1`
+- `narrative_provenance` (link back to source theme file)
+- `reasoning_chain` and `citation_url` copied from the theme table
+- `order_of_beneficiary` (1 | 2 | 3)
+- `ark_6_metric_initial_scores` copied from theme frontmatter `candidate_ark_scores`
+
+Idempotent: re-running the same `--promote` command detects the existing entry, exits 0 with "already promoted", and makes no changes.
+
+The command also updates `K2Bi-Vault/wiki/watchlist/index.md` with the new entry.
+
 ## Ship roadmap
 
-- **Ship 1 (this skill)**: Single-call manual MVP. Prompt-engineering only. No Python validators.
-- **Ship 2**: Two-call decomposition, Python validators (ticker-exists, market-cap, liquidity, priced-in), canonical ticker registry, citation HTTP-HEAD validation, `--promote <symbol>` writer.
+- **Ship 1**: Single-call manual MVP. Prompt-engineering only. No Python validators. **SHIPPED 2026-04-26.**
+- **Ship 2 (this skill)**: Two-call decomposition, Python validators, canonical ticker registry, citation HTTP-HEAD validation, `--promote <symbol>` writer. **SHIPPED 2026-04-26.**
 - **Ship 3**: News-feed integration, scheduled refresh, attention-score auto-population.
