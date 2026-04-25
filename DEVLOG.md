@@ -3,6 +3,44 @@
 Session-by-session ship log. Append-only. New entries on top.
 
 
+## 2026-04-25 -- Q41 kill-switch `kill.flag` alias SHIPPED + Bundle 5a m2.9 cron-env hotfix SHIPPED
+
+**Commits:** `4b3b8c5` feat(risk): Q41 kill-switch kill.flag alias (Kimi K2Bi session) · `cfd1fb6` fix(invest-alert): export HTTPS_PROXY for cron-environment Telegram delivery (K2B architect session)
+
+### Q41 — kill-switch `kill.flag` alias
+
+Architect-approved 2026-04-24 (option 3 belt-and-suspenders per `upcoming-sessions.md` finding (w)). Kimi K2Bi session shipped `4b3b8c5` clean: `_check_kill_path()` uses `lstat()` (TOCTOU-safe), `_scan_kill_paths()` checks canonical `.killed` first then alias `kill.flag` with short-circuit OR, `read_kill_record()` is fail-safe on malformed JSON. 12 tests pass (7 alias-specific + 5 existing regression). MiniMax R1 review: 3 findings fixed, 2 defended via contract tests. Synced to Mac Mini; engine restarted as pid 13171.
+
+**Live functional validation deferred** — Mac Mini engine entered Q40-pattern Gateway↔IBKR-backend disconnect loop immediately on cold start (per `Warning 2110: Connectivity between TWS and server is broken`). Engine retry loop is exemplary (correct Q34 read-path bounded `wait_for` behavior — every cycle reaches `Synchronization complete` despite read timeouts), but engine never holds a stable post-init session long enough to execute the touch-`kill.flag` test. Validation runs after operator-driven IB Gateway restart on Mac Mini.
+
+### Bundle 5a m2.9 — cron-env hotfix
+
+**Symptom surfaced 2026-04-25 13:05 HKT during Q41 ship:** 8 consecutive `recovery_state_mismatch` Tier-1 alerts (`12:58:31` through `13:05:31`) failed to deliver from Mac Mini cron with `curl: (28) Connection timed out after 30s` and `telegram sendMessage failed: HTTP 000`. m2.9 detection was firing correctly; only delivery was broken.
+
+**Root cause (K2B architect diagnosis):** `invest-alert-tick.sh` is invoked by the `* * * * * /Users/fastshower/Projects/K2Bi/scripts/invest-alert-tick.sh >/dev/null 2>&1` cron line, which runs in a stripped environment that does NOT source `~/.zshenv`. The Phase 7 / L-2026-03-30-007 fix that put `HTTPS_PROXY=http://127.0.0.1:7897` in `~/.zshenv` only takes effect for interactive shells. The 12:33 deployment test ping landed because it was operator-fired from a manual ssh shell (had `HTTPS_PROXY` from `.zshenv`). The cron-fired path was never validated end-to-end.
+
+**Verified at diagnosis time:** Direct `curl -x http://127.0.0.1:7897 https://api.telegram.org/` from Mac Mini returned HTTP 302 in <1s. Clash Verge proxy was healthy throughout. Telegram was reachable. Only the env-var inheritance path was broken.
+
+**Fix shape (`scripts/invest-alert-tick.sh` 8-line addition between `.env` source block and classifier call):** `export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"` plus `HTTP_PROXY` and `NO_PROXY` with the same `${VAR:-default}` pattern. Idempotent on hosts that already have `HTTPS_PROXY` set; defaults to Clash port 7897 (Mini's documented config) when absent.
+
+**Validation evidence (2026-04-25 13:19 HKT):** First post-fix cron tick logged `2026-04-25T13:19:03+08:00 SENT: recovery_state_mismatch tier=1` followed by `SENT: disconnect_status tier=1` (×2) and `SENT: engine_stopped tier=1`. Backlog drained to Telegram K2Bi Alerts group within one tick. m2.9 cron-environment delivery now production-validated.
+
+**Review:** No K2Bi-side `/invest-ship` adversarial review run. K2B-architect-direct fix path used per Keith's explicit override of "no direct commits to K2Bi from K2B" rule for this operational hotfix. Mechanically obvious 8-line bash change, fix verified working in production within 60s of landing. Acknowledged single pass of architect judgment instead of dual-reviewer normally required for K2Bi changes — recorded as exception for ops/alerting hotfix scope, not a precedent for capital-path code.
+
+### Follow-ups
+
+- **Operator action: restart IB Gateway on Mac Mini** to clear the Q40-pattern outage loop currently in flight. Engine will reconnect cleanly once IBKR-backend is reachable. m2.9 will deliver the recovery sequence to K2Bi Alerts as it happens — first end-to-end production drill of the alerting pipeline.
+- **Q41 live functional validation** (post-Gateway-restart): `ssh macmini 'touch ~/Projects/K2Bi-Vault/System/kill.flag'` → wait 35s → engine STOPPED via `kill_switch_triggered` → m2.9 fires Tier-2 alert → `rm` alias → restart engine.
+- **Bundle 5a finding (z) added to `upcoming-sessions.md`** — cron-env vs interactive-shell delivery distinction must be in `/invest-ship` validation discipline for any cron-triggered Telegram-emitting script. Plus a separate sub-bullet on Telegram-as-single-channel + Clash-as-SPOF architectural fragility (lower priority, pre-Phase-3.10 burn-in).
+- **K2B-side learning logged at L-2026-04-25-002** — cron environment never sources interactive shell rc files; always export proxy env vars explicitly in any cron script that does network I/O.
+
+### Key decisions
+
+- **Hotfix scope strictly limited to the 8-line proxy export.** Did not refactor `send-telegram.sh` to use explicit `-x` flag (would work but spreads the proxy knowledge to a second site). Did not move `HTTPS_PROXY` into the project `.env` (mixing host-config with secrets). The `${VAR:-default}` pattern keeps the script portable to any future host that doesn't need a proxy while making the Mini default explicit and self-documenting.
+- **Did NOT open a Q34 fix session despite Kimi's earlier diagnosis pointing there.** Architect read of the live engine log on Mac Mini showed Q34 read-path bounded `wait_for` IS firing correctly — every cycle reaches `Synchronization complete` despite the timeouts. The actual root cause is Q40 (Gateway↔IBKR-backend disconnect, `Warning 2110`), not a Q34 init failure. Q34 finding (r) (write-path deferred) remains correctly open; today's symptom does NOT trigger it.
+- **Phase 3.7 m2.13 invest-screen MVP NOT next.** Originally queued as next ship, but architect call: do not ship m2.13 into a non-functional engine environment. Revised queue: operator Gateway restart → Q41 live validation → Phase 3.7 m2.13.
+
+
 ## 2026-04-24 -- Q43 hotfix: marketPrice is a method not an attribute (Mac Mini engine cold-start crash)
 
 **Commit:** `89bfd6b` fix(connectors): Q43 marketPrice is a method not an attribute (defense-in-depth Decimal convert)
