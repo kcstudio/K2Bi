@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,23 +70,81 @@ def _validate_slug(slug: str) -> None:
 
 DEFAULT_KILL_PATH = Path.home() / "Projects" / "K2Bi-Vault" / "System" / ".killed"
 
+# Q41 belt-and-suspenders alias: Syncthing dotfile-ignore may drop `.killed`;
+# `kill.flag` (no leading dot) propagates reliably while preserving the
+# canonical path for backward compatibility.
+DEFAULT_KILL_PATH_ALIAS = Path.home() / "Projects" / "K2Bi-Vault" / "System" / "kill.flag"
+
 # Per-strategy retirement sentinels share the `.killed` parent directory:
 # vault-side under System/ so Syncthing replicates them to the Mac Mini
 # Trader tier. Sentinel files are named `.retired-<slug>`.
 DEFAULT_RETIRED_DIR = Path.home() / "Projects" / "K2Bi-Vault" / "System"
 
 
+def _check_kill_path(path: Path) -> tuple[bool, Path | None]:
+    """Return (is_active, triggering_path).
+
+    A symlinked path is rejected (containment) and treated as NOT active.
+    Uses a single lstat() to avoid TOCTOU between existence and symlink
+    checks. Both canonical and alias paths share this helper.
+    """
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return False, None
+    if stat.S_ISLNK(st.st_mode):
+        LOG.warning(
+            "kill path %s is a symlink; rejecting (containment)", path
+        )
+        return False, None
+    return True, path
+
+
+def _scan_kill_paths() -> tuple[bool, Path | None]:
+    """Check canonical then alias. Returns (active, trigger_path).
+
+    Centralised so is_killed and assert_not_killed cannot drift.
+    """
+    active, trigger = _check_kill_path(DEFAULT_KILL_PATH)
+    if active:
+        LOG.info("kill switch active (canonical): %s", trigger)
+        return True, trigger
+    active, trigger = _check_kill_path(DEFAULT_KILL_PATH_ALIAS)
+    if active:
+        LOG.info("kill switch active (alias): %s", trigger)
+        return True, trigger
+    return False, None
+
+
 def is_killed(path: Path | None = None) -> bool:
-    target = path or DEFAULT_KILL_PATH
-    return target.exists()
+    # Backward compat: explicit path override checks only that path.
+    if path is not None:
+        active, _ = _check_kill_path(path)
+        return active
+    active, _ = _scan_kill_paths()
+    return active
 
 
 def read_kill_record(path: Path | None = None) -> dict[str, Any] | None:
+    """Return parsed record, or None on missing / unreadable / malformed.
+
+    Fail-safe: malformed JSON returns None rather than raising, matching
+    read_retired_record semantics. The file's EXISTENCE is the gate signal;
+    its contents are for audit only.
+    """
     target = path or DEFAULT_KILL_PATH
     if not target.exists():
         return None
-    with target.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with target.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning(
+            "kill record %s unreadable (%s); treating as None",
+            target,
+            type(exc).__name__,
+        )
+        return None
 
 
 def write_killed(
@@ -167,9 +226,15 @@ class KillSwitchActiveError(RuntimeError):
 
 
 def assert_not_killed(path: Path | None = None) -> None:
-    target = path or DEFAULT_KILL_PATH
-    if target.exists():
-        raise KillSwitchActiveError(path=target, record=read_kill_record(target))
+    # Backward compat: explicit path override checks only that path.
+    if path is not None:
+        active, trigger = _check_kill_path(path)
+        if active:
+            raise KillSwitchActiveError(path=trigger, record=read_kill_record(trigger))
+        return
+    active, trigger = _scan_kill_paths()
+    if active:
+        raise KillSwitchActiveError(path=trigger, record=read_kill_record(trigger))
 
 
 # ---------- per-strategy retirement sentinels (Bundle 3 m2.17, Q7) ----------

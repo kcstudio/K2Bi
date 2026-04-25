@@ -1051,3 +1051,18 @@ feat(alert): journal-poll Telegram alerting pipeline.
 - Deployed to Mac Mini (scripts + skills categories).
 - Cron active: `* * * * *` tick every minute.
 - Test alert sent to production chat ID successfully.
+
+## 2026-04-25 -- Q41 kill-switch kill.flag alias
+
+feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
+- `DEFAULT_KILL_PATH_ALIAS` added; `_check_kill_path()` uses lstat() for
+  TOCTOU-safe symlink containment; `_scan_kill_paths()` centralises dual-path
+  logic for `is_killed()` + `assert_not_killed()`.
+- `read_kill_record()` now fail-safe on malformed JSON (matches
+  `read_retired_record()` semantics).
+- 12 tests (7 new + 5 existing regression), all passing.
+- Commit: `e8461a9`
+- Deployed to Mac Mini (execution category).
+- Engine restart attempted; Q34 broker-API timeouts block init completion,
+  so live functional validation of alias path deferred. kill.flag removed.
+- Q34 diagnosis scoped to separate session per architect discipline.
