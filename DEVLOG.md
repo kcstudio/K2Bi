@@ -43,6 +43,10 @@
 - Ship 3: News-feed integration, attention-score auto-population, scheduled refresh
 - `/sync` to VPS deferred until next routine deploy cycle
 
+### Q42 orphan trim (post-ship hygiene)
+
+Original Ship 1 commit (`295d898`) inadvertently included `.tmp/plans/2026-04-26-Q42-orphan-stop-adoption.md`, which belongs to the parallel K2Bi-Opus Q42 session, not invest-narrative. Removed via `git rm` and added `.tmp/` to `.gitignore` to block recurrence. No functional change to Ship 1 skill or theme file.
+
 ## 2026-04-25 -- Phase 3.9 Stage 2 SHIPPED -- skill+script retargeting Mac Mini -> Hostinger VPS + Kimi-backed reviewer prose consistency + finding #2 backport (${VAR:-} -> ${VAR-} cron-env trap fix); R2 P1 #1 fixed (AGENTS.md back to excludes), R2 P1 #2 defended via documentation (false positive, verified via executable bash test), R2 #3 escalated by R3 to P1 -> Path 3 hardening applied (restart failure now FATAL to deploy, sentinel does not advance on failed restart); R2 P2 #4 + #5 documented as design decisions
 
 **Commit:** `a6cc226` Phase 3.9 Stage 2 SHIPPED -- skill+script retargeting Mac Mini -> Hostinger VPS + Kimi-backed reviewer prose consistency + finding #2 backport (${VAR:-} -> ${VAR-} cron-env trap fix); R2 P1 #1 fixed (AGENTS.md back to excludes), R2 P1 #2 defended via documentation (false positive, verified via executable bash test), R2 #3 escalated by R3 to P1 -> Path 3 hardening applied (restart failure now FATAL to deploy, sentinel does not advance on failed restart); R2 P2 #4 + #5 documented as design decisions
