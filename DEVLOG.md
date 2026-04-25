@@ -1186,3 +1186,39 @@ feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
 - **Stage 4**: Mac Mini K2Bi nuke (kill remaining K2Bi pm2 if any, remove K2Bi-Vault from Mini Syncthing peer list, delete K2Bi files from Mini disk).
 
 **Position state at ship time:** SPY 2 @ 707.72 cost basis, broker-held STOP 1888063981 GTC at $697.13. VPS engine pid 9033 owns the connection. Mini engine fully terminated.
+
+
+## 2026-04-25 -- Phase 3.9 Stage 4 SHIPPED -- Mac Mini K2Bi physically removed; VPS-only K2Bi infrastructure live; Phase 3.9 fully CLOSED
+
+**Commit:** `a82bb2e` chore: Phase 3.9 Stage 4 SHIPPED -- Mac Mini K2Bi physically removed; VPS-only K2Bi infrastructure live; Phase 3.9 fully CLOSED
+
+**What shipped (operational, not in repo):** Mac Mini K2Bi nuke executed 2026-04-25 ~midnight HKT per architect runbook `K2Bi-Vault/wiki/planning/phase-3.9-stage4-mac-mini-nuke-runbook.md`. K2Bi-Vault folder removed from Mini Syncthing UI via tunneled `:8385` (no GUI password prompt -- Keith's prior browser session had cached auth). `~/Projects/K2Bi` (167M) and `~/Projects/K2Bi-Vault` (1.7M) deleted from Mini disk. K2B compute stack untouched (k2b-remote, k2b-observer-loop, k2b-dashboard, K2B-Vault Syncthing peer, ib-gateway / IBC / Jts residue). Cross-machine kill.flag round-trip validated end-to-end on the new 2-way MacBook <-> VPS topology: ~9s MacBook->VPS arrival, ~6s VPS->MacBook removal; engine PID 12043 survived the kill.flag detection cycle without crash. Step 3 (optional IB Gateway uninstall on Mini) SKIPPED -- Mini's `~/Jts/` and `~/ibc/` may be K2B-shared experimentation residue; safer to leave intact.
+
+**What shipped (in this commit):** `.gitignore` only -- adds `logs/` runtime ignore (mirrors K2B 9ff5dfc fix for Codex working-tree pre-flight EISDIR hazard) and `.kimi/` (Kimi handoff job specs, local-only). Both leftover from Stage 1/2 work, never committed.
+
+**Stage 3 closure context:** Verdict PASS at 2026-04-25 23:50 HKT via VPS systemd timer `k2bi-stage3-check.timer`, rescheduled same-evening from 13:00 UTC 2026-04-26 to 15:50 UTC 2026-04-25 per architect call. The 24h wait was unnecessary after 6h+ stable runtime, and the original 13:00 UTC timer would not have covered the 11:40 HKT Sunday IBC daily restart anyway -- so the reschedule lost no load-bearing test. Rule captured as L-2026-04-25-007.
+
+**Vault planning docs already updated by K2B architect side (synced via Syncthing before this ship):**
+- `mac-mini-engine-migration.md`: SUPERSEDED banner extended with closure paragraph
+- `index.md`: Resume Card Forward sequence updated to Phase 3.9 fully CLOSED
+- `milestones.md`: Phase 3 row 3.9 Stages 3+4 marked done
+- `feature_vps-migration.md`: Steps 6+7 done + section closure line
+
+**Pre-ship cleanup (this session, not in commit):**
+- Deleted obsolete `proposals/2026-04-24_invest-screen-m213-session-plan.md` (superseded by 2026-04-25 m2.13 re-scope to reader/enricher).
+- Deleted defunct `.pending-sync/20260425T114124_2e155fe_34029c2c.json` (Mini-targeted; Mini decommissioned this stage).
+
+**Codex pre-commit review:** APPROVE in 51s (Codex R1, no fallback). Zero material findings. One non-blocking suggestion deferred: replace external K2B sha `9ff5dfc` reference in the `.gitignore` comment with a local pointer to `scripts/lib/review_runner.py`'s documented EISDIR hazard. Cosmetic; not load-bearing.
+
+**Feature status change:** no feature note this session (`--no-feature`); Phase 3.9 vault tracking lives in `K2Bi-Vault/wiki/planning/feature_vps-migration.md`, already updated by architect side.
+
+**Follow-ups:**
+- Optional cosmetic edit to `.gitignore` comment (Codex deferred suggestion). Trivial; can ride along the next chore commit that touches `.gitignore`.
+- Post-3.9 parallel-queue activation: Phase 3.6.5 invest-narrative Ship 1, Q42 orphan-STOP adoption, Bundle 5 remainder, invest-narrative Ship 2 (K2B architect side will confirm sequencing in a separate session).
+- Operational: K2Bi engine on VPS continues unattended; daily IBC restart at 11:40 HKT Sunday is the next stress event to monitor.
+
+**Key decisions:**
+- `--no-feature` ship variant chosen because the only file in the repo diff is `.gitignore` (config-class), and the feature note for Phase 3.9 lives in the vault rather than `wiki/concepts/`. Architect runbook is authoritative for the operational state, not a repo-side feature note.
+- Deferred (not applied) the Codex cosmetic suggestion. The K2B sha reference is informative for sibling-repo cross-referencing, and the local code pointer can be added cheaply on a later edit. Auto-mode action vs interruption tradeoff favored ship-as-spec'd.
+- Kept Mini's `~/Jts/` and `~/ibc/` intact rather than uninstalling IB Gateway -- conservative call given uncertainty about K2B-side shared usage. If K2B side wants them gone, it owns that operation.
+
