@@ -526,6 +526,144 @@ up: "[[index]]"{ark_block}
                 promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
             self.assertIn("Refusing to overwrite", str(ctx.exception))
 
+    def test_promote_conflict_raises_on_different_reasoning(self):
+        """m2.22 F2: an existing promoted file with different Ship-2 fields
+        is a conflict, NOT idempotent state."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            # Pre-stage a watchlist file as if a different theme had promoted LRCX
+            # with completely different reasoning.
+            watchlist_path = td_path / "wiki" / "watchlist" / "LRCX.md"
+            watchlist_path.parent.mkdir(parents=True, exist_ok=True)
+            watchlist_path.write_text(
+                "---\n"
+                "tags: [watchlist, k2bi]\n"
+                "date: 2026-04-25\n"
+                "type: watchlist\n"
+                "origin: k2bi-extract\n"
+                "up: \"[[index]]\"\n"
+                "symbol: LRCX\n"
+                "status: promoted\n"
+                "schema_version: 1\n"
+                "narrative_provenance: \"[[macro-themes/theme_other]]\"\n"
+                "reasoning_chain: \"completely different reasoning from a different theme\"\n"
+                "citation_url: \"https://other.example.com\"\n"
+                "order_of_beneficiary: 1\n"
+                "ark_6_metric_initial_scores: {}\n"
+                "---\n"
+                "# Watchlist: LRCX\n"
+            )
+            with self.assertRaises(ValueError) as ctx:
+                promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+            msg = str(ctx.exception)
+            self.assertIn("Conflict", msg)
+            self.assertIn("narrative_provenance", msg)
+            self.assertIn("reasoning_chain", msg)
+
+    def test_promote_idempotent_only_when_ship2_fields_match(self):
+        """m2.22 F2: an existing promoted file with byte-for-byte matching
+        Ship-2 fields IS idempotent."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            # First promote creates the canonical file.
+            promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+            # Second promote against the SAME theme must succeed (idempotent).
+            result = promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+            self.assertTrue(result.exists())
+
+    def test_promote_rolls_back_watchlist_on_index_failure(self):
+        """m2.22 F3: if the watchlist-index update fails after the
+        watchlist file is created, the file must be unlinked so the
+        operator does not see a half-committed state."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            watchlist_path = td_path / "wiki" / "watchlist" / "LRCX.md"
+
+            with patch(
+                "scripts.lib.invest_narrative_pipeline._update_watchlist_index",
+                side_effect=RuntimeError("simulated index failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+
+            self.assertFalse(
+                watchlist_path.exists(),
+                "Watchlist file should have been rolled back on index failure",
+            )
+
+    def test_promote_rolls_back_index_and_watchlist_on_theme_failure(self):
+        """m2.22 F3: if the theme-log append fails, both the watchlist
+        file AND the index update must be rolled back to pre-promote
+        state."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            watchlist_path = td_path / "wiki" / "watchlist" / "LRCX.md"
+            index_path = td_path / "wiki" / "watchlist" / "index.md"
+
+            with patch(
+                "scripts.lib.invest_narrative_pipeline._append_promotion_to_theme",
+                side_effect=RuntimeError("simulated theme-log failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+
+            self.assertFalse(
+                watchlist_path.exists(),
+                "Watchlist file should have been rolled back",
+            )
+            # Index did not exist before promote; it must not exist after rollback either.
+            self.assertFalse(
+                index_path.exists(),
+                "Watchlist index should have been rolled back to pre-promote state",
+            )
+
+    def test_promote_preserves_existing_index_on_theme_failure(self):
+        """m2.22 F3: when an index already exists with prior rows, a
+        rollback must restore the prior bytes byte-for-byte (not delete
+        the index)."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            # Pre-stage an index with an unrelated symbol.
+            index_path = td_path / "wiki" / "watchlist" / "index.md"
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            prior_index = (
+                "---\n"
+                "tags: [watchlist, index, k2bi]\n"
+                "date: 2026-04-25\n"
+                "type: index\n"
+                "origin: k2bi-generate\n"
+                "up: \"[[index]]\"\n"
+                "---\n\n"
+                "# Watchlist Index\n\n"
+                "| Symbol | Date | Status |\n|---|---|---|\n"
+                "| [[NVDA]] | 2026-04-25 | screened |\n"
+            )
+            index_path.write_text(prior_index)
+
+            with patch(
+                "scripts.lib.invest_narrative_pipeline._append_promotion_to_theme",
+                side_effect=RuntimeError("simulated theme-log failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+
+            self.assertTrue(index_path.exists(), "Pre-existing index must survive rollback")
+            self.assertEqual(
+                index_path.read_text(),
+                prior_index,
+                "Index must be restored byte-for-byte",
+            )
+
 
 class CliTests(unittest.TestCase):
     @patch("scripts.lib.invest_narrative_pipeline.promote_to_watchlist")

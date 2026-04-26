@@ -24,6 +24,7 @@ import yaml
 
 from scripts.lib.invest_ship_strategy import resolve_vault_root
 from scripts.lib.strategy_frontmatter import atomic_write_bytes, parse as parse_frontmatter
+from scripts.lib.watchlist_index import update_watchlist_index
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -309,6 +310,60 @@ def _validate_stage1_status(fm: dict, path: Path) -> None:
         )
 
 
+def _validate_stage1_values(fm: dict, path: Path) -> None:
+    """Fail loud if Ship-2-owned Stage-1 fields are present but malformed.
+
+    Key-presence is checked separately by ``_validate_stage1_presence``.
+    This pass guards against null, wrong type, empty string, or
+    out-of-range values surviving the Ship 2 ``--promote`` writer and
+    being silently canonized into a ``screened`` Stage-2 file.
+    """
+    errors: list[str] = []
+
+    symbol = fm.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip():
+        errors.append(f"symbol: expected non-empty string, got {symbol!r}")
+    else:
+        expected = path.stem.upper()
+        if symbol.strip().upper() != expected:
+            errors.append(
+                f"symbol: file path stem is {expected!r} but frontmatter has {symbol!r}"
+            )
+
+    provenance = fm.get("narrative_provenance")
+    if not isinstance(provenance, str) or not provenance.strip():
+        errors.append(
+            f"narrative_provenance: expected non-empty string, got {provenance!r}"
+        )
+
+    reasoning = fm.get("reasoning_chain")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        errors.append(
+            f"reasoning_chain: expected non-empty string, got {reasoning!r}"
+        )
+
+    citation = fm.get("citation_url")
+    if not isinstance(citation, str) or not citation.strip():
+        errors.append(f"citation_url: expected non-empty string, got {citation!r}")
+
+    order = fm.get("order_of_beneficiary")
+    if not isinstance(order, int) or isinstance(order, bool) or order not in (1, 2, 3):
+        errors.append(
+            f"order_of_beneficiary: expected int in (1, 2, 3), got {order!r}"
+        )
+
+    ark_scores = fm.get("ark_6_metric_initial_scores")
+    if ark_scores is not None and not isinstance(ark_scores, dict):
+        errors.append(
+            f"ark_6_metric_initial_scores: expected dict or null, got {type(ark_scores).__name__}"
+        )
+
+    if errors:
+        raise ValueError(
+            f"Stage-1 value validation failed for {path.name}: " + "; ".join(errors)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Frontmatter mutation (preserves Stage-1 fields byte-for-byte)
 # ---------------------------------------------------------------------------
@@ -396,40 +451,10 @@ def _build_manual_stub(symbol: str, stage2_data: dict, date: str) -> bytes:
 
 
 def _update_watchlist_index(vault: Path, symbol: str, date: str, status: str) -> None:
-    index_path = vault / "wiki" / "watchlist" / "index.md"
-    entry_line = f"| [[{symbol}]] | {date} | {status} |"
-
-    if index_path.exists():
-        content = index_path.read_text()
-        if f"| [[{symbol}]]" in content:
-            return
-        lines = content.splitlines()
-        insert_pos = len(lines)
-        in_table = False
-        for i, line in enumerate(lines):
-            if line.startswith("| Symbol"):
-                in_table = True
-            elif in_table and not line.startswith("|"):
-                insert_pos = i
-                break
-        lines.insert(insert_pos, entry_line)
-        new_content = "\n".join(lines) + "\n"
-    else:
-        frontmatter = {
-            "tags": ["watchlist", "index", "k2bi"],
-            "date": date,
-            "type": "index",
-            "origin": "k2bi-generate",
-            "up": "[[index]]",
-        }
-        fm_lines = ["---"]
-        fm_lines.extend(yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True).splitlines())
-        fm_lines.append("---")
-        new_content = "\n".join(fm_lines) + "\n\n# Watchlist Index\n\n"
-        new_content += "| Symbol | Date | Status |\n|---|---|---|\n"
-        new_content += entry_line + "\n"
-
-    atomic_write_bytes(index_path, new_content.encode("utf-8"))
+    """Backwards-compatible thin shim. New code should call
+    ``scripts.lib.watchlist_index.update_watchlist_index`` directly.
+    """
+    update_watchlist_index(vault, symbol, date, status)
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +497,11 @@ def enrich(
                 f"--re-enrich requires status 'screened', got {current_status!r}"
             )
         _validate_stage1_presence(fm, watchlist_path)
+        _validate_stage1_values(fm, watchlist_path)
     else:
         _validate_stage1_presence(fm, watchlist_path)
         _validate_stage1_status(fm, watchlist_path)
+        _validate_stage1_values(fm, watchlist_path)
 
     stage1_context = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
     validated = _score_symbol(symbol, stage1_context, "none provided", call_fn)

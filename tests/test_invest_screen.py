@@ -18,6 +18,7 @@ from scripts.lib.invest_screen import (
     _validate_llm_output,
     _validate_stage1_presence,
     _validate_stage1_status,
+    _validate_stage1_values,
     enrich,
     main,
     manual_promote,
@@ -322,6 +323,91 @@ class ValidateStage1Tests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _validate_stage1_status(fm, Path("/vault/wiki/watchlist/LRCX.md"))
         self.assertIn("expected status 'promoted'", str(ctx.exception))
+
+
+class ValidateStage1ValuesTests(unittest.TestCase):
+    """Stage-1 value integrity (m2.22 F1): key presence is not enough --
+    null/empty/wrong-type values from a corrupted Ship-2 write must be
+    rejected before they reach the LLM prompt."""
+
+    def _valid_fm(self) -> dict:
+        return {
+            "symbol": "LRCX",
+            "narrative_provenance": "[[macro-themes/theme_x]]",
+            "reasoning_chain": "real reasoning text",
+            "citation_url": "https://example.com",
+            "order_of_beneficiary": 2,
+            "ark_6_metric_initial_scores": {},
+        }
+
+    def test_valid_passes(self):
+        _validate_stage1_values(self._valid_fm(), Path("/vault/wiki/watchlist/LRCX.md"))
+
+    def test_null_field_raises(self):
+        fm = self._valid_fm()
+        fm["reasoning_chain"] = None
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("reasoning_chain", str(ctx.exception))
+
+    def test_empty_string_raises(self):
+        fm = self._valid_fm()
+        fm["citation_url"] = "   "
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("citation_url", str(ctx.exception))
+
+    def test_wrong_type_raises(self):
+        fm = self._valid_fm()
+        fm["narrative_provenance"] = 42
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("narrative_provenance", str(ctx.exception))
+
+    def test_order_out_of_range_raises(self):
+        fm = self._valid_fm()
+        fm["order_of_beneficiary"] = 5
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("order_of_beneficiary", str(ctx.exception))
+
+    def test_order_bool_raises(self):
+        # bool is a subclass of int in Python; reject it explicitly.
+        fm = self._valid_fm()
+        fm["order_of_beneficiary"] = True
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("order_of_beneficiary", str(ctx.exception))
+
+    def test_symbol_path_mismatch_raises(self):
+        fm = self._valid_fm()
+        fm["symbol"] = "TSLA"
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("LRCX", str(ctx.exception))
+
+    def test_ark_scores_wrong_type_raises(self):
+        fm = self._valid_fm()
+        fm["ark_6_metric_initial_scores"] = "not a dict"
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        self.assertIn("ark_6_metric_initial_scores", str(ctx.exception))
+
+    def test_ark_scores_null_passes(self):
+        # Null is permitted -- pipeline.py:605 already coalesces to {}.
+        fm = self._valid_fm()
+        fm["ark_6_metric_initial_scores"] = None
+        _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+
+    def test_collects_multiple_errors(self):
+        fm = self._valid_fm()
+        fm["citation_url"] = ""
+        fm["order_of_beneficiary"] = 9
+        with self.assertRaises(ValueError) as ctx:
+            _validate_stage1_values(fm, Path("/vault/wiki/watchlist/LRCX.md"))
+        msg = str(ctx.exception)
+        self.assertIn("citation_url", msg)
+        self.assertIn("order_of_beneficiary", msg)
 
 
 # ---------------------------------------------------------------------------
