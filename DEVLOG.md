@@ -1,3 +1,19 @@
+## 2026-04-26 -- propagate handlers: dynamic m2.22 gate phrasing
+
+**Commit:** `9812771` fix(propagate): replace M2_22_GATE_DESCRIPTION constant with dynamic helper
+
+**What shipped:** Replaced the `M2_22_GATE_DESCRIPTION = "gates on m2.13"` constant in `scripts/lib/propagate_handlers.py` with `_m22_gate_phrase(text)` that reads m2.13's status from the Phase 3 table and m2.22's status from the Bundle 5 table, returning the appropriate phrase. Three branches: m2.22 shipped → drop the slot from output; m2.13 shipped + m2.22 pending → "READY (m2.13 ✅; awaits architect greenlight)"; m2.13 not shipped → "gates on m2.13" (unchanged). Wired into `render_phase3_status`, `render_bundle5_status`, and `render_next_concrete_action` so all three handlers stay consistent. Today's output flips across all 14 mirror-doc fences. Idempotency re-verified.
+
+**Codex review:** skipped (one-file ~5-line helper change with full unit-test coverage for all three branches per SKILL.md "one-line/comment-only changes" exception).
+
+**Feature status change:** none.
+
+**Follow-ups:** none. Architect raised the staleness right after the bootstrap ship landed; this fix completes the propagation system's "derived prose reflects current source-of-truth" guarantee.
+
+**Key decisions:** none divergent from architect's recommended patch shape.
+
+---
+
 ## 2026-04-26 -- review.sh usage gotcha + L-2026-04-26-002
 
 **Commit:** `b85b5db` docs(review): pin shell env-prefix gotcha in scripts/review.sh usage block
