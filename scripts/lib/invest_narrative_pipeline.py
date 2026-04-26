@@ -715,25 +715,52 @@ def promote_to_watchlist(
 
             _append_promotion_to_theme(theme_file_path, symbol, today)
         except Exception as exc:
-            # Rollback under the same per-symbol lock that wraps the
-            # transaction. Index compensation re-reads under the index
-            # lock and removes only this symbol's row, so concurrent
-            # writers' rows are not stomped (m2.22 N2 fix).
+            # Rollback ordering matters when a compensator itself fails
+            # (m2.22 N3 fix). Unlink the watchlist file FIRST: the file
+            # is the ground-truth gate that other ops check via
+            # ``watchlist_path.exists()``. Then remove the index row.
+            # If unlink fails: file + index row + (maybe) theme-log
+            # remain -- operator re-runs promote and either F2's
+            # conflict detection raises a clear error, or the
+            # idempotent path completes the recovery. If unlink
+            # succeeds but index-row removal fails: file gone +
+            # phantom index row -- operator re-runs promote and
+            # update_watchlist_index's `if symbol in content: return`
+            # guard self-heals. Either single-step rollback failure
+            # therefore converges via the next promote attempt rather
+            # than stranding silent split-brain.
             rollback_errors: list[str] = []
+            file_unlinked = True
+            if watchlist_written:
+                try:
+                    watchlist_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception as rb_exc:
+                    file_unlinked = False
+                    rollback_errors.append(f"watchlist unlink: {rb_exc}")
             if index_written:
                 try:
                     remove_watchlist_index_row(vault, symbol)
                 except Exception as rb_exc:
                     rollback_errors.append(f"index row removal: {rb_exc}")
-            if watchlist_written:
-                try:
-                    watchlist_path.unlink()
-                except Exception as rb_exc:
-                    rollback_errors.append(f"watchlist unlink: {rb_exc}")
             if rollback_errors:
+                if not file_unlinked:
+                    recovery_hint = (
+                        "Watchlist file remains; re-running promote will "
+                        "hit F2 conflict detection or complete via the "
+                        "idempotent path."
+                    )
+                else:
+                    recovery_hint = (
+                        "Watchlist file removed; index row remains. "
+                        "Re-running promote will self-heal via "
+                        "update_watchlist_index's idempotent guard."
+                    )
                 raise RuntimeError(
-                    f"Promote failed (root cause below) AND rollback failed: "
+                    f"Promote failed AND rollback partially failed: "
                     + "; ".join(rollback_errors)
+                    + f". Recovery: {recovery_hint}"
                 ) from exc
             raise
 

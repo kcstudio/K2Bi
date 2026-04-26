@@ -627,6 +627,54 @@ up: "[[index]]"{ark_block}
             content = index_path.read_text()
             self.assertNotIn("| [[LRCX]]", content)
 
+    def test_promote_rollback_partial_failure_self_heals_on_retry(self):
+        """m2.22 N3: when both the promote AND its index-row-removal
+        rollback fail, the next promote attempt converges to clean
+        state via update_watchlist_index's idempotent guard rather
+        than stranding split-brain."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            theme_path = td_path / "wiki" / "macro-themes" / "theme_ai-compute-demand.md"
+            self._make_theme_file(theme_path)
+            watchlist_path = td_path / "wiki" / "watchlist" / "LRCX.md"
+            index_path = td_path / "wiki" / "watchlist" / "index.md"
+
+            # Force theme-append to fail AND force the rollback's
+            # remove_watchlist_index_row to ALSO fail. The new
+            # ordering unlinks the file FIRST, so after the failed
+            # promote we expect: no watchlist file, phantom index row.
+            with patch(
+                "scripts.lib.invest_narrative_pipeline._append_promotion_to_theme",
+                side_effect=RuntimeError("simulated theme failure"),
+            ), patch(
+                "scripts.lib.invest_narrative_pipeline.remove_watchlist_index_row",
+                side_effect=RuntimeError("simulated rollback failure"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+                self.assertIn("self-heal", str(ctx.exception))
+
+            self.assertFalse(watchlist_path.exists(), "Unlink succeeded; file should be gone")
+            self.assertTrue(index_path.exists())
+            self.assertIn(
+                "| [[LRCX]]",
+                index_path.read_text(),
+                "Phantom row remains after rollback removal failed",
+            )
+
+            # Retry: the idempotent guard inside update_watchlist_index
+            # sees the existing row and no-ops on the index step,
+            # while the new watchlist file write succeeds. Theme append
+            # is no longer mocked-to-fail.
+            result = promote_to_watchlist("LRCX", theme_path, vault_root=td_path)
+            self.assertTrue(result.exists(), "Retry must self-heal the watchlist file")
+            content = index_path.read_text()
+            self.assertEqual(
+                content.count("| [[LRCX]]"),
+                1,
+                "Idempotent guard should not duplicate the row on retry",
+            )
+
     def test_promote_preserves_existing_index_on_theme_failure(self):
         """m2.22 F3 + N2: when an index already has rows, rollback must
         leave the unrelated rows intact while removing only this
