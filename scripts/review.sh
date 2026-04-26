@@ -19,6 +19,19 @@
 #   scripts/review.sh plan --plan plans/2026-04-19_foo.md
 #   scripts/review.sh files --files a.py,b.py --focus "regex safety"
 #
+# ENV VAR GOTCHA: shell vars used in --files / --focus values must be set
+# on a SEPARATE line BEFORE invocation, NOT via env-prefix on the same
+# command line as the script call. The shell expands "$FILES" against the
+# CURRENT shell's namespace before applying any env-prefix, so an inline
+# `FILES=... ./scripts/review.sh ... --files "$FILES"` puts an empty
+# string into --files and the wrapper silently launches without scope.
+#   GOOD: FILES="a.py,b.py"
+#         K2B_LLM_PROVIDER=minimax ./scripts/review.sh diff --files "$FILES"
+#   BAD:  K2B_LLM_PROVIDER=minimax FILES="a.py,b.py" \
+#           ./scripts/review.sh diff --files "$FILES"
+# Captured 2026-04-26 as L-2026-04-26-002 after a /invest-ship review
+# attempt landed on minimax-review.sh '--scope diff requires --files'.
+#
 # Common flags:
 #   --primary codex|minimax   default: codex
 #     (the 'minimax' flag value selects scripts/minimax-review.sh, which
