@@ -1,0 +1,31 @@
+{
+  "band_definition_version": 1,
+  "component_max": {
+    "technical": 40,
+    "fundamentals": 35,
+    "catalyst": 25
+  },
+  "sub_factors": {
+    "trend_alignment": {"max": 10, "component": "technical"},
+    "momentum": {"max": 8, "component": "technical"},
+    "volume_pattern": {"max": 7, "component": "technical"},
+    "pattern_quality": {"max": 8, "component": "technical"},
+    "key_level_proximity": {"max": 7, "component": "technical"},
+    "valuation": {"max": 8, "component": "fundamentals"},
+    "growth": {"max": 8, "component": "fundamentals"},
+    "profitability": {"max": 7, "component": "fundamentals"},
+    "balance_sheet": {"max": 6, "component": "fundamentals"},
+    "analyst": {"max": 6, "component": "fundamentals"},
+    "catalyst_clarity": {"max": 8, "component": "catalyst"},
+    "timeline": {"max": 6, "component": "catalyst"},
+    "sentiment": {"max": 5, "component": "catalyst"},
+    "rr_setup": {"max": 6, "component": "catalyst"}
+  },
+  "rating_bands": {
+    "A": {"min": 80, "max": 100},
+    "B": {"min": 65, "max": 79},
+    "C": {"min": 50, "max": 64},
+    "D": {"min": 35, "max": 49},
+    "F": {"min": 0, "max": 34}
+  }
+}
