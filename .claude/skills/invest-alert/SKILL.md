@@ -1,7 +1,7 @@
 ---
 name: invest-alert
 description: Push real-time signals to Keith via Telegram. Polls the decision journal for new events, classifies them into Tier 1 (critical) or Tier 2 (informational), and sends Telegram messages within 60 seconds. Used for disconnect outages, engine stops, recovery mismatches, order fills, cancellations, and kill-switch triggers. Phase 2 MVP uses a single Telegram chat; Phase 4 may add routing by event class. Use when Keith says /alert "<text>" to test-send, or automatically by other invest-* skills that detect an alert-worthy event.
-tier: Trader
+tier: trader
 phase: 2
 status: mvp
 ---

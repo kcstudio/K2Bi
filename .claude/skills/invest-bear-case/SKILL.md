@@ -1,7 +1,7 @@
 ---
 name: invest-bear-case
 description: Run a single adversarial Claude Code call against a thesis before any order ticket. Returns VETO (>70% conviction bear) or PROCEED (with top-3 counter-points). Adapted from AI Investing Lab's 2026 pattern; single call, not a standing agent, per agent-topology.md decision. Use when Keith says /bear <SYMBOL>, "bear-case this", "poke holes in this thesis", or automatically as gate before /invest-ship approves a strategy whose first trade is a specific ticker.
-tier: Analyst
+tier: analyst
 routines-ready: true
 phase: 2
 status: mvp

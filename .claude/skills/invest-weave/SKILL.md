@@ -1,6 +1,7 @@
 ---
 name: invest-weave
 description: Background cross-link weaver -- runs MiniMax M2.7 to find missing links between K2Bi wiki pages (tickers, sectors, strategies, macro-themes, playbooks) and drops proposals into the review queue. Use when Keith says /weave, "run weave", "find missing links", "propose cross-links", or when the scheduled cron task fires (Phase 4+).
+tier: analyst
 triggers:
   - /weave
   - weave run

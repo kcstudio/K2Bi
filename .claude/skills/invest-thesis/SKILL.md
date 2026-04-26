@@ -1,7 +1,7 @@
 ---
 name: invest-thesis
 description: Produce a ticker-level thesis using the Dave Ahern 4-phase framework (business model, competitive moat, financial quality, risks + valuation) plus the 5-dim thesis scorecard + fundamental sub-scoring + EV-weighted asymmetry block + Action Plan Summary. MVP runs one-shot via /research (NBLM-grounded variant lands in Phase 4 only if the experiment passes its 5 exit criteria). Output lands in wiki/tickers/<SYMBOL>.md frontmatter + body. Use when Keith says /thesis <SYMBOL>, "write a thesis on X", "generate thesis for X", "update thesis on X", or before a strategy is drafted that depends on a ticker.
-tier: Analyst
+tier: analyst
 routines-ready: true
 phase: 2
 status: mvp

@@ -1,6 +1,7 @@
 ---
 name: invest-session-wrapup
 description: Capture a conversation summary -- extracts decisions, action items, and insights into a K2Bi vault note. Use when Keith says /session-wrapup, "summarize this", "capture this", "save this conversation", or wants to save the key points from a research/trading session.
+tier: portfolio-manager
 ---
 
 # Invest Session Wrap-Up Capture

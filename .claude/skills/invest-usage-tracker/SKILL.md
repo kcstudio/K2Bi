@@ -1,6 +1,7 @@
 ---
 name: invest-usage-tracker
 description: Track K2Bi skill usage and trigger automated actions when thresholds are hit. Use when Keith says "check usage", "how often have I used", "usage stats", "trigger after N uses", or when any other invest skill needs to log its invocation. Also used by the session-start hook to check for threshold breaches.
+tier: utility
 ---
 
 # K2B Usage Tracker

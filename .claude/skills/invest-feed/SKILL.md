@@ -1,7 +1,7 @@
 ---
 name: invest-feed
 description: Scheduled RSS poller that lands raw items in raw/news/. Phase 2 MVP wires one source end-to-end to prove the polling pattern; additional sources (earnings calendar, SEC filings, macro releases) land in Phase 4 only if watchlist coverage gaps surface during burn-in. Use when Keith says /feed, "pull the feed", "show me the feed", or automatically via pm2 cron during market hours.
-tier: Trader
+tier: trader
 phase: 2
 status: stub
 ---

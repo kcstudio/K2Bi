@@ -1,7 +1,7 @@
 ---
 name: invest-execute
 description: Claude-side wrapper for the Python execution engine. Reads engine state from the vault (kill-switch, last decision journal entries, open positions), surfaces it to Keith, and can manually trigger a run of the engine's main loop. Does NOT call any validator or bypass; the engine owns all enforcement. Use when Keith says /execute, "run the engine", "what's the engine doing", "show me the last trades", "is the kill switch on".
-tier: Trader
+tier: trader
 phase: 2
 status: shipped
 ---

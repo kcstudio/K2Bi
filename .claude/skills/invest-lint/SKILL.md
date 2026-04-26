@@ -1,6 +1,7 @@
 ---
 name: invest-lint
 description: K2Bi vault health maintenance -- find and fix structural issues, keep indexes current, detect orphans and stale content across the trading research vault.
+tier: analyst
 triggers:
   - /lint
   - vault health check

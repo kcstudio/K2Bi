@@ -1,6 +1,7 @@
 ---
 name: invest-ship
 description: End-of-session shipping workflow -- runs Codex pre-commit review, commits, pushes, updates the feature note, updates wiki/concepts/index.md lane membership, appends DEVLOG.md and wiki/log.md, suggests next Backlog promotion, and reminds Keith to /sync. Use when Keith says /ship, "ship it", "wrap up", "end of session", "done shipping", or at the natural end of a build session where code was modified.
+tier: portfolio-manager
 ---
 
 # K2B Ship

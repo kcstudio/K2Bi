@@ -1,6 +1,7 @@
 ---
 name: invest-observer
 description: Harvest implicit preference signals from K2Bi vault behavior and synthesize a preference profile that other skills reference. This skill should be used when Keith says /observe, "what have you noticed", "check preferences", "review feedback", or on session-start/scheduled runs. It reads observer-loop analysis, review queue outcomes (trade-ideas, strategy-approvals, alerts, contradictions), revision patterns, and adoption rates to learn what Keith actually wants in his trading workflow without him having to say it explicitly.
+tier: analyst
 ---
 
 # Invest Observer

@@ -1,7 +1,7 @@
 ---
 name: invest-backtest
 description: Yfinance sanity-check backtest for a strategy spec. 2-year window, basic Sharpe / max-DD / win-rate. Explicitly NOT walk-forward (walk-forward harness is Phase 4 only, triggered by overfit signs during burn-in or when a second strategy needs it). Use when Keith says /backtest <strategy>, "backtest this", "sanity check the strategy on 2 years".
-tier: Analyst
+tier: analyst
 routines-ready: true
 phase: 2
 status: mvp

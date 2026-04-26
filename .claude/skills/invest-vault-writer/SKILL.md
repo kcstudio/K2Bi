@@ -1,6 +1,7 @@
 ---
 name: invest-vault-writer
 description: Create or update notes in the K2Bi Obsidian vault with correct frontmatter, cross-links, and MOC integration. Use when creating any new note in the vault, or when updating an existing note after progress is made on a ticker, strategy, sector, or trade. Also use when another skill (invest-journal, invest-compile, invest-session-wrapup) needs to create or update a linked note.
+tier: utility
 ---
 
 # K2Bi Vault Writer

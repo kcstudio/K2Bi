@@ -1,7 +1,7 @@
 ---
 name: invest-screen
 description: Manual ticker intake that writes to wiki/watchlist/ with a structured rubric (moat, balance sheet, thesis-fit, catalysts, risk flags). Phase 2 MVP takes ticker symbols from Keith directly; real multi-factor screening with data-feed input lands in Phase 4 only if watchlist coverage gaps surface during burn-in. Use when Keith says /screen <SYMBOL>, "add X to watchlist", "screen X", "put X on the watchlist with reason Y".
-tier: Analyst
+tier: analyst
 routines-ready: true
 phase: 2
 status: stub

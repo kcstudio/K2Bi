@@ -1,6 +1,7 @@
 ---
 name: invest-feedback
 description: Capture learnings, errors, and feature requests to make K2Bi smarter over time. This skill should be used when Keith says /learn, /error, /request, /feedback, "remember that", "don't do that again", "next time do X", "that broke", "something went wrong", "I wish you could", "can you do X" (and the answer is no), or any variation of teaching K2Bi, reporting a failure, or identifying a capability gap. For reviewing all captured feedback, use invest-improve (once built, currently via invest-feedback + invest-observer manual review).
+tier: utility
 ---
 
 # K2B Feedback Capture

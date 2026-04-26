@@ -1,6 +1,7 @@
 ---
 name: invest-autoresearch
 description: Run the Karpathy autoresearch self-improvement loop on K2Bi skills. Iteratively improves a target SKILL.md using binary assertions, git-based memory, and the commit-before-test pattern. Use when Keith says /autoresearch, "improve this skill", "run the loop", "optimize skill", "self-improve", or wants to iteratively enhance any K2Bi skill's output quality.
+tier: portfolio-manager
 ---
 
 # Invest Autoresearch

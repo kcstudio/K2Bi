@@ -1,6 +1,7 @@
 ---
 name: invest-compile
 description: Compile raw sources into wiki knowledge pages -- reads raw captures, identifies affected wiki pages, shows Keith a summary, updates wiki on approval. The knowledge compilation engine that turns filing into digestion for K2Bi.
+tier: portfolio-manager
 triggers:
   - /compile
   - compile this

@@ -1,6 +1,7 @@
 ---
 name: invest-sync
 description: Sync K2Bi project files to the Hostinger VPS -- detects what changed, syncs every category declared in scripts/deploy-config.yml (skills, execution, scripts, pm2 today; extensible), rebuilds on the VPS when the category needs it. Use when Keith says /sync, "sync to vps", "deploy to vps", "push to vps", or after K2Bi modifies project files tracked by the deploy config.
+tier: utility
 ---
 
 # K2Bi Sync to Hostinger VPS

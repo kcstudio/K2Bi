@@ -1,7 +1,7 @@
 ---
 name: invest-propose-limits
 description: Draft a proposed validator config change (position_size, trade_risk, leverage, market_hours, instrument_whitelist) and write it to review/strategy-approvals/ for Keith's explicit approval. Claude CANNOT edit execution/validators/config.yaml directly -- only this skill produces the delta, and only Keith lands it via /invest-ship. Use when Keith says "propose new limits", "widen position size", "allow ticker X", "tighten risk", "/propose-limits".
-tier: Portfolio Manager
+tier: portfolio-manager
 phase: 2
 status: shipped
 ---

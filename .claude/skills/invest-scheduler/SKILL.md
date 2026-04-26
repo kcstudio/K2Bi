@@ -1,6 +1,7 @@
 ---
 name: invest-scheduler
 description: Create, list, pause, resume, and delete persistent scheduled tasks for K2Bi. Use when Keith says /schedule, "schedule", "remind me", "set up a recurring", "every week do X", "run this daily", "automate", or wants any task to run on a timer. Handles both recurring cron schedules and one-time reminders. Backs onto K2B's shared k2b-remote scheduler service.
+tier: utility
 ---
 
 # K2Bi Scheduler (shared with K2B)

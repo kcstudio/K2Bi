@@ -1,7 +1,7 @@
 ---
 name: invest-regime
 description: Manually classify the current market regime (risk-on, risk-off, choppy, trending, volatility-expansion, etc.) and atomically update wiki/regimes/current.md. Auto-detection using feed data lands in Phase 4 only if regime-mismatched trades surface during burn-in. Use when Keith says /regime, "classify regime", "update regime to X", "what's the current regime".
-tier: Analyst
+tier: analyst
 routines-ready: true
 phase: 2
 status: stub

@@ -1,7 +1,7 @@
 ---
 name: invest-narrative
 description: Manual MVP single-call top-of-funnel ticker discovery. Takes a macro narrative from Keith and produces a structured theme file with 4-6 sub-themes, 5+ candidate tickers (prioritizing 2nd/3rd-order beneficiaries), reasoning chains, citations, and ARK 6-metric scores. Output lands in wiki/macro-themes/theme_<slug>.md. Use when Keith says /invest-narrative "<text>", "find tickers for this theme", "narrative to candidates", or brings a macro story he wants mapped to symbols.
-tier: Analyst
+tier: portfolio-manager
 routines-ready: yes
 ship: 1-of-3
 ---

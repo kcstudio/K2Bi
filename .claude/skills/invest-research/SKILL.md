@@ -1,7 +1,10 @@
 ---
 name: invest-research
 description: Deep dive into external topics -- scan for new AI tools, techniques, and ideas; analyze URLs, YouTube videos, and GitHub repos. This skill should be used when Keith says /research, "look into this", "what's new in AI", or wants to deep-dive into a topic, URL, or repo. Also triggers on /research deep for multi-source NotebookLM research. For internal system health, use /improve instead.
+tier: portfolio-manager
 ---
+
+<!-- Tier note: hybrid skill; schedulable subset migrates to Analyst in Phase 6 -->
 
 # K2Bi Research Agent
 

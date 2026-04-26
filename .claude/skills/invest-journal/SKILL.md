@@ -1,6 +1,7 @@
 ---
 name: invest-journal
 description: Start or end the trading day -- compiles today's captures from vault and session wrap-ups into a structured trading journal entry through multi-turn conversation. Use when Keith says /journal, "today", "start the day", "end of day", "EOD", "what's on today", or anything about daily trading planning/review.
+tier: portfolio-manager
 ---
 
 # Invest Journal
