@@ -1,3 +1,49 @@
+## 2026-04-26 -- OPS: IB Gateway daily-restart outage RESOLVED -- 2h10m DisconnectedError outage caused by IBC's `Auto logoff` setting; switched Lock-and-Exit to `Auto restart` so future daily-restart cycles self-heal (~30-60s instead of indefinite)
+
+**Type:** Operations incident, not a code ship. No commit. Configuration-only change applied via IB Gateway UI on the VPS.
+
+**Symptom (Telegram alert):**
+```
+🔴 T1: disconnect_status outage > 300s
+Outage: 1.9h
+Attempts: 28
+Error: DisconnectedError
+```
+Alert started 07:46 HKT (23:46 UTC 2026-04-25). At full diagnosis, outage had grown to attempt #30 / 7547s before reconnect.
+
+**Root cause:**
+IBKR mandates a daily gateway restart for software updates. IBC's Lock-and-Exit was set to `Auto logoff` (default), which means at the scheduled time it gracefully closes the gateway but does NOT relaunch it. The gateway sat dead from 23:40:00 UTC onward.
+
+Confirmed in `/opt/ibc/logs/ibc-3.23.0_GATEWAY-1037_Saturday.txt`:
+```
+2026-04-25 23:40:00:091 IBC: Login has completed: exiting via [File, Close] menu
+2026-04-25 23:40:00:549 IBC: detected dialog entitled: Shutdown progress; event=Opened
+```
+
+The `[File, Close] menu` line is the diagnostic signature of an Auto-logoff (vs. crash, OOM, or network event — none of those were present).
+
+**Fix applied:**
+1. SSH'd to `hostinger` VPS, ran `sudo systemctl start ib-gateway` -- gateway came up at 01:46:55 UTC, listening on port 4002.
+2. Engine auto-reconnected on its next 5-min retry tick at 01:50:55 UTC -- journal recorded `reconnected outage_seconds=7847.918274 prior_error_class=DisconnectedError init_completed_before_outage=True`.
+3. In TWS Configuration → Lock and Exit, switched the radio button from `Auto logoff` to `Auto restart` so tonight's 08:30 PM cycle relaunches the gateway in-place instead of leaving it dead.
+
+**Verified:**
+- Gateway service active, Java process listening on 4002.
+- Engine reconnected, kill switch INACTIVE, no open positions or pending orders disturbed.
+- Next daily-restart cycle is the live test of the `Auto restart` toggle.
+
+**Open follow-ups (NOT done in this session, parked for Keith):**
+
+1. **Verify Auto-restart timezone alignment** -- The Lock-and-Exit timer reads "08:30 PM" but the actual logoff fired at 23:40 UTC, suggesting the gateway's clock or scheduled time may not be in HKT or UTC. Watch tonight's cycle to confirm time + behavior.
+2. **Watchdog systemd timer (belt-and-suspenders)** -- A 10-min `is-active || restart` timer on `ib-gateway.service` would catch *non-daily* failures (OOM, segfault, network blip). Daily-restart is now self-healing via Auto restart, but a watchdog covers the rest of the failure modes that took 2h to detect this time.
+3. **Rotate IBKR credentials -- security exposure** -- The IBC start command in `ib-gateway.service` passes `--user=k2binvest --pw=$1gnHub.io` as command-line args. Anyone with shell access to the VPS can read the password via `ps aux`. Move the password into IBC's `config.ini` (chmod 600) and rotate the existing password since it's been exposed in process listings.
+
+**Lessons (for the K2Bi runbook):**
+- A `DisconnectedError` outage that starts within ±15 min of the scheduled Lock-and-Exit time → first hypothesis is the daily-restart cycle, not network or IBKR-side. The IBC log's `[File, Close] menu` line is the confirming signature.
+- The K2Bi engine's 5-min retry cadence means recovery latency from a fixed-then-restarted gateway is at most one tick. No engine restart needed when only the gateway is the problem.
+
+---
+
 ## 2026-04-26 -- Q42 orphan-STOP adoption SHIPPED -- Phase 3.6 Day 1 STOP permId=1888063981 now first-class journal event; K2BI_ALLOW_RECOVERY_MISMATCH=1 no longer required for permId=1888063981 on VPS cold-start (Step 4 production validation PASSED 2026-04-25T18:02:07Z)
 
 **Commit:** `39a7234` feat: Q42 orphan-STOP adoption workflow (K2BI_ADOPT_ORPHAN_STOP)
