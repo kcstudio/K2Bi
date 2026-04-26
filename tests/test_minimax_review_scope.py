@@ -23,10 +23,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
 
 from minimax_review import (  # noqa: E402
+    extract_json_object,
     gather_diff_scoped_context,
     gather_file_list_context,
     gather_plan_context,
     gather_working_tree_context,
+    is_valid_review_object,
 )
 
 
@@ -393,6 +395,621 @@ class CLIDispatch(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             self.assertIn("no working-tree changes", res.stderr)
             self.assertIn("gathering working-tree context", res.stderr)
+
+
+class JSONExtractionValidation(unittest.TestCase):
+    """Regression: a partial JSON parse must NOT silently exit 0 with
+    `findings: []`.
+
+    Codex flagged this twice during the m2.22 review window. The fence
+    path uses json.JSONDecoder.raw_decode, which stops at the end of
+    the first valid JSON value -- so an early ```json stub before the
+    real review, or a truncated response that fences only
+    `{"verdict": "approve"}`, parses successfully and renders as a
+    successful empty review. The wrapper's quality gate at
+    review_runner.py:368-382 only checks for verdict markers on rc=0,
+    so the malformed-success suppresses the secondary-reviewer fallback.
+
+    The fix: validate the parsed object has the schema-required fields
+    (verdict + summary + findings + next_steps) before treating it as
+    a review. Invalid -> treat as unparseable, exit non-zero, let the
+    wrapper fall through.
+    """
+
+    def test_early_fence_stub_with_later_real_review_returns_none(self) -> None:
+        """The original R1 bug: an early ```json stub followed by a
+        later ```json review used to silently drop the real review.
+        After R7 (multiple ```json fences are ambiguous),
+        extract_json_object rejects the entire response so the
+        wrapper falls through to the secondary reviewer."""
+        text = (
+            "Let me start the review.\n\n"
+            "```json\n"
+            '{"verdict": "approve"}\n'
+            "```\n\n"
+            "Wait, on second look I have findings:\n\n"
+            "```json\n"
+            '{"verdict": "needs-attention", "summary": "real review", '
+            '"findings": [{"severity": "high", "title": "X", '
+            '"body": "detail", "file": "a.py", "line_start": 1, '
+            '"line_end": 2, "confidence": 0.9, "recommendation": "fix"}], '
+            '"next_steps": []}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_validator_rejects_verdict_only_stub(self) -> None:
+        self.assertFalse(is_valid_review_object({"verdict": "approve"}))
+
+    def test_validator_rejects_missing_findings(self) -> None:
+        self.assertFalse(
+            is_valid_review_object(
+                {
+                    "verdict": "approve",
+                    "summary": "looks good",
+                    "next_steps": [],
+                }
+            )
+        )
+
+    def test_validator_rejects_missing_summary(self) -> None:
+        self.assertFalse(
+            is_valid_review_object(
+                {
+                    "verdict": "approve",
+                    "findings": [],
+                    "next_steps": [],
+                }
+            )
+        )
+
+    def test_validator_rejects_unknown_verdict(self) -> None:
+        self.assertFalse(
+            is_valid_review_object(
+                {
+                    "verdict": "unparseable",
+                    "summary": "?",
+                    "findings": [],
+                    "next_steps": [],
+                }
+            )
+        )
+
+    def test_validator_rejects_non_list_findings(self) -> None:
+        self.assertFalse(
+            is_valid_review_object(
+                {
+                    "verdict": "approve",
+                    "summary": "ok",
+                    "findings": "none",
+                    "next_steps": [],
+                }
+            )
+        )
+
+    def test_validator_accepts_empty_findings(self) -> None:
+        self.assertTrue(
+            is_valid_review_object(
+                {
+                    "verdict": "approve",
+                    "summary": "no issues",
+                    "findings": [],
+                    "next_steps": [],
+                }
+            )
+        )
+
+    def test_validator_accepts_full_review(self) -> None:
+        self.assertTrue(
+            is_valid_review_object(
+                {
+                    "verdict": "needs-attention",
+                    "summary": "found issues",
+                    "findings": [
+                        {
+                            "severity": "high",
+                            "title": "X",
+                            "body": "detail",
+                            "file": "a.py",
+                            "line_start": 1,
+                            "line_end": 2,
+                            "confidence": 0.9,
+                            "recommendation": "fix",
+                        }
+                    ],
+                    "next_steps": ["follow up"],
+                }
+            )
+        )
+
+    # R2 (Codex post-commit review): top-level shape is not enough.
+    # The fence path's raw_decode could land on a payload whose findings
+    # items are empty objects or whose next_steps items are empty
+    # strings, and the previous validator passed it -- which still hits
+    # the wrapper's verdict-marker gate at rc=0 and skips fallback.
+    # Mirror the schema's nested `required` for findings items and the
+    # `minLength: 1` constraint for next_steps items.
+
+    def _full_finding(self, **overrides: object) -> dict:
+        base = {
+            "severity": "high",
+            "title": "X",
+            "body": "detail",
+            "file": "a.py",
+            "line_start": 1,
+            "line_end": 2,
+            "confidence": 0.9,
+            "recommendation": "fix",
+        }
+        base.update(overrides)
+        return base
+
+    def _wrap(self, **overrides: object) -> dict:
+        base = {
+            "verdict": "needs-attention",
+            "summary": "ok",
+            "findings": [self._full_finding()],
+            "next_steps": ["next"],
+        }
+        base.update(overrides)
+        return base
+
+    def test_validator_rejects_empty_finding_object(self) -> None:
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[{}])))
+
+    def test_validator_rejects_finding_missing_one_required_field(self) -> None:
+        partial = self._full_finding()
+        del partial["body"]
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[partial])))
+
+    def test_validator_rejects_finding_with_invalid_severity(self) -> None:
+        bad = self._full_finding(severity="weak")
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_empty_title(self) -> None:
+        bad = self._full_finding(title="")
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_non_int_line_start(self) -> None:
+        bad = self._full_finding(line_start="1")
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_zero_line_start(self) -> None:
+        bad = self._full_finding(line_start=0)
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_out_of_range_confidence(self) -> None:
+        bad = self._full_finding(confidence=1.5)
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_negative_confidence(self) -> None:
+        bad = self._full_finding(confidence=-0.1)
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_finding_with_non_dict_item(self) -> None:
+        self.assertFalse(
+            is_valid_review_object(self._wrap(findings=["not-a-dict"]))
+        )
+
+    def test_validator_rejects_empty_next_step_string(self) -> None:
+        self.assertFalse(is_valid_review_object(self._wrap(next_steps=[""])))
+
+    def test_validator_rejects_non_string_next_step(self) -> None:
+        self.assertFalse(is_valid_review_object(self._wrap(next_steps=[1])))
+
+    def test_validator_accepts_int_confidence_in_range(self) -> None:
+        # Schema allows number; an int in [0,1] is valid (e.g. 1).
+        good = self._full_finding(confidence=1)
+        self.assertTrue(is_valid_review_object(self._wrap(findings=[good])))
+
+    # R3 (Codex post-R2 review): two more soundness gaps.
+    # 1. The schema sets additionalProperties: false at both the top
+    #    level and inside each finding -- extra keys are schema
+    #    violations and should fail validation.
+    # 2. Python's json.loads accepts NaN / Infinity by default; both
+    #    `NaN < 0` and `NaN > 1` are false, so the [0,1] range check
+    #    silently lets non-finite confidences through.
+
+    def test_validator_rejects_extra_top_level_key(self) -> None:
+        bad = self._wrap()
+        bad["extra"] = "not allowed"
+        self.assertFalse(is_valid_review_object(bad))
+
+    def test_validator_rejects_extra_finding_key(self) -> None:
+        bad = self._full_finding()
+        bad["extra"] = "not allowed"
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_nan_confidence(self) -> None:
+        bad = self._full_finding(confidence=float("nan"))
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_inf_confidence(self) -> None:
+        bad = self._full_finding(confidence=float("inf"))
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    def test_validator_rejects_negative_inf_confidence(self) -> None:
+        bad = self._full_finding(confidence=float("-inf"))
+        self.assertFalse(is_valid_review_object(self._wrap(findings=[bad])))
+
+    # R4 (Codex post-R3 review): the fence path's raw_decode returns
+    # the FIRST valid JSON object inside ```json ... ``` and ignores
+    # everything after it within the same fence. So trailing garbage
+    # or two concatenated objects in one fence still parses to the
+    # first object, which is a malformed-success path even after the
+    # validator hardening. Require the rest of the fenced payload to
+    # be whitespace.
+
+    def test_fence_with_clean_payload_still_parses(self) -> None:
+        text = (
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+        )
+        parsed = extract_json_object(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.get("verdict"), "approve")
+
+    def test_fence_with_prose_after_closing_fence_returns_none(self) -> None:
+        # R9: Codex flagged that prose after the closing fence could
+        # contain real review content the parser would silently drop.
+        # Per the prompt's "no prose before or after the JSON object"
+        # contract, anything but whitespace after the closing fence
+        # rejects the parse so the wrapper falls through.
+        text = (
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+            "Some prose after the closing fence is NOT allowed.\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_fence_with_trailing_garbage_inside_fence_returns_none(self) -> None:
+        text = (
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "BROKEN trailing garbage inside the fence\n"
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_fence_with_two_concatenated_objects_returns_none(self) -> None:
+        text = (
+            "```json\n"
+            '{"verdict":"approve"}\n'
+            '{"verdict":"needs-attention","summary":"x","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    # R5 (Codex post-R4 review): the fence regex matched
+    # `\`\`\`(?:json)?` -- the `json` tag was optional, so an earlier
+    # ``` ```python ... ``` `` block containing a schema-shaped stub
+    # could hijack extraction even when a later real ``` ```json ```
+    # block contained the actual review. Require an explicit `json`
+    # tag so non-JSON fenced blocks are skipped.
+
+    def test_python_fence_then_json_review_returns_none_after_r10(
+        self,
+    ) -> None:
+        # Originally R5 made this case parse the real json review. R10
+        # tightened further: ANY non-whitespace before the ```json
+        # fence rejects, so a preceding python fence (with or without
+        # a stub inside) now causes the whole response to fail. The
+        # wrapper falls through to the secondary reviewer.
+        text = (
+            "```python\n"
+            '# example output:\n'
+            '# {"verdict":"approve","summary":"stub","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n\n"
+            "Real review:\n\n"
+            "```json\n"
+            '{"verdict":"needs-attention","summary":"real","findings":[],'
+            '"next_steps":["follow up"]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_no_fence_inline_json_with_prose_returns_none_strict(self) -> None:
+        # R5 originally allowed this; R9 tightened to require the
+        # response to be only the JSON (with optional whitespace).
+        text = (
+            'Here is the review: {"verdict":"approve","summary":"ok",'
+            '"findings":[],"next_steps":[]} -- end.'
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    # R6 (Codex post-R5 review): the fence regex `\`\`\`json\s*` was
+    # still a prefix match -- `\s*` consumes zero chars, so it matched
+    # `\`\`\`jsonc` and `\`\`\`json5` and the parser would scan into
+    # the wrong fence. Require a word boundary after `json`.
+
+    def test_jsonc_fence_then_json_review_returns_none_after_r10(
+        self,
+    ) -> None:
+        # Originally R6 (word-boundary fix) made this parse the json
+        # review, skipping the jsonc prefix. R10 tightened further:
+        # any leading content rejects.
+        text = (
+            "```jsonc\n"
+            '// example:\n'
+            '{"verdict":"approve","summary":"stub","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n\n"
+            "Real review:\n\n"
+            "```json\n"
+            '{"verdict":"needs-attention","summary":"real","findings":[],'
+            '"next_steps":["follow up"]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_json5_fence_then_json_review_returns_none_after_r10(
+        self,
+    ) -> None:
+        text = (
+            "```json5\n"
+            '{"verdict":"approve","summary":"stub","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n\n"
+            "```json\n"
+            '{"verdict":"needs-attention","summary":"real","findings":[],'
+            '"next_steps":["follow up"]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_json_fence_with_no_trailing_whitespace_still_parses(self) -> None:
+        # Edge case: `\`\`\`json{...}` with no whitespace between the
+        # tag and the `{`. Word-boundary `\b` matches at the json/{
+        # transition, so this is still treated as a json fence.
+        text = '```json{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}```'
+        parsed = extract_json_object(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.get("verdict"), "approve")
+
+    # R7 (Codex post-R6 review): the first valid `\`\`\`json` fence
+    # still won unconditionally, even when a later `\`\`\`json` fence
+    # held the real review (e.g. Kimi self-corrects: writes a draft,
+    # then writes a real one). Ambiguity must trigger fallback.
+
+    def test_two_json_fences_disagreeing_returns_none(self) -> None:
+        text = (
+            "```json\n"
+            '{"verdict":"approve","summary":"draft","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n\n"
+            "Actually, on reflection:\n\n"
+            "```json\n"
+            '{"verdict":"needs-attention","summary":"real","findings":[],'
+            '"next_steps":["follow up"]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_two_json_fences_identical_still_returns_none(self) -> None:
+        # Even if both fences contain the same JSON, the duplication
+        # is itself a malformed-success signal. Reject.
+        body = (
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}'
+        )
+        text = f"```json\n{body}\n```\n\n```json\n{body}\n```\n"
+        self.assertIsNone(extract_json_object(text))
+
+    def test_single_json_fence_with_leading_non_json_fence_returns_none(
+        self,
+    ) -> None:
+        # Pre-R10 this passed (json fence after python fence parsed).
+        # R10 strict policy: leading content before the json fence
+        # rejects.
+        text = (
+            "```python\n"
+            "print('hello')\n"
+            "```\n\n"
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    # R8 (Codex post-R7 review): the greedy first-{ to last-} fallback
+    # runs when there are zero `\`\`\`json` fences, but the response
+    # may still contain a schema-shaped stub inside a non-JSON fence
+    # (e.g. ``` ```python ... {stub} ... ``` ```). Greedy would parse
+    # the stub and the validator would accept it. Skip greedy
+    # whenever any backtick fence exists -- inline-JSON-with-prose is
+    # still allowed when no fence is present.
+
+    def test_python_fence_stub_with_no_json_fence_returns_none(self) -> None:
+        text = (
+            "```python\n"
+            '# example output:\n'
+            '{"verdict":"approve","summary":"stub","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n\n"
+            "Real review in prose: I see no issues.\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_no_fence_inline_json_with_prose_returns_none(self) -> None:
+        # R9: Codex flagged that surrounding prose could contain real
+        # review content. Strict policy: only whole-response JSON
+        # (no fences, no prose) parses via the greedy path; anything
+        # else rejects so the wrapper falls through.
+        text = (
+            "Here is my review.\n\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n\n'
+            "Hope that helps!\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_no_fence_pure_json_response_still_works(self) -> None:
+        # R9 sanity: response that is just JSON (with optional
+        # surrounding whitespace, the prompt's expected output shape)
+        # still parses cleanly via strict json.loads.
+        text = (
+            '\n  {"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n  '
+        )
+        parsed = extract_json_object(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.get("verdict"), "approve")
+
+    # R10 (Codex post-R9 review): the fenced path also accepted
+    # leading prose -- both before the ```json fence and between the
+    # tag and the opening brace. Whole-response policy: leading
+    # content must be whitespace too.
+
+    def test_fence_with_prose_before_opening_fence_returns_none(self) -> None:
+        text = (
+            "Intro text describing what's about to come.\n\n"
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_fence_with_prose_between_tag_and_brace_returns_none(self) -> None:
+        text = (
+            "```json\n"
+            "// preamble inside the fence before the JSON\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```\n"
+        )
+        self.assertIsNone(extract_json_object(text))
+
+    def test_fence_with_only_whitespace_before_opens_still_parses(self) -> None:
+        text = (
+            "\n  \n"
+            "```json\n"
+            '{"verdict":"approve","summary":"ok","findings":[],'
+            '"next_steps":[]}\n'
+            "```"
+        )
+        parsed = extract_json_object(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.get("verdict"), "approve")
+
+
+class MainExitCodeOnPartialParse(unittest.TestCase):
+    """End-to-end: feed the script a malformed Kimi response that contains
+    a valid verdict marker, and assert it does NOT exit 0 with
+    findings: []. This is the architect's regression guard for the
+    R3-r3 / R4-r4 finding -- if the script exits 0, the wrapper's
+    quality gate at review_runner.py:368-382 sees `"verdict"` in the
+    log and skips the Kimi <-> Codex fallback entirely, dropping all
+    real findings on the floor.
+    """
+
+    SCRIPT = REPO_ROOT / "scripts" / "lib" / "minimax_review.py"
+
+    def _run_with_mocked_response(
+        self,
+        raw_response: str,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess:
+        """Run main() with chat_completion patched to return raw_response.
+
+        `python3 script.py` puts the script's directory at sys.path[0]
+        before PYTHONPATH entries, so a shadow-import shim does not
+        actually shadow. Instead we write a small runner that imports
+        minimax_review and rebinds the in-module chat_completion symbol
+        before calling main(). Cwd is the tmp fixture repo so the
+        module-level `git rev-parse --show-toplevel` lands on it.
+        """
+        lib_dir = REPO_ROOT / "scripts" / "lib"
+        runner = cwd / "_test_runner.py"
+        canned = {
+            "id": "stub",
+            "choices": [{"message": {"content": raw_response}}],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+        runner.write_text(
+            "import json\n"
+            "import sys\n"
+            f"sys.path.insert(0, {str(lib_dir)!r})\n"
+            "import minimax_review\n"
+            f"_CANNED = {json.dumps(canned)}\n"
+            "def _fake_chat(*args, **kwargs):\n"
+            "    return _CANNED\n"
+            "minimax_review.chat_completion = _fake_chat\n"
+            "sys.argv = ['minimax_review.py'] + sys.argv[1:]\n"
+            "sys.exit(minimax_review.main())\n"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--scope",
+                "working-tree",
+                "--no-archive",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+
+    def test_partial_parse_with_verdict_marker_is_not_exit_0(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            build_fixture_repo(tmp_path)
+            # Malformed Kimi response: an early fenced verdict-only stub
+            # followed by what was supposed to be the real review with
+            # embedded quotes that break the JSON. The first fence
+            # parses cleanly via raw_decode and would silently win
+            # without the new validator.
+            raw = (
+                "Starting review.\n\n"
+                "```json\n"
+                '{"verdict": "approve"}\n'
+                "```\n\n"
+                "Actually, more findings:\n\n"
+                "```json\n"
+                '{"verdict": "needs-attention", "summary": "real review", '
+                '"findings": [{"severity": "high", "title": "Quote issue", '
+                '"body": "Code has "embedded" quotes", "file": "a.py", '
+                '"line_start": 1, "line_end": 2, "confidence": 0.8, '
+                '"recommendation": "escape them"}], "next_steps": []}\n'
+                "```\n"
+            )
+            res = self._run_with_mocked_response(raw, tmp_path)
+            self.assertNotEqual(
+                res.returncode,
+                0,
+                f"script exited 0 on partial-parse with verdict marker; "
+                f"this would suppress the wrapper's secondary-reviewer "
+                f"fallback. stdout={res.stdout!r} stderr={res.stderr!r}",
+            )
+
+    def test_truncated_verdict_only_response_is_not_exit_0(self) -> None:
+        """If max_tokens cuts the response off after just the verdict,
+        we must still not return success with empty findings."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            build_fixture_repo(tmp_path)
+            raw = "```json\n" '{"verdict": "approve"}\n' "```\n"
+            res = self._run_with_mocked_response(raw, tmp_path)
+            self.assertNotEqual(
+                res.returncode,
+                0,
+                f"script exited 0 on truncated verdict-only response; "
+                f"stdout={res.stdout!r} stderr={res.stderr!r}",
+            )
 
 
 if __name__ == "__main__":

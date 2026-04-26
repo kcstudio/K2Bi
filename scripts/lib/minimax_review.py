@@ -6,6 +6,7 @@ Codex's review-output schema. Touches nothing in /ship or the codex plugin.
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -410,7 +411,19 @@ def build_prompt(target_label: str, focus: str, content: str, schema_text: str) 
 
 
 def extract_json_object(text: str) -> dict | None:
-    """Try strict json.loads first, then regex-extract the first {...} block."""
+    """Try strict json.loads first, then regex-extract the first {...} block.
+
+    The fence path uses json.JSONDecoder.raw_decode (instead of a greedy
+    regex brace-match) to avoid catastrophic backtracking on pathological
+    input -- the K2B 2026-04-25 swap flagged the prior greedy regex as
+    a hang risk. raw_decode returns the first valid JSON value and the
+    index where it stopped; we then verify the rest of the fenced
+    payload (up to the closing ```) is whitespace. Trailing garbage or
+    a second concatenated object inside the same fence is rejected
+    here so the wrapper can fall through to the secondary reviewer
+    instead of accepting the prefix as the whole review (Codex R4
+    flagged this as a malformed-success class still open after R3).
+    """
     text = text.strip()
     if not text:
         return None
@@ -418,30 +431,181 @@ def extract_json_object(text: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Kimi wraps JSON in ```json ... ``` fences. Use json.JSONDecoder.raw_decode
-    # instead of a regex brace-match: raw_decode scans linearly with a real
-    # JSON parser, so it cannot catastrophic-backtrack on pathological input
-    # (the K2B 2026-04-25 swap flagged the prior greedy regex as a hang risk).
-    fence = re.search(r"```(?:json)?\s*", text)
-    if fence:
+    # Locate explicit `json` fences. Word-boundary `\b` keeps the
+    # match strictly to the `json` tag so `jsonc` / `json5` (Codex R5)
+    # and untagged or alternate-language fences (R5/R6) do not match.
+    # Multiple `json` fences in one response (Codex R7) are ambiguous:
+    # Kimi outputting two reviews -- whether disagreeing drafts or a
+    # duplicate -- is itself a malformed-success signal that the
+    # wrapper should fall through on.
+    fence_iter = list(re.finditer(r"```json\b\s*", text))
+    if len(fence_iter) > 1:
+        return None
+    if len(fence_iter) == 1:
+        fence = fence_iter[0]
+        # R10: content before the opening ```json fence must be
+        # whitespace. Leading prose could contain real review content
+        # the parser would otherwise silently drop.
+        if text[: fence.start()].strip():
+            return None
         rest = text[fence.end():]
         brace = rest.find("{")
         if brace != -1:
+            # R10: content between the fence tag and the opening `{`
+            # must also be whitespace -- the prompt's contract is
+            # "no prose before or after the JSON object", which
+            # extends to inside the fence.
+            if rest[:brace].strip():
+                return None
             try:
-                obj, _ = json.JSONDecoder().raw_decode(rest[brace:])
-                if isinstance(obj, dict):
-                    return obj
+                obj, idx = json.JSONDecoder().raw_decode(rest[brace:])
             except json.JSONDecodeError:
-                pass
-    # Greedy first-{ to last-} fallback
+                obj = None
+            if isinstance(obj, dict):
+                trailing = rest[brace + idx:]
+                close = trailing.find("```")
+                if close != -1:
+                    fenced_remainder = trailing[:close]
+                    after_close = trailing[close + 3 :]
+                else:
+                    fenced_remainder = trailing
+                    after_close = ""
+                # R4: payload up to closing fence must be whitespace.
+                # R9: content after closing fence must also be
+                # whitespace -- the prompt's contract says "no prose
+                # before or after the JSON object", so trailing prose
+                # could contain real review content the parser would
+                # otherwise silently drop.
+                if (
+                    not fenced_remainder.strip()
+                    and not after_close.strip()
+                ):
+                    return obj
+        # The single json-tagged fence existed but its payload was
+        # malformed (parse error, non-dict, or trailing garbage). Do
+        # NOT salvage via the greedy first-{ to last-} fallback -- the
+        # greedy search ignores text between brace positions, which is
+        # exactly the gap Codex R4 flagged: it would re-accept a valid
+        # prefix and silently drop whatever Kimi appended.
+        return None
+    # No json-tagged fence. If ANY backtick fence exists in the
+    # response (e.g. ``` ```python ... ``` ```), do NOT salvage with
+    # greedy: Codex R8 flagged that a schema-shaped stub inside a
+    # non-JSON fence would otherwise be accepted as the review. Greedy
+    # is only safe for completely fence-free responses, and (R9)
+    # only when the JSON object is the entire response -- prose
+    # before or after could contain real review content.
+    if "```" in text:
+        return None
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
+        if text[:start].strip() or text[end + 1 :].strip():
+            # R9: surrounding prose violates the prompt's
+            # "no prose before or after" contract.
+            return None
         try:
             return json.loads(text[start : end + 1])
         except json.JSONDecodeError:
             return None
     return None
+
+
+_FINDING_SEVERITIES = ("critical", "high", "medium", "low")
+_REVIEW_TOP_KEYS = frozenset({"verdict", "summary", "findings", "next_steps"})
+_FINDING_KEYS = frozenset(
+    {
+        "severity", "title", "body", "file",
+        "line_start", "line_end", "confidence", "recommendation",
+    }
+)
+
+
+def _is_strict_int(x: object) -> bool:
+    # bool is an int subclass in Python; the JSON schema's `integer`
+    # type does not match booleans.
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _is_strict_finite_number(x: object) -> bool:
+    # Python's json.loads accepts NaN / Infinity by default. NaN
+    # silently bypasses range checks (any comparison with NaN is False),
+    # so confidence must be explicitly finite to satisfy the schema.
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    return math.isfinite(x)
+
+
+def _is_valid_finding(f: object) -> bool:
+    if not isinstance(f, dict):
+        return False
+    # additionalProperties: false in the schema -- exact key set.
+    if set(f.keys()) != _FINDING_KEYS:
+        return False
+    if f.get("severity") not in _FINDING_SEVERITIES:
+        return False
+    for key in ("title", "body", "file"):
+        v = f.get(key)
+        if not isinstance(v, str) or not v.strip():
+            return False
+    for key in ("line_start", "line_end"):
+        v = f.get(key)
+        if not _is_strict_int(v) or v < 1:
+            return False
+    conf = f.get("confidence")
+    if not _is_strict_finite_number(conf) or conf < 0 or conf > 1:
+        return False
+    if not isinstance(f.get("recommendation"), str):
+        return False
+    return True
+
+
+def is_valid_review_object(parsed: object) -> bool:
+    """Return True iff parsed matches review-output.schema.json's required shape.
+
+    Without this check, the fence path's json.JSONDecoder.raw_decode can
+    return a partial dict (e.g. an early ```json stub before the real
+    review, or a truncated response that fences only
+    `{"verdict": "approve"}`) that renders as a successful empty review
+    and exits 0. The wrapper's quality gate at review_runner.py:368-382
+    only checks for verdict markers on rc=0, so a malformed-success
+    suppresses the Kimi <-> Codex fallback entirely.
+
+    Mirrors review-output.schema.json including `additionalProperties: false`
+    at both levels. Top-level keys must be exactly `_REVIEW_TOP_KEYS`;
+    each finding must have exactly `_FINDING_KEYS`. Required types:
+    verdict (enum), summary (non-empty string), findings (list of
+    valid items), next_steps (list of non-empty strings). Confidence
+    must be a finite number in [0, 1] -- NaN / Infinity are explicitly
+    rejected (json.loads accepts both, and NaN bypasses range checks).
+    An empty findings or next_steps list is fine -- a real "approve,
+    no findings" review still passes; only schema-violating entries
+    trip this.
+
+    Review history (Codex):
+      R1 -- top-level-only check accepted `findings: [{}]` (HIGH)
+      R2 -- nested item check accepted extra keys + NaN confidence (HIGH)
+    """
+    if not isinstance(parsed, dict):
+        return False
+    if set(parsed.keys()) != _REVIEW_TOP_KEYS:
+        return False
+    if parsed.get("verdict") not in ("approve", "needs-attention"):
+        return False
+    summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    findings = parsed.get("findings")
+    if not isinstance(findings, list):
+        return False
+    if any(not _is_valid_finding(f) for f in findings):
+        return False
+    next_steps = parsed.get("next_steps")
+    if not isinstance(next_steps, list):
+        return False
+    if any(not isinstance(s, str) or not s.strip() for s in next_steps):
+        return False
+    return True
 
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -713,6 +877,17 @@ def main() -> int:
         )
         append_usage_log(archive_dir, args.model, args.scope, usage)
         print(f"[minimax-review] archived: {out.relative_to(REPO_ROOT)}", file=sys.stderr)
+
+    parsed_is_partial = parsed is not None and not is_valid_review_object(parsed)
+    if parsed_is_partial:
+        print(
+            "[minimax-review] parsed JSON is missing required review fields "
+            "(verdict/summary/findings/next_steps); treating as unparseable "
+            "so the wrapper falls through to the secondary reviewer. "
+            "See archive for raw output.",
+            file=sys.stderr,
+        )
+        parsed = None
 
     if parsed is None:
         print(
