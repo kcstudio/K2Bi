@@ -1,6 +1,6 @@
 ## 2026-04-26 -- engine test-suite stabilization -- 8 pre-existing capital-path test failures resolved
 
-**Commit:** TBD fix(engine): stabilize 8 pre-existing capital-path test failures (8 stale-test-updated, 0 engine-regressed-fixed, 0 flake-or-skip)
+**Commit:** `0763d97` fix(engine): stabilize 8 pre-existing capital-path test failures (8 stale-test-updated, 0 engine-regressed-fixed, 0 flake-or-skip)
 
 **Context:** These 8 tests were confirmed failing on the origin/main baseline at the commits where they were introduced (not regressions from later engine changes). Phase 3.10 unattended burn-in gate now clean.
 
