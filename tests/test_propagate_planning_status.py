@@ -16,6 +16,7 @@ from scripts.lib import propagate_handlers, propagate_planning_status
 from scripts.lib.propagate_handlers import (
     HANDLERS,
     render_bundle5_status,
+    render_current_regime,
     render_next_concrete_action,
     render_phase3_status,
 )
@@ -81,6 +82,44 @@ class HandlerUnitTests(unittest.TestCase):
         self.assertIn("m2.13", out)
         self.assertIn("invest-screen", out)
         self.assertIn("kimi-handoff", out)
+
+
+class CurrentRegimeHandlerTests(unittest.TestCase):
+    """Tests for the current-regime propagation handler."""
+
+    def test_populated_current_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vault = tmp_path / "K2Bi-Vault"
+            regimes = vault / "wiki" / "regimes"
+            regimes.mkdir(parents=True, exist_ok=True)
+            current_md = regimes / "current.md"
+            current_md.write_text(
+                "---\n"
+                "regime: bull\n"
+                "classified_date: 2026-04-26\n"
+                "reasoning_summary: Earnings strong.\n"
+                "---\n\nBody\n",
+                encoding="utf-8",
+            )
+            # milestones_md path is only used to derive the vault root.
+            milestones_md = vault / "wiki" / "planning" / "milestones.md"
+            milestones_md.parent.mkdir(parents=True, exist_ok=True)
+            milestones_md.write_text("# milestones\n", encoding="utf-8")
+            out = render_current_regime(milestones_md)
+            self.assertEqual(
+                out, "Current regime: bull (classified 2026-04-26; Earnings strong.)"
+            )
+
+    def test_missing_current_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vault = tmp_path / "K2Bi-Vault"
+            milestones_md = vault / "wiki" / "planning" / "milestones.md"
+            milestones_md.parent.mkdir(parents=True, exist_ok=True)
+            milestones_md.write_text("# milestones\n", encoding="utf-8")
+            out = render_current_regime(milestones_md)
+            self.assertEqual(out, "Current regime: not yet classified")
 
 
 class EndToEndPropagationTests(unittest.TestCase):

@@ -35,6 +35,23 @@ def _read_text(path: Path) -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
+def _read_frontmatter(path: Path) -> dict:
+    """Read a markdown file and return its YAML frontmatter as a dict."""
+    if not path.exists():
+        return {}
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return {}
+    # Re-use the strategy_frontmatter parser (safe_load, robust).
+    from scripts.lib.strategy_frontmatter import parse as _parse
+
+    try:
+        return _parse(content)
+    except ValueError:
+        return {}
+
+
 def _phase3_section(text: str) -> str:
     """Extract the Phase 3 section content (between '## Phase 3 --' and the next top-level header)."""
     match = re.search(
@@ -491,8 +508,43 @@ def render_next_concrete_action(milestones_md_path: Path) -> str:
     return "<no next action found in milestones.md Phase 3 table; check status>"
 
 
+def render_current_regime(_milestones_md_path: Path) -> str:
+    """Regime snapshot from wiki/regimes/current.md (one line).
+
+    The handler ignores the milestones path; its source of truth is
+    current.md frontmatter. Idempotent: output for the same current.md
+    is byte-for-byte identical (no wall-clock timestamps).
+    """
+    # Derive current.md path from the same vault root that holds milestones.md.
+    current_md = _milestones_md_path.with_name("current.md")
+    # Walk up to wiki/ then into regimes/.
+    # milestones_md_path is .../wiki/planning/milestones.md
+    # current.md is .../wiki/regimes/current.md
+    current_md = _milestones_md_path.parent.parent / "regimes" / "current.md"
+
+    fm = _read_frontmatter(current_md)
+    if not fm:
+        return "Current regime: not yet classified"
+
+    band = str(fm.get("regime", "")).strip()
+    classified_date = str(fm.get("classified_date", "")).strip()
+    reasoning_summary = str(fm.get("reasoning_summary", "")).strip()
+
+    if not band:
+        return "Current regime: not yet classified"
+
+    if classified_date and reasoning_summary:
+        return f"Current regime: {band} (classified {classified_date}; {reasoning_summary})"
+    if classified_date:
+        return f"Current regime: {band} (classified {classified_date})"
+    if reasoning_summary:
+        return f"Current regime: {band} ({reasoning_summary})"
+    return f"Current regime: {band}"
+
+
 HANDLERS: dict[str, Callable[[Path], str]] = {
     "phase3-status": render_phase3_status,
     "bundle5-status": render_bundle5_status,
     "next-concrete-action": render_next_concrete_action,
+    "current-regime": render_current_regime,
 }
