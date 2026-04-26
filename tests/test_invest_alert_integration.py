@@ -11,8 +11,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from typing import Any
+
+_JOURNAL_DATE = date.today().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +50,11 @@ def _seed_journal(vault_root: Path, date_str: str, events: list[dict[str, Any]])
 
 
 def _run_classifier(vault_root: Path, state_dir: Path, threshold: int = 300) -> list[dict[str, Any]]:
+    state_dir_path = Path(state_dir)
+    state_dir_path.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir_path / "alert-state.json"
+    if not state_file.exists():
+        state_file.write_text('{}', encoding='utf-8')
     env = os.environ.copy()
     env["K2BI_VAULT_ROOT"] = str(vault_root)
     env["K2BI_ALERT_STATE_DIR"] = str(state_dir)
@@ -73,7 +81,7 @@ class MessageFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
-            _seed_journal(vault_root, "2026-04-24", [
+            _seed_journal(vault_root, _JOURNAL_DATE, [
                 _event("engine_stopped", "id01", payload={"pid": 1, "reason": "test"}),
             ])
             alerts = _run_classifier(vault_root, state_dir)
@@ -87,7 +95,7 @@ class MessageFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
-            _seed_journal(vault_root, "2026-04-24", [
+            _seed_journal(vault_root, _JOURNAL_DATE, [
                 _event("order_filled", "id02", payload={"ticker": "SPY", "qty": 2, "price": "709.00", "side": "buy"}),
             ])
             alerts = _run_classifier(vault_root, state_dir)
@@ -102,7 +110,7 @@ class MessageFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
-            _seed_journal(vault_root, "2026-04-24", [
+            _seed_journal(vault_root, _JOURNAL_DATE, [
                 _event("disconnect_status", "id03", payload={"attempts": 5, "outage_seconds": 3600}),
             ])
             alerts = _run_classifier(vault_root, state_dir)
@@ -117,7 +125,7 @@ class SingleFireTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
-            _seed_journal(vault_root, "2026-04-24", [
+            _seed_journal(vault_root, _JOURNAL_DATE, [
                 _event("engine_stopped", "id04", payload={"pid": 1}),
             ])
             alerts1 = _run_classifier(vault_root, state_dir)
@@ -132,7 +140,7 @@ class MixedJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
-            _seed_journal(vault_root, "2026-04-24", [
+            _seed_journal(vault_root, _JOURNAL_DATE, [
                 _event("disconnect_status", "id05_00", payload={"attempts": 1, "outage_seconds": 100}),
                 _event("disconnect_status", "id05_01", payload={"attempts": 2, "outage_seconds": 350}),
                 _event("order_filled", "id05_02", payload={"ticker": "A", "qty": 1, "price": "1"}),

@@ -40,21 +40,27 @@ export HTTPS_PROXY="${HTTPS_PROXY-http://127.0.0.1:7897}"
 export HTTP_PROXY="${HTTP_PROXY-http://127.0.0.1:7897}"
 export NO_PROXY="${NO_PROXY-localhost,127.0.0.1}"
 
+# Serialize ticks so overlapping cron runs cannot commit out of order.
+LOCK_FILE="${K2BI_ALERT_STATE_DIR:-$HOME/.k2bi}/.alert-state.lock"
+exec 200>"$LOCK_FILE"
+flock -n 200 || {
+  echo "$(date -Iseconds) WARN: another alert tick is running; skipping" >> "$LOG_FILE"
+  exit 0
+}
+
 # Run classifier WITHOUT saving state yet.
 # State is only committed after all Telegram sends succeed.
 ALERTS_JSON="$(mktemp -t invest-alert-json.XXXXXX)"
-STATE_JSON="$(mktemp -t invest-alert-state.XXXXXX)"
+STATE_DIR="${K2BI_ALERT_STATE_DIR:-$HOME/.k2bi}"
+mkdir -p "$STATE_DIR"
+STATE_JSON="$STATE_DIR/alert-state.json.tmp.$$"
 trap 'rm -f "$ALERTS_JSON" "$STATE_JSON"' EXIT
 
-python3 "$SCRIPT_DIR/invest_alert_lib.py" --no-save-state --state-json-out "$STATE_JSON" > "$ALERTS_JSON" 2>>"$LOG_FILE" || {
+PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m scripts.invest_alert_lib --no-save-state --state-json-out "$STATE_JSON" > "$ALERTS_JSON" 2>>"$LOG_FILE" || {
   echo "$(date -Iseconds) ERROR: classifier failed" >> "$LOG_FILE"
   exit 1
 }
-
-# If no alerts, silent success (no state to commit)
-if [[ ! -s "$ALERTS_JSON" ]]; then
-  exit 0
-fi
 
 # Send each alert via Telegram. Fail hard on first failure so state
 # is NOT committed and cron will retry on next tick.
@@ -75,10 +81,8 @@ if [[ "$FAILED" -ne 0 ]]; then
   exit 1
 fi
 
-# All sends succeeded: commit state
+# All sends succeeded: commit state (including bootstrap watermark advances)
 if [[ -f "$STATE_JSON" ]]; then
-  STATE_DIR="${K2BI_ALERT_STATE_DIR:-$HOME/.k2bi}"
-  mkdir -p "$STATE_DIR"
   mv "$STATE_JSON" "$STATE_DIR/alert-state.json"
 fi
 

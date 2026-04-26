@@ -22,6 +22,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Allow importing execution.* when this file is run directly (cron path)
+if __name__ == "__main__" and __package__ is None:
+    _project_root = Path(__file__).resolve().parent.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+
+from execution.risk.kill_switch import _scan_kill_paths, is_killed
+
 DEFAULT_OUTAGE_THRESHOLD_S = 300
 DEFAULT_VAULT_ROOT = Path.home() / "Projects" / "K2Bi-Vault"
 DEFAULT_STATE_DIR = Path.home() / ".k2bi"
@@ -68,12 +76,14 @@ class ClassifierState:
     last_processed_entry_id: str | None = None
     last_processed_ts: str | None = None
     alerted_outage_start_ts: str | None = None  # first disconnect_status ts of current alerted outage
+    kill_switch_state: str = "unknown"  # "unknown" | "clear" | "active"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "last_processed_entry_id": self.last_processed_entry_id,
             "last_processed_ts": self.last_processed_ts,
             "alerted_outage_start_ts": self.alerted_outage_start_ts,
+            "kill_switch_state": self.kill_switch_state,
         }
 
     @classmethod
@@ -82,6 +92,7 @@ class ClassifierState:
             last_processed_entry_id=d.get("last_processed_entry_id"),
             last_processed_ts=d.get("last_processed_ts"),
             alerted_outage_start_ts=d.get("alerted_outage_start_ts"),
+            kill_switch_state=d.get("kill_switch_state", "unknown"),
         )
 
 
@@ -93,21 +104,23 @@ def _state_path(state_dir: Path) -> Path:
     return state_dir / STATE_FILE_NAME
 
 
-def load_state(state_dir: Path) -> ClassifierState:
+def load_state(state_dir: Path) -> tuple[ClassifierState, bool]:
+    """Return (state, file_existed). file_existed is False only when
+    the state file is missing; True when it existed (even if malformed)."""
     path = _state_path(state_dir)
     if not path.exists():
-        return ClassifierState()
+        return ClassifierState(), False
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("state file is not a dict")
-        return ClassifierState.from_dict(data)
+        return ClassifierState.from_dict(data), True
     except (json.JSONDecodeError, ValueError, TypeError) as e:
         # Malformed state: reset cleanly. We resume from the max entry_id
         # seen in the current scan rather than replaying history.
         print(f"[warn] alert-state malformed ({e}), resetting cleanly", file=sys.stderr)
-        return ClassifierState()
+        return ClassifierState(), True
 
 
 def save_state(state: ClassifierState, state_dir: Path) -> None:
@@ -149,6 +162,33 @@ def _read_journal_lines(vault_root: Path, date_str: str) -> list[dict[str, Any]]
                 continue
             lines.append(record)
     return lines
+
+
+def _scan_kill_paths_for_vault(vault_root: Path) -> tuple[bool, Path | None]:
+    """Check kill paths relative to the configured vault root."""
+    canonical = vault_root / "System" / ".killed"
+    alias = vault_root / "System" / "kill.flag"
+    if is_killed(path=canonical):
+        return True, canonical
+    if is_killed(path=alias):
+        return True, alias
+    return False, None
+
+
+def _find_latest_journal_event(
+    vault_root: Path,
+    today: datetime.date | None = None,
+) -> dict[str, Any] | None:
+    """Return the last event from today+yesterday journals that has a valid
+    journal_entry_id. Walks backward so a malformed tail row does not
+    poison the bootstrap cursor."""
+    all_events: list[dict[str, Any]] = []
+    for date_str in _journal_dates(today):
+        all_events.extend(_read_journal_lines(vault_root, date_str))
+    for ev in reversed(all_events):
+        if ev.get("journal_entry_id"):
+            return ev
+    return None
 
 
 def _iter_new_events(
@@ -313,6 +353,33 @@ def _build_kill_switch_alert(event: dict[str, Any]) -> Alert:
     )
 
 
+def _build_kill_switch_active_alert(trigger_path: Path) -> Alert:
+    msg = (
+        f"🟡 T2: kill_switch_active\n"
+        f"Path: {trigger_path}"
+    )
+    return Alert(
+        tier=2,
+        event_type="kill_switch_active",
+        journal_entry_id="",
+        ts=datetime.now(timezone.utc).isoformat(),
+        message=msg,
+        context={"path": str(trigger_path)},
+    )
+
+
+def _build_kill_switch_clear_alert() -> Alert:
+    msg = "🟡 T2: kill_switch_clear"
+    return Alert(
+        tier=2,
+        event_type="kill_switch_clear",
+        journal_entry_id="",
+        ts=datetime.now(timezone.utc).isoformat(),
+        message=msg,
+        context={},
+    )
+
+
 def classify_events(
     events: list[dict[str, Any]],
     state: ClassifierState,
@@ -396,7 +463,7 @@ def run_classification(
 ) -> tuple[list[Alert], ClassifierState, bool]:
     """Main entry point: load state, read journal, classify, optionally save state.
 
-    Returns (alerts, new_state, had_events).
+    Returns (alerts, new_state, had_state_change).
     """
     if vault_root is None:
         vault_root = Path(os.environ.get("K2BI_VAULT_ROOT", DEFAULT_VAULT_ROOT)).expanduser()
@@ -405,12 +472,57 @@ def run_classification(
     if threshold is None:
         threshold = int(os.environ.get("K2BI_ALERT_OUTAGE_THRESHOLD_S", DEFAULT_OUTAGE_THRESHOLD_S))
 
-    state = load_state(state_dir)
+    state, state_file_existed = load_state(state_dir)
+
+    # (bb) Bootstrap when state file is missing
+    if not state_file_existed:
+        tail_event = _find_latest_journal_event(vault_root, today)
+        if tail_event is not None:
+            entry_id = tail_event.get("journal_entry_id")
+            if entry_id:
+                state.last_processed_entry_id = entry_id
+                state.last_processed_ts = tail_event.get("ts", "")
+        # Scan actual kill-switch state so a subsequent clear transition is not lost
+        kill_active, _ = _scan_kill_paths_for_vault(vault_root)
+        state.kill_switch_state = "active" if kill_active else "clear"
+        watermark = state.last_processed_ts or "none"
+        print(f"[info] alert-state bootstrapped to journal-tail watermark {watermark}", file=sys.stderr)
+        if commit_state:
+            save_state(state, state_dir)
+        return [], state, True
+
+    # (z.4) Scan kill switch state for transitions
+    kill_active, trigger_path = _scan_kill_paths_for_vault(vault_root)
+    current_kill_state = "active" if kill_active else "clear"
+    kill_switch_alerts: list[Alert] = []
+    kill_switch_state_changed = False
+
+    # Upgrade path: old state files lack kill_switch_state. Seed from live scan
+    # without alerting so a pre-existing kill does not trigger a false transition.
+    if state.kill_switch_state == "unknown":
+        state.kill_switch_state = current_kill_state
+        kill_switch_state_changed = True
+    elif state.kill_switch_state != current_kill_state:
+        if current_kill_state == "active":
+            kill_switch_alerts.append(
+                _build_kill_switch_active_alert(trigger_path or Path("unknown"))
+            )
+        else:
+            kill_switch_alerts.append(_build_kill_switch_clear_alert())
+        state.kill_switch_state = current_kill_state
+        kill_switch_state_changed = True
+
     events = _iter_new_events(vault_root, state, today)
     alerts, new_state = classify_events(events, state, threshold)
-    if events and commit_state:
+
+    # Merge kill-switch alerts at the front
+    alerts = kill_switch_alerts + alerts
+    new_state.kill_switch_state = current_kill_state
+
+    state_changed = bool(events) or bool(kill_switch_alerts) or kill_switch_state_changed
+    if state_changed and commit_state:
         save_state(new_state, state_dir)
-    return alerts, new_state, bool(events)
+    return alerts, new_state, state_changed
 
 
 def main() -> int:
@@ -425,7 +537,7 @@ def main() -> int:
     state_dir = Path(os.environ.get("K2BI_ALERT_STATE_DIR", DEFAULT_STATE_DIR)).expanduser()
     threshold = int(os.environ.get("K2BI_ALERT_OUTAGE_THRESHOLD_S", DEFAULT_OUTAGE_THRESHOLD_S))
 
-    alerts, new_state, had_events = run_classification(
+    alerts, new_state, had_state_change = run_classification(
         vault_root, state_dir, threshold, commit_state=not args.no_save_state
     )
     for alert in alerts:
@@ -437,7 +549,7 @@ def main() -> int:
             "message": alert.message,
             "context": alert.context,
         }))
-    if args.state_json_out and had_events:
+    if args.state_json_out and had_state_change:
         with open(args.state_json_out, "w", encoding="utf-8") as f:
             json.dump(new_state.to_dict(), f, indent=2)
     return 0

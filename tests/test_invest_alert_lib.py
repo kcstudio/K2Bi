@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from scripts import invest_alert_lib as ial
 
@@ -200,8 +201,9 @@ class IdempotencyTests(unittest.TestCase):
             state_dir = Path(td)
             bad_path = state_dir / ial.STATE_FILE_NAME
             bad_path.write_text("not json {{{", encoding="utf-8")
-            state = ial.load_state(state_dir)
+            state, existed = ial.load_state(state_dir)
             self.assertIsNone(state.last_processed_entry_id)
+            self.assertTrue(existed)  # file existed but was malformed
             # Should not raise
 
     def test_empty_journal_no_alerts(self):
@@ -272,9 +274,13 @@ class OutageFireOnceTests(unittest.TestCase):
 
 class EndToEndTests(unittest.TestCase):
     def test_run_classification_skips_processed(self):
+        from datetime import date
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
+            # Pre-seed empty state so bootstrap doesn't skip events
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / ial.STATE_FILE_NAME).write_text('{}', encoding='utf-8')
             _seed_journal(vault_root, "2026-04-24", [
                 _event("engine_stopped", "id80", payload={"pid": 1}),
                 _event("order_filled", "id81", payload={"ticker": "X", "qty": 1, "price": "1"}),
@@ -282,10 +288,10 @@ class EndToEndTests(unittest.TestCase):
             os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
             os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
 
-            alerts1, _, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+            alerts1, _, _ = ial.run_classification(vault_root, state_dir, threshold=300, today=date(2026, 4, 24))
             self.assertEqual(len(alerts1), 2)
 
-            alerts2, _, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+            alerts2, _, _ = ial.run_classification(vault_root, state_dir, threshold=300, today=date(2026, 4, 24))
             self.assertEqual(len(alerts2), 0)
 
     def test_run_classification_reads_today_and_yesterday(self):
@@ -293,6 +299,9 @@ class EndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             vault_root = Path(td) / "vault"
             state_dir = Path(td) / "state"
+            # Pre-seed empty state so bootstrap doesn't skip events
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / ial.STATE_FILE_NAME).write_text('{}', encoding='utf-8')
             # Yesterday has an event
             _seed_journal(vault_root, "2026-04-23", [
                 _event("engine_stopped", "id90", payload={"pid": 1}),
@@ -332,6 +341,332 @@ class ThresholdConfigTests(unittest.TestCase):
         ev2 = _event("disconnect_status", "id101", payload={"attempts": 1, "outage_seconds": 605})
         alerts2, _ = ial.classify_events([ev2], ial.ClassifierState(), threshold=600)
         self.assertEqual(len(alerts2), 1)
+
+
+# ---------------------------------------------------------------------------
+# (z.4) kill_switch_active transition state
+# ---------------------------------------------------------------------------
+
+class KillSwitchTransitionTests(unittest.TestCase):
+    def test_transition_to_active_fires_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id01"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+            # Pre-seed state as clear so we can test the transition to active
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / ial.STATE_FILE_NAME).write_text(
+                '{"kill_switch_state":"clear"}', encoding='utf-8'
+            )
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(True, Path("/vault/System/kill.flag")),
+            ):
+                alerts1, state1, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts1), 1)
+                self.assertEqual(alerts1[0].event_type, "kill_switch_active")
+                self.assertEqual(alerts1[0].tier, 2)
+                self.assertIn("kill.flag", alerts1[0].message)
+                self.assertEqual(state1.kill_switch_state, "active")
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(True, Path("/vault/System/kill.flag")),
+            ):
+                alerts2, _, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts2), 0)
+
+    def test_transition_to_clear_fires_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id02"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+            # Pre-seed state as active
+            state = ial.ClassifierState(kill_switch_state="active")
+            ial.save_state(state, state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts1, state1, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts1), 1)
+                self.assertEqual(alerts1[0].event_type, "kill_switch_clear")
+                self.assertEqual(alerts1[0].tier, 2)
+                self.assertEqual(state1.kill_switch_state, "clear")
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts2, _, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts2), 0)
+
+    def test_stable_clear_no_alert(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id03"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / ial.STATE_FILE_NAME).write_text(
+                '{"kill_switch_state":"clear"}', encoding='utf-8'
+            )
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, _, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts), 0)
+
+
+# ---------------------------------------------------------------------------
+# (bb) fresh-install bootstrap
+# ---------------------------------------------------------------------------
+
+class BootstrapTests(unittest.TestCase):
+    def test_bootstrap_sets_watermark_to_latest_journal_event(self):
+        from datetime import date
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("engine_stopped", "id10", payload={"pid": 1}),
+                _event("order_filled", "id11", payload={"ticker": "X", "qty": 1, "price": "1"}),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, state, changed = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                self.assertEqual(len(alerts), 0)
+                self.assertTrue(changed)
+                self.assertEqual(state.last_processed_entry_id, "id11")
+                self.assertEqual(state.last_processed_ts, "2026-04-24T12:00:00+00:00")
+                self.assertEqual(state.kill_switch_state, "clear")
+
+            # Second run: no bootstrap, no alerts because cursor is at tail
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts2, _, _ = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                self.assertEqual(len(alerts2), 0)
+
+    def test_bootstrap_with_empty_journal(self):
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, state, changed = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts), 0)
+                self.assertTrue(changed)
+                self.assertIsNone(state.last_processed_entry_id)
+                self.assertEqual(state.kill_switch_state, "clear")
+
+    def test_malformed_state_does_not_bootstrap(self):
+        from datetime import date
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            bad_path = state_dir / ial.STATE_FILE_NAME
+            bad_path.write_text("not json {{{", encoding="utf-8")
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("engine_stopped", "id12", payload={"pid": 1}),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, state, changed = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                # Malformed state resets cleanly, then processes events normally
+                self.assertEqual(len(alerts), 1)
+                self.assertTrue(changed)
+                # Should NOT have bootstrapped; should have processed the event
+                self.assertEqual(state.last_processed_entry_id, "id12")
+
+    def test_bootstrap_honors_actual_kill_state(self):
+        from datetime import date
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id20"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(True, Path("/vault/System/kill.flag")),
+            ):
+                alerts, state, changed = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                self.assertEqual(len(alerts), 0)  # no alert on bootstrap
+                self.assertEqual(state.kill_switch_state, "active")
+                self.assertTrue(changed)
+
+            # Now clear the kill switch; should detect transition
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts2, state2, _ = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                self.assertEqual(len(alerts2), 1)
+                self.assertEqual(alerts2[0].event_type, "kill_switch_clear")
+                self.assertEqual(state2.kill_switch_state, "clear")
+
+    def test_bootstrap_respects_no_save_state(self):
+        from datetime import date
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id21"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, state, changed = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24), commit_state=False
+                )
+                self.assertEqual(len(alerts), 0)
+                self.assertTrue(changed)
+                # State file should NOT exist because commit_state=False
+                self.assertFalse((state_dir / ial.STATE_FILE_NAME).exists())
+
+    def test_old_state_without_kill_field_upgrades_silently(self):
+        """Pre-existing alert-state.json without kill_switch_state must not
+        emit a false transition alert when the kill switch is already active."""
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            # Old state file lacked kill_switch_state
+            (state_dir / ial.STATE_FILE_NAME).write_text(
+                '{"last_processed_entry_id":"id99"}', encoding='utf-8'
+            )
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id99"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(True, Path("/vault/System/kill.flag")),
+            ):
+                alerts, state, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts), 0)  # no false alert on upgrade
+                self.assertEqual(state.kill_switch_state, "active")
+
+    def test_old_state_upgrade_persists_on_quiet_system(self):
+        """Old state files must persist the kill_switch_state migration even
+        when there are no new journal events, so a later transition is detected."""
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / ial.STATE_FILE_NAME).write_text(
+                '{"last_processed_entry_id":"id99"}', encoding='utf-8'
+            )
+            _seed_journal(vault_root, "2026-04-24", [
+                _event("eod_complete", "id99"),
+            ])
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            # First run: upgrade from unknown -> clear (no alert)
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts1, state1, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts1), 0)
+                self.assertEqual(state1.kill_switch_state, "clear")
+
+            # Second run: clear -> active transition (should alert)
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(True, Path("/vault/System/kill.flag")),
+            ):
+                alerts2, state2, _ = ial.run_classification(vault_root, state_dir, threshold=300)
+                self.assertEqual(len(alerts2), 1)
+                self.assertEqual(alerts2[0].event_type, "kill_switch_active")
+                self.assertEqual(state2.kill_switch_state, "active")
+
+    def test_bootstrap_skips_empty_entry_id(self):
+        """Bootstrap must not persist an empty journal_entry_id cursor."""
+        from datetime import date
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            journal_dir = vault_root / "raw" / "journal"
+            journal_dir.mkdir(parents=True, exist_ok=True)
+            # Event with missing journal_entry_id
+            ev = {
+                "ts": "2026-04-24T12:00:00+00:00",
+                "schema_version": 2,
+                "event_type": "eod_complete",
+                "trade_id": None,
+                "journal_entry_id": "",
+                "strategy": None,
+                "git_sha": None,
+                "payload": {},
+            }
+            with open(journal_dir / "2026-04-24.jsonl", "w", encoding="utf-8") as f:
+                f.write(json.dumps(ev) + "\n")
+            os.environ["K2BI_VAULT_ROOT"] = str(vault_root)
+            os.environ["K2BI_ALERT_STATE_DIR"] = str(state_dir)
+
+            with patch(
+                "scripts.invest_alert_lib._scan_kill_paths_for_vault",
+                return_value=(False, None),
+            ):
+                alerts, state, _ = ial.run_classification(
+                    vault_root, state_dir, threshold=300, today=date(2026, 4, 24)
+                )
+                self.assertEqual(len(alerts), 0)
+                self.assertIsNone(state.last_processed_entry_id)
 
 
 if __name__ == "__main__":
