@@ -24,7 +24,7 @@ import yaml
 
 from scripts.lib.invest_ship_strategy import resolve_vault_root
 from scripts.lib.strategy_frontmatter import atomic_write_bytes, parse as parse_frontmatter
-from scripts.lib.watchlist_index import update_watchlist_index
+from scripts.lib.watchlist_index import symbol_lock, update_watchlist_index
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -478,63 +478,69 @@ def enrich(
     symbol = symbol.upper()
     watchlist_path = vault / "wiki" / "watchlist" / f"{symbol}.md"
 
-    if not watchlist_path.exists():
-        raise FileNotFoundError(f"Watchlist entry not found: {watchlist_path}")
+    # Per-symbol lock spans the full transaction: existence check, read,
+    # validate, LLM scoring, write, index update, and rollback. The LLM
+    # call is inside the lock so a concurrent promote cannot mutate the
+    # frontmatter we just sampled (m2.22 N4 fix -- prior to this lock,
+    # an in-flight enrich could have its Stage-2 write clobbered by a
+    # promote rollback that ran after the enrich's atomic write).
+    with symbol_lock(vault, symbol):
+        if not watchlist_path.exists():
+            raise FileNotFoundError(f"Watchlist entry not found: {watchlist_path}")
 
-    original_bytes = watchlist_path.read_bytes()
-    fm = parse_frontmatter(original_bytes)
+        original_bytes = watchlist_path.read_bytes()
+        fm = parse_frontmatter(original_bytes)
 
-    current_status = str(fm.get("status", "")).strip()
-    if current_status == "screened":
-        if not re_enrich:
-            date = str(fm.get("date", "unknown"))
-            print(f"{symbol} already screened on {date}; pass --re-enrich to overwrite")
-            return watchlist_path
+        current_status = str(fm.get("status", "")).strip()
+        if current_status == "screened":
+            if not re_enrich:
+                date = str(fm.get("date", "unknown"))
+                print(f"{symbol} already screened on {date}; pass --re-enrich to overwrite")
+                return watchlist_path
 
-    if re_enrich:
-        if current_status != "screened":
-            raise ValueError(
-                f"--re-enrich requires status 'screened', got {current_status!r}"
-            )
-        _validate_stage1_presence(fm, watchlist_path)
-        _validate_stage1_values(fm, watchlist_path)
-    else:
-        _validate_stage1_presence(fm, watchlist_path)
-        _validate_stage1_status(fm, watchlist_path)
-        _validate_stage1_values(fm, watchlist_path)
+        if re_enrich:
+            if current_status != "screened":
+                raise ValueError(
+                    f"--re-enrich requires status 'screened', got {current_status!r}"
+                )
+            _validate_stage1_presence(fm, watchlist_path)
+            _validate_stage1_values(fm, watchlist_path)
+        else:
+            _validate_stage1_presence(fm, watchlist_path)
+            _validate_stage1_status(fm, watchlist_path)
+            _validate_stage1_values(fm, watchlist_path)
 
-    stage1_context = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
-    validated = _score_symbol(symbol, stage1_context, "none provided", call_fn)
+        stage1_context = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+        validated = _score_symbol(symbol, stage1_context, "none provided", call_fn)
 
-    stage2_data = {
-        "quick_score": validated["quick_score"],
-        "quick_score_breakdown": validated["quick_score_breakdown"],
-        "sub_factors": validated["sub_factors"],
-        "rating_band": validated["rating_band"],
-        "band_definition_version": 1,
-    }
+        stage2_data = {
+            "quick_score": validated["quick_score"],
+            "quick_score_breakdown": validated["quick_score_breakdown"],
+            "sub_factors": validated["sub_factors"],
+            "rating_band": validated["rating_band"],
+            "band_definition_version": 1,
+        }
 
-    new_bytes = _enrich_frontmatter(original_bytes, stage2_data)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        new_bytes = _enrich_frontmatter(original_bytes, stage2_data)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    try:
-        atomic_write_bytes(watchlist_path, new_bytes)
-        _update_watchlist_index(vault, symbol, today, "screened")
-    except Exception as exc:
-        # Rollback watchlist to original on index failure to avoid split-brain
         try:
-            atomic_write_bytes(watchlist_path, original_bytes)
-        except Exception as rollback_exc:
-            raise RuntimeError(
-                f"Rollback failed after primary failure: {rollback_exc}"
-            ) from exc
-        raise
+            atomic_write_bytes(watchlist_path, new_bytes)
+            _update_watchlist_index(vault, symbol, today, "screened")
+        except Exception as exc:
+            try:
+                atomic_write_bytes(watchlist_path, original_bytes)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"Rollback failed after primary failure: {rollback_exc}"
+                ) from exc
+            raise
 
-    print(
-        f"{symbol} enriched: quick_score={validated['quick_score']}, "
-        f"band={validated['rating_band']}"
-    )
-    return watchlist_path
+        print(
+            f"{symbol} enriched: quick_score={validated['quick_score']}, "
+            f"band={validated['rating_band']}"
+        )
+        return watchlist_path
 
 
 def manual_promote(
@@ -550,39 +556,42 @@ def manual_promote(
     symbol = symbol.upper()
     watchlist_path = vault / "wiki" / "watchlist" / f"{symbol}.md"
 
-    if watchlist_path.exists():
-        raise FileExistsError(
-            f"Watchlist entry {symbol} already exists. "
-            f"Use --enrich if it is promoted, or --re-enrich if screened."
-        )
+    # Per-symbol lock spans existence check + LLM scoring + write +
+    # index update + rollback so a concurrent promote_to_watchlist of
+    # the same symbol cannot interleave (m2.22 N4 fix).
+    with symbol_lock(vault, symbol):
+        if watchlist_path.exists():
+            raise FileExistsError(
+                f"Watchlist entry {symbol} already exists. "
+                f"Use --enrich if it is promoted, or --re-enrich if screened."
+            )
 
-    stage1_context = "minimal stub: no narrative provenance, reasoning chain, citation, or ARK scores available"
-    optional_reason = reason if reason else "none provided"
-    validated = _score_symbol(symbol, stage1_context, optional_reason, call_fn)
+        stage1_context = "minimal stub: no narrative provenance, reasoning chain, citation, or ARK scores available"
+        optional_reason = reason if reason else "none provided"
+        validated = _score_symbol(symbol, stage1_context, optional_reason, call_fn)
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    stage2_data = {
-        "quick_score": validated["quick_score"],
-        "quick_score_breakdown": validated["quick_score_breakdown"],
-        "sub_factors": validated["sub_factors"],
-        "rating_band": validated["rating_band"],
-        "band_definition_version": 1,
-    }
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stage2_data = {
+            "quick_score": validated["quick_score"],
+            "quick_score_breakdown": validated["quick_score_breakdown"],
+            "sub_factors": validated["sub_factors"],
+            "rating_band": validated["rating_band"],
+            "band_definition_version": 1,
+        }
 
-    content = _build_manual_stub(symbol, stage2_data, today)
-    atomic_write_bytes(watchlist_path, content)
+        content = _build_manual_stub(symbol, stage2_data, today)
+        atomic_write_bytes(watchlist_path, content)
 
-    try:
-        _update_watchlist_index(vault, symbol, today, "screened")
-    except Exception as exc:
-        # Rollback: remove newly created watchlist file on index failure
         try:
-            watchlist_path.unlink()
-        except OSError as rollback_exc:
-            raise RuntimeError(
-                f"Rollback failed after primary failure: {rollback_exc}"
-            ) from exc
-        raise
+            _update_watchlist_index(vault, symbol, today, "screened")
+        except Exception as exc:
+            try:
+                watchlist_path.unlink()
+            except OSError as rollback_exc:
+                raise RuntimeError(
+                    f"Rollback failed after primary failure: {rollback_exc}"
+                ) from exc
+            raise
 
     print(
         f"{symbol} manually promoted: quick_score={validated['quick_score']}, "

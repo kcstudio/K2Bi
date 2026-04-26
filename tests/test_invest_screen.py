@@ -22,6 +22,7 @@ from scripts.lib.invest_screen import (
     enrich,
     main,
     manual_promote,
+    symbol_lock as _symbol_lock_imported,  # noqa: F401 -- import-side wiring check
 )
 
 
@@ -621,6 +622,45 @@ class ManualPromoteFlowTests(unittest.TestCase):
 
             with self.assertRaises(FileExistsError):
                 manual_promote("AAPL", vault_root=td_path, call_fn=self._mock_call_fn)
+
+
+class CrossShipSymbolLockWiringTests(unittest.TestCase):
+    """m2.22 N4: enrich() and manual_promote() must acquire symbol_lock
+    so a concurrent promote_to_watchlist (Ship 2) cannot interleave
+    its rollback with these Ship 2.5 mutations and lose data."""
+
+    def _mock_call_fn(self, symbol: str, ctx: str, reason: str) -> dict:
+        return _make_valid_llm_response()
+
+    def test_enrich_acquires_symbol_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            watchlist_path = td_path / "wiki" / "watchlist" / "LRCX.md"
+            watchlist_path.parent.mkdir(parents=True)
+            watchlist_path.write_text(_make_stage1_frontmatter("LRCX") + "# LRCX\n")
+
+            with patch(
+                "scripts.lib.invest_screen.symbol_lock",
+                wraps=__import__("scripts.lib.watchlist_index", fromlist=["symbol_lock"]).symbol_lock,
+            ) as spy:
+                enrich("LRCX", vault_root=td_path, call_fn=self._mock_call_fn)
+            spy.assert_called_once()
+            args, _ = spy.call_args
+            self.assertEqual(args[0], td_path)
+            self.assertEqual(args[1], "LRCX")
+
+    def test_manual_promote_acquires_symbol_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            with patch(
+                "scripts.lib.invest_screen.symbol_lock",
+                wraps=__import__("scripts.lib.watchlist_index", fromlist=["symbol_lock"]).symbol_lock,
+            ) as spy:
+                manual_promote("AAPL", vault_root=td_path, call_fn=self._mock_call_fn)
+            spy.assert_called_once()
+            args, _ = spy.call_args
+            self.assertEqual(args[0], td_path)
+            self.assertEqual(args[1], "AAPL")
 
 
 # ---------------------------------------------------------------------------
