@@ -377,9 +377,10 @@ class OrderSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self._tmp.cleanup()
 
     async def _patch_now(self, patched: datetime) -> None:
-        """Monkey-patch datetime.now in the engine module so the tick
-        clock lines up with a mid-session time."""
+        """Monkey-patch datetime.now in the engine and mock connector
+        modules so the tick clock lines up with a mid-session time."""
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
         from datetime import datetime as real_dt
 
         class _PatchedDT(real_dt):
@@ -391,11 +392,15 @@ class OrderSubmissionTests(unittest.IsolatedAsyncioTestCase):
         # we use a self-managed save/restore here.
         self._orig_dt = main_mod.datetime
         main_mod.datetime = _PatchedDT
+        self._orig_mock_dt = mock_mod.datetime
+        mock_mod.datetime = _PatchedDT
 
     async def _unpatch_now(self) -> None:
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
 
         main_mod.datetime = self._orig_dt
+        mock_mod.datetime = self._orig_mock_dt
 
     async def test_order_flow_through_validators_and_submit(self):
         await self._patch_now(_mid_session_utc())
@@ -1261,6 +1266,7 @@ class FillDedupeTests(unittest.IsolatedAsyncioTestCase):
 
     async def _patch_now(self, patched: datetime) -> None:
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
         from datetime import datetime as real_dt
 
         class _PatchedDT(real_dt):
@@ -1270,11 +1276,15 @@ class FillDedupeTests(unittest.IsolatedAsyncioTestCase):
 
         self._orig_dt = main_mod.datetime
         main_mod.datetime = _PatchedDT
+        self._orig_mock_dt = mock_mod.datetime
+        mock_mod.datetime = _PatchedDT
 
     async def _unpatch_now(self) -> None:
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
 
         main_mod.datetime = self._orig_dt
+        mock_mod.datetime = self._orig_mock_dt
 
     async def test_same_exec_id_not_counted_twice(self):
         await self._patch_now(_mid_session_utc())
@@ -1463,6 +1473,7 @@ class RunOnceTests(unittest.IsolatedAsyncioTestCase):
 
     async def _patch_now(self, patched: datetime) -> None:
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
         from datetime import datetime as real_dt
 
         class _PatchedDT(real_dt):
@@ -1472,11 +1483,15 @@ class RunOnceTests(unittest.IsolatedAsyncioTestCase):
 
         self._orig_dt = main_mod.datetime
         main_mod.datetime = _PatchedDT
+        self._orig_mock_dt = mock_mod.datetime
+        mock_mod.datetime = _PatchedDT
 
     async def _unpatch_now(self) -> None:
         import execution.engine.main as main_mod
+        import execution.connectors.mock as mock_mod
 
         main_mod.datetime = self._orig_dt
+        mock_mod.datetime = self._orig_mock_dt
 
     async def test_run_once_reaches_strategy_evaluation(self):
         await self._patch_now(_mid_session_utc())
