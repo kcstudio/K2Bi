@@ -1431,3 +1431,29 @@ feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
 **Key decisions:**
 - One-pass mechanical bucket discipline applied: single Codex pass, findings overruled inline by architect ruling rather than fix-and-re-review. This matches the K2B-architect pre-declaration that m2.20 is NOT capital-path.
 - `utility` treated as a 4th tier value (extending the 3-tier hedge-fund role model) for shared-tool infrastructure skills that have no migration target and run wherever their caller runs.
+
+## 2026-04-26 -- m2.9 (z.4)+(bb) SHIPPED -- kill_switch_active Tier-2 alerts + alert-state.json fresh-install auto-bootstrap close two Bundle 5a follow-up gaps
+
+**Commit:** `f847509` feat(alert): m2.9 (z.4) kill_switch_active classifier + (bb) fresh-install watermark bootstrap
+
+**What shipped:**
+- (z.4) Kill-switch transition alerts: one-shot Tier-2 Telegram alerts fire when the kill switch transitions from clear->active (operator places kill.flag) or active->clear (operator removes it). State is tracked in alert-state.json so restarts don't re-alert.
+- (bb) Fresh-install auto-bootstrap: when alert-state.json is missing, the classifier reads the journal tail, sets the watermark to the latest event, and logs a single info line. No Telegram backlog flood on first cold-start.
+- Shell script hardened: atomic same-directory state rename, flock serialization against overlapping cron ticks, and state commit even when there are zero alerts (fixes a pre-existing idempotency gap for event-only ticks).
+- Schema migration: old state files lacking kill_switch_state upgrade silently without false transition alerts.
+
+**Codex review:** 5 rounds of adversarial review. All concrete findings addressed:
+- Bootstrap now honors --no-save-state deferred commit semantics.
+- Bootstrap captures actual kill-switch state (not hardcoded "clear").
+- Bootstrap walks backward to find the first event with a valid journal_entry_id.
+- Kill-switch scanning uses vault-root-relative paths via _scan_kill_paths_for_vault().
+- Malformed state recovery defaults to "unknown" and seeds from live scan without alerting.
+
+**Feature status change:** m2.9 operational follow-ups -> shipped
+
+**Follow-ups:**
+- Monitor first VPS cold-start after deploy to confirm bootstrap log line appears and no backlog flood occurs.
+- Codex flagged the auto-bootstrap-on-missing-file design as potentially losing alerts if state is accidentally deleted; this is the intended disaster-recovery behavior per the job spec (no operator action, no flag). If operational experience shows this is problematic, consider adding an env-gate (e.g. K2BI_ALERT_BOOTSTRAP=1) in a future follow-up.
+
+**Key decisions:**
+- Accepted Codex recommendation to remove fallback from _scan_kill_paths_for_vault() to module-default paths when vault_root is non-default. This closes a cross-vault false-positive vector but means non-standard deployments must place kill sentinels inside the configured vault's System/ dir.
