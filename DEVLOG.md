@@ -1,3 +1,19 @@
+## 2026-04-26 -- review.sh usage gotcha + L-2026-04-26-002
+
+**Commit:** `b85b5db` docs(review): pin shell env-prefix gotcha in scripts/review.sh usage block
+
+**What shipped:** 13-line "ENV VAR GOTCHA" block added to `scripts/review.sh` usage header. Documents the POSIX evaluation-order trap where `K2B_LLM_PROVIDER=minimax FILES=... ./scripts/review.sh ... --files "$FILES"` on a single command line silently produces `--files ""`. Paired with L-2026-04-26-002 in `K2Bi-Vault/System/memory/self_improve_learnings.md` so future K2Bi sessions hit the archive before paying the round-trip.
+
+**Codex review:** skipped (comment-only addition to usage header, per SKILL.md "Config tweaks, typo fixes, one-line changes" exception).
+
+**Feature status change:** none.
+
+**Follow-ups:** none (paired L-entry already captured).
+
+**Key decisions:** none divergent from the architect's paste-ready diff.
+
+---
+
 ## 2026-04-26 -- per-repo post-build-hook convention + K2Bi planning propagation bootstrap
 
 **Commit:** `b67f9aa` feat(ship): per-repo post-build-hook convention + K2Bi planning propagation bootstrap
