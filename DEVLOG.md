@@ -1,3 +1,19 @@
+## 2026-04-26 -- invest-regime m2.14 MVP
+
+**Commit:** TBD feat(skills): m2.14 invest-regime MVP — manual classification + atomic write to wiki/regimes/current.md
+
+**What shipped:** `scripts/lib/invest_regime.py` with `classify(band, reason, indicators)` API and argparse CLI. Five valid bands (crash, bear, neutral, bull, euphoria). Atomic write via `atomic_write_bytes` to `K2Bi-Vault/wiki/regimes/current.md` with frontmatter (regime, classified_date, reasoning_summary) and body (reasoning + indicator table). Optional `--indicators` JSON dict populates a 4-row markdown table; missing keys render `n/a`. Re-classification overwrites (no history in MVP). `SKILL.md` replaced with clean m2.14 taxonomy and Phase 4 expansion stub. `learnings.md` seeded. `current-regime` propagation handler added to `scripts/lib/propagate_handlers.py` so `wiki/regimes/index.md` AUTO fence stays current. 15 unit tests (13 in `tests/test_invest_regime.py` + 2 in `tests/test_propagate_planning_status.py`).
+
+**Codex review:** Round 1 (working-tree) flagged two issues: [P2] `_first_sentence()` used fixed-order delim search so `!` or `?` before `.` produced wrong `reasoning_summary` — fixed by picking earliest terminator; [P2] unrelated parallel-session `invest_narrative_pipeline.py` rollback race — out of scope, not touched. Round 2 (focused diff on m2.14 files) flagged two issues: [P2] `render_current_regime()` extra space before semicolon in formatted output — fixed by building string with f-strings instead of `" ".join(parts)`; [P2] empty/whitespace `--reason` accepted despite required argparse flag — fixed by `reason.strip()` validation in `classify()`. Round 3 (focused diff, post-fixes) APPROVE, zero findings.
+
+**Feature status change:** invest-regime skill `status: shipped` in SKILL.md frontmatter.
+
+**Follow-ups:** Phase 4 auto-fetch indicators, history archive, scheduled detection, cross-skill consumption (all documented as out-of-scope in SKILL.md).
+
+**Key decisions:** Overwrite-without-history is correct for MVP because Phase 3 only needs current regime context, not a time series. No separate history file until operator asks for it.
+
+---
+
 ## 2026-04-26 -- propagate handlers: dynamic m2.22 gate phrasing
 
 **Commit:** `9812771` fix(propagate): replace M2_22_GATE_DESCRIPTION constant with dynamic helper
