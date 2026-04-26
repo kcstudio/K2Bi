@@ -115,6 +115,9 @@ class OnceExitBarrierTests(unittest.IsolatedAsyncioTestCase):
                 kill_path=self.kill_path,
                 # Short barrier window for fast tests.
                 once_exit_wait_seconds=0.5,
+                # Disable fill timeout so barrier tests are not tripped
+                # by the synthetic past submitted_at in _awaiting_pending.
+                fill_timeout_seconds=float("inf"),
             ),
         )
         # Engine comes up connected so the barrier's inner tick loop

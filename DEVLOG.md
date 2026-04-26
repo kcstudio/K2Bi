@@ -40,6 +40,39 @@ Two-layer fix:
 
 ---
 
+## 2026-04-26 -- engine test-suite stabilization -- 8 pre-existing capital-path test failures resolved
+
+**Commit:** `0763d97` fix(engine): stabilize 8 pre-existing capital-path test failures (8 stale-test-updated, 0 engine-regressed-fixed, 0 flake-or-skip)
+
+**Context:** These 8 tests were confirmed failing on the origin/main baseline at the commits where they were introduced (not regressions from later engine changes). Phase 3.10 unattended burn-in gate now clean.
+
+**Per-test classification table:**
+
+| Test | File | Classification | Evidence / Justification |
+|------|------|----------------|--------------------------|
+| `test_cancel_request_defers_terminal_journal` | `tests/test_engine_main.py` | (a) stale-test-updated | Test patched `execution.engine.main.datetime` but not `execution.connectors.mock.datetime`. The mock connector's `submit_order` returned `submitted_at` using real wall-clock, while the engine's `_poll_awaiting` compared against patched time. This caused `elapsed` to be negative, preventing the fill-timeout cancel path from firing. Test was broken since introduction at `530eb81`. |
+| `test_fill_transitions_to_connected_idle` | `tests/test_engine_main.py` | (a) stale-test-updated | Same datetime mismatch: `get_executions_since(since)` used `since = real_now` and `filled_at = patched_past`, so the synthetic fill was never returned. `_poll_awaiting` fell through to `_reconcile_terminal` instead of `_reconcile_fill`. Test broken since `530eb81`. |
+| `test_same_exec_id_not_counted_twice` | `tests/test_engine_main.py` | (a) stale-test-updated | Same root cause -- the synthetic fill was invisible to `_poll_awaiting` because of the datetime mismatch, so the first poll never filled and the dedupe path was never exercised. Engine dedupe logic (`e.exec_id not in pending.applied_exec_ids`) is correct. Test broken since `530eb81`. |
+| `test_barrier_journal_write_failure_does_not_silently_swallow` | `tests/test_engine_once_barrier.py` | (a) stale-test-updated | `_awaiting_pending` sets `submitted_at = _mid_session_utc()` (2026-04-21). The barrier's inner `_poll_awaiting` loop compared this against real wall-clock (2026-04-26), yielding `elapsed > fill_timeout_seconds` (60s default). The order was cancelled and `_pending_order` cleared before the barrier ever reached its timeout-and-journal code. Engine barrier logic correctly surfaces journal append errors (no try/except around `journal.append` at lines 506-528). Test broken since introduction at `cd03d41`. |
+| `test_barrier_respects_custom_timeout_config` | `tests/test_engine_once_barrier.py` | (a) stale-test-updated | Same fill-timeout interference from stale `submitted_at`. The barrier's actual wait time was never tested because `_poll_awaiting` cancelled the pending during the first poll. Test broken since `cd03d41`. |
+| `test_barrier_timeout_payload_matches_architect_shape` | `tests/test_engine_once_barrier.py` | (a) stale-test-updated | Same fill-timeout interference. The barrier exited early via `_poll_awaiting`'s timeout branch, so no `once_exit_barrier_timeout` event was emitted. Test broken since `cd03d41`. |
+| `test_barrier_times_out_and_emits_event` | `tests/test_engine_once_barrier.py` | (a) stale-test-updated | Same fill-timeout interference. `_poll_awaiting` cleared `_pending_order` before the barrier could emit. Test broken since `cd03d41`. |
+| `test_q39b_consumes_barrier_timeout_event` | `tests/test_engine_once_barrier.py` | (a) stale-test-updated | Same fill-timeout interference. No barrier event was written, so Q39B recovery had nothing to consume. Test broken since `cd03d41`. |
+
+**Fixes applied:**
+- `tests/test_engine_main.py`: Extended `_patch_now` / `_unpatch_now` in all 3 test classes (`OrderSubmissionTests`, `FillDedupeTests`, `RunOnceTests`) to also patch / restore `execution.connectors.mock.datetime`, synchronizing the mock connector's clock with the engine's patched clock.
+- `tests/test_engine_once_barrier.py`: Added `fill_timeout_seconds=float("inf")` to `EngineConfig` in `OnceExitBarrierTests.asyncSetUp` so the orthogonal fill-timeout mechanism does not interfere with barrier-specific behavior.
+
+**Regression guards:** None added -- all 8 failures were test-mock contract mismatches, not engine regressions. The existing tests now correctly exercise their intended engine surfaces.
+
+**Suite result:** 1273 passed, 1 skipped, 0 failures (full suite). Test count unchanged (no deletions, no additions).
+
+**Reviewer:** Codex (mandatory for capital-path scope, per L-2026-04-26-001).
+
+**Bundle 5 / Phase 3.10 note:** Milestones row updated: "Pre-existing 8 engine test failures stabilized 2026-04-26 at K2Bi `<sha>` (8 stale, 0 engine-regressed-fixed, 0 skipped); Phase 3.10 burn-in gate now clean."
+
+---
+
 ## 2026-04-26 -- m2.22 Codex full-stack review SHIPPED -- closes Bundle 5 (5/5), unblocks Phase 3.10 burn-in window
 
 **Commits:** `9b0f0b3` fix(m2.22-review): F1-F4 + `3c98417` fix(m2.22-review-r2): N1+N2 + `dbee41f` fix(m2.22-review-r3): N3 + `317cdba` fix(m2.22-review-r4): N4
