@@ -1726,3 +1726,26 @@ feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
 
 **Key decisions:**
 - Accepted Codex recommendation to remove fallback from _scan_kill_paths_for_vault() to module-default paths when vault_root is non-default. This closes a cross-vault false-positive vector but means non-standard deployments must place kill sentinels inside the configured vault's System/ dir.
+
+## 2026-04-29 -- Phase 3.8.6 MVP-1 SHIPPED -- L-2026-04-27-004 + L-2026-04-27-005 + 2 policy guards
+
+**Commit:** `84fbc79` memory: L-2026-04-27-004 + L-2026-04-27-005 + 2 policy guards (Phase 3.8.6 MVP-1)
+
+**What shipped:**
+- Appended L-2026-04-27-004 to K2Bi-Vault/System/memory/self_improve_learnings.md: "Curated info sets must be primary-source-verified before thesis drafting" (guard: invest-thesis consume_curated_info_set, risk high).
+- Appended L-2026-04-27-005 to K2Bi-Vault/System/memory/self_improve_learnings.md: "Bucket-rule thresholds must be cross-checked against management forward guidance before locking" (guard: invest-strategy bucket_rule_threshold_lock, risk high).
+- Appended both corresponding JSONL guards to K2Bi-Vault/wiki/context/policy-ledger.jsonl.
+- No skill bodies modified, no strategy specs modified, no CALX work touched, no feature note created (--no-feature).
+
+**Adversarial review:** Self-review pass clean. Verified verbatim match against .kimi/job.md SECTIONS A1/A2/B1/B2, valid JSONL with all six fields, no duplicate L-IDs, no out-of-scope file changes.
+
+**Feature status change:** N/A (memory-only work; gates MVP-2 and MVP-3 in subsequent sessions)
+
+**Follow-ups:**
+- MVP-2: verification gate inside invest-thesis (operator-driven checklist on non-yfinance-sourced load-bearing claims).
+- MVP-3: forward-guidance prompt at bucket-rule lock-time in discipline-parameter dialogue.
+- CALX shadow-verification rerun after MVP-3 ships, not first paper trade.
+
+**Key decisions:**
+- Conservative auto-mode ON: no auto-merge over P0/P1 without operator approval. Self-review returned clean.
+- Scope strictly limited to memory + ledger; no code changes, no wiki back-fills, no active_rules.md promotion.
