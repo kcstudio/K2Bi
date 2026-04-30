@@ -1777,7 +1777,7 @@ feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
 
 ## 2026-04-29 -- Phase 3.8.6 MVP-3 SHIPPED -- forward-guidance gate at --approve-strategy
 
-**Commit:** `PENDING` feat(invest-ship): forward-guidance gate at --approve-strategy (Phase 3.8.6 MVP-3)
+**Commit:** `33b9ba5` feat(invest-ship): forward-guidance gate at --approve-strategy (Phase 3.8.6 MVP-3)
 
 **What shipped:**
 - `scripts/lib/strategy_frontmatter.py`: added `ThresholdedMetric` + `ForwardGuidanceCheck` dataclasses, `extract_forward_guidance_check()` parser (permissive on absence, strict on malformation), and `validate_forward_guidance_check()` enforcing the MVP-3 matrix (pass / override / waive).
