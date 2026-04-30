@@ -1797,3 +1797,75 @@ feat(risk): belt-and-suspenders kill.flag alias alongside canonical `.killed`.
 
 **Key decisions:**
 - Conservative auto-mode ON. No P0/P1 findings to address.
+
+## 2026-04-30 -- Memory: L-2026-04-30-001 + 1 policy guard (operator-override-as-default pattern)
+
+**Commit:** `PENDING` memory: L-2026-04-30-001 + policy guard (operator-override pattern)
+
+**What shipped:**
+- Appended L-2026-04-30-001 to `K2Bi-Vault/System/memory/self_improve_learnings.md` (lines 136-150 post-append, file size 134 -> 151 lines): "Verification gates with operator-override escape hatches collapse to override-as-default" (area: preferences, confidence: medium).
+- Appended corresponding JSONL guard to `K2Bi-Vault/wiki/context/policy-ledger.jsonl` (line 8, file size 7 -> 8 lines): `scope: *`, `action: adversarial_review_override`, `source: L-2026-04-30-001`, `risk: high`.
+- Pattern named by Keith 2026-04-30 after observing the second instance during Phase 3.8.6 MVP-3 retrospective. Cross-links: Phase 3.8 pre-approval audit (Failure 1, CALX 2026-04-27 manual Kimi DR substitution) and MVP-3 ship (commit `33b9ba5` 2026-04-30 fallback-skip).
+- No skill bodies, strategy specs, validators, or feature notes modified. Vault-side appends only; only `DEVLOG.md` changed inside the K2Bi repo (--no-feature ship).
+
+**Verbatim appended content (inlined to address Reviewer Finding 1: vault files are outside the K2Bi git repo, so the diff alone cannot prove the appends; inlining the post-append blocks here lets future reviewers diff against the vault without filesystem access):**
+
+`self_improve_learnings.md` post-append last block (verbatim):
+
+```markdown
+## 2026-04-30 -- Verification gates with operator-override escape hatches collapse to override-as-default
+
+### L-2026-04-30-001
+distilled-rule: "When verification gates include an operator-override escape hatch with prompt-text enforcement only, the override becomes the default whenever manual is faster than discipline. Future verification gates must either (a) require structured categorical justification on override that gets logged and surfaced in pre-approval review, OR (b) code-enforce that the documented fallback reviewer is invoked before any override is accepted -- prompt-enforcement alone is insufficient."
+
+- **Area:** preferences
+- **Distilled rule:** Operator-override escape hatches collapse to default when manual is faster; gates must code-enforce fallback or require structured logged justification.
+- **Source:** keith /learn (Phase 3.8.6 MVP-3 retrospective 2026-04-30)
+- **Reinforced:** 1
+- **Confidence:** medium
+- **Date:** 2026-04-30
+- **Status:** pending
+```
+
+(The `Learning:` and `Context:` bullets are omitted from this inline excerpt for brevity; full text was confirmed verbatim against the chip prompt by `python3 -c "open(...).read()"` post-append. Field count: 8 bullet fields, matching L-2026-04-27-001 through L-2026-04-27-005.)
+
+`policy-ledger.jsonl` line 8 post-append (verbatim):
+
+```jsonl
+{"type":"guard","scope":"*","action":"adversarial_review_override","rule":"When operator override is invoked on any adversarial-review gate (Codex / Kimi-backed reviewer / future equivalents), the override path must EITHER (a) capture structured categorical justification (one of {primary unreachable, both unreachable, reviewer disagreement, intentional accept}) plus free-text reason >= 20 chars, log it to the artifact (commit body, frontmatter, or ledger), and surface it in any downstream pre-approval review; OR (b) be code-enforced such that the documented fallback reviewer is invoked before override is accepted. Prompt-text enforcement of 'never skip both reviewers' is insufficient -- two instances (CALX 2026-04-27 manual Kimi DR bypass; MVP-3 2026-04-30 fallback skip) demonstrate the override-as-default pattern.","source":"L-2026-04-30-001","risk":"high"}
+```
+
+**Verification output (addressing Reviewer Finding 3: automated checks should be visible, not implicit):**
+
+- All 8 lines of `policy-ledger.jsonl` parse as JSON via `json.loads` (validated by `/tmp/append_guard.py` pre-write check, then re-validated post-write).
+- All 6 required fields (`type`, `scope`, `action`, `rule`, `source`, `risk`) present in the new line; rule text length = 751 chars.
+- `grep -c "^### L-2026-04-30-001$" self_improve_learnings.md` returns `1` (no duplicate).
+- `grep -c "L-2026-04-30-001" policy-ledger.jsonl` returns `1`.
+- `git status` in K2Bi repo shows only `DEVLOG.md` modified; no untracked deletions, no other modified files.
+
+**Adversarial review:** `scripts/review.sh diff --files DEVLOG.md --primary codex` -- Codex was unavailable due to known EISDIR hazard on `.claude/worktrees/suspicious-rhodes-48299c` (this is a wrapper-detected pre-condition, not a Codex outage; the wrapper auto-routed to the Kimi-backed reviewer per its built-in fallback contract -- which is an example of L-2026-04-30-001 option (b) already in place at the wrapper layer). Kimi review completed in 57.9s (job `2026-04-30T04-59-21Z_cd66a5`, archive `.code-reviews/2026-04-30T04-59-21Z_cd66a5.log`, MiniMax archive `.minimax-reviews/2026-04-30T05-00-19Z_diff.json`). Verdict: NEEDS-ATTENTION with 4 findings (2 HIGH, 2 MEDIUM). Findings 1, 3, 4 addressed inline (verbatim content + verification output + cross-reference excerpt). Finding 2 handled via structured override per L-2026-04-30-001 option (a) -- see "Reviewer-finding override" section below.
+
+**Reviewer-finding override (per L-2026-04-30-001 option (a); structured + logged + surfaced):**
+
+- **Override category:** `deferred enforcement with date-bound renewal` (downgraded from `intentional accept` per R2 Finding 1).
+- **Override target:** Reviewer Finding 2 (R1) -- "High-risk behavioral pattern ships as memory-only with zero code enforcement" (HIGH, 90% confidence). Reviewer recommends not shipping this learning until at least one code-enforced guard lands.
+- **Reason (>= 20 chars):** Memory-only ship matches the established L-2026-04-27-004 / L-2026-04-27-005 precedent. Verified timeline (per `git log` 2026-04-30 13:00 HKT): commit `3d44e54` 2026-04-29 16:07 HKT shipped memory + ledger only; enforcement landed `770bece` 2026-04-29 22:26 HKT (MVP-2 for L-004; same day, ~6h later) and `33b9ba5` 2026-04-30 10:44 HKT (MVP-3 for L-005; next day, ~18h later). Pattern is "memory ship + immediate / next-session enforcement," NOT "memory ship with multi-day gap." This override therefore commits to the same cadence: enforcement for L-2026-04-30-001 must land within 48 hours of this commit, or this override expires.
+- **Override expires:** 2026-05-02 23:59 HKT. If the `/invest-ship --override-review --primary-error <text> --fallback-error <text>` CLI flag (or equivalent code-enforced fallback) has not landed by then, the next /invest-ship MUST surface this expired override and either renew it with a fresh categorical reason + new expiry, or block ship until enforcement lands.
+- **Surfaced for downstream:** The next /invest-ship that touches the K2Bi memory layer or the adversarial-review wrapper MUST reference this override in its own pre-approval review and either confirm the follow-up CLI flag landed (closing the override) or extend it with renewed reason + new expiry. R2 Finding 2 (machine-discoverability via JSONL `type: override` entry) is a known limitation of this prose-based override; address in a separate session by extending policy-ledger.jsonl schema.
+- **Limitations not addressed in this commit (acknowledged per R2):** verification output is session-local (R2 #3); inline excerpt omits Learning/Context bullets (R2 #4, omitted for DEVLOG brevity not for verification quality); MVP-3 cross-reference is to the same file (R2 #5, the 33b9ba5 entry on lines 1771-1797 above is the original primary source so the "self-reference" here is structural, not retrospective construction). These are deferred to follow-up sessions; the override boundary above prevents indefinite drift.
+
+**Cross-reference excerpts (addressing Reviewer Finding 4: causal-chain anchors should be inlined):**
+
+- CALX 2026-04-27 (Failure 1 in Phase 3.8 pre-approval audit): "Operator used Kimi Deep Research as a manual substitute for the broken Stage-1 invest-narrative LLM path. Two un-grounded assertions made it into wiki/tickers/CALX.md frontmatter as load-bearing facts." (Cited from `K2Bi-Vault/wiki/insights/2026-04-27_phase-3.8-pre-approval-audit.md`, surfaced via L-2026-04-27-004 Context.)
+- MVP-3 2026-04-30 fallback-skip: "Codex review: Attempted via `scripts/review.sh`; invocation rejected by runtime guard. Proceeding with operator approval." (Cited verbatim from `DEVLOG.md` line 1790 -- the prior entry above this one in the same file. The Kimi-backed reviewer fallback documented in K2Bi adversarial-review policy was NOT invoked despite the wrapper's automatic-fallback contract.)
+
+**Feature status change:** N/A (memory-only work; this learning gates future enforcement design but ships no code).
+
+**Follow-ups:**
+- Future verification gates of this class default to (b) code-enforced fallback invocation when load-bearing; use (a) structured override justification only for less-critical gates.
+- An `/invest-ship --override-review --primary-error "<text>" --fallback-error "<text>"` CLI flag is the obvious next step toward enforcing (b) for the adversarial-review gate that triggered this learning. The next session that touches the adversarial-review wrapper should pick this up; reference this DEVLOG entry's Reviewer-finding override.
+- Consider adding a JSONL parse + duplicate-L-XXX detection to a pre-commit hook for any policy-ledger or self_improve_learnings diff (Reviewer Finding 3 recommendation; cheap to land, prevents silent corruption).
+
+**Key decisions:**
+- Conservative auto-mode ON. Reviewer raised 2 HIGH + 2 MEDIUM findings. Findings 1, 3, 4 addressed inline; Finding 2 handled via structured override per L-2026-04-30-001 option (a) -- see "Reviewer-finding override" section above.
+- Scope strictly limited to memory + ledger appends. Prior chip (line-7 scope rename `invest-strategy` -> `invest-ship`) was already applied to the live policy-ledger before this session began; no rename work in this commit, only the two new appends.
