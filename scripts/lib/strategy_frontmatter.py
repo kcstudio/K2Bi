@@ -56,6 +56,7 @@ import sys
 import tempfile
 import unicodedata
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
@@ -275,6 +276,215 @@ def _nfc(value: Any) -> Any:
             return dt_form
         return unicodedata.normalize("NFC", value)
     return unicodedata.normalize("NFC", str(value))
+
+
+# ---------- forward-guidance check (Phase 3.8.6 MVP-3) ----------
+
+
+@dataclass(frozen=True)
+class ThresholdedMetric:
+    """One thresholded metric in a strategy's bucket-rule logic."""
+
+    metric: str
+    locked_threshold_text: str
+    guide_source_text: str
+    guide_range_text: str
+    sits_inside_guide: bool
+    operator_note: str | None = None
+
+
+@dataclass(frozen=True)
+class ForwardGuidanceCheck:
+    """Aggregate forward-guidance check block for a strategy spec."""
+
+    completed_at: str
+    status: str
+    override_reason: str | None = None
+    waive_reason: str | None = None
+    thresholded_metrics: list[ThresholdedMetric] = None  # type: ignore[assignment]
+
+
+# Minimum length for override / waive reasons (same as MVP-2).
+MIN_FGC_REASON_LEN = 20
+
+# Allowed aggregate statuses.
+ALLOWED_FGC_STATUSES = frozenset({"pass", "override", "waive"})
+
+
+def _coerce_bool(raw: Any) -> bool:
+    """Accept only real booleans (not strings like 'true')."""
+    if isinstance(raw, bool):
+        return raw
+    raise ValueError(f"expected bool, got {type(raw).__name__}")
+
+
+def _require_str(raw: Any, path: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{path} must be a non-empty string, got {raw!r}")
+    return raw.strip()
+
+
+def extract_forward_guidance_check(
+    frontmatter: dict[str, Any],
+) -> ForwardGuidanceCheck | None:
+    """Parse the ``forward_guidance_check:`` block from parsed YAML frontmatter.
+
+    Returns ``None`` when the block is absent (the validator handles
+    missing-block as a refusal; the parser is permissive). Raises
+    ``ValueError`` if the block is structurally malformed (wrong types,
+    missing required sub-fields).
+    """
+    raw = frontmatter.get("forward_guidance_check")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"forward_guidance_check must be a mapping, got {type(raw).__name__}"
+        )
+
+    status = _require_str(raw.get("status"), "forward_guidance_check.status")
+    completed_at = _require_str(
+        raw.get("completed_at"), "forward_guidance_check.completed_at"
+    )
+
+    # Validate completed_at is parseable ISO-8601.
+    try:
+        _dt.datetime.fromisoformat(completed_at)
+    except ValueError as exc:
+        raise ValueError(
+            f"forward_guidance_check.completed_at must be ISO-8601 datetime, "
+            f"got {completed_at!r}: {exc}"
+        ) from exc
+
+    override_reason = raw.get("override_reason")
+    if override_reason is not None and not isinstance(override_reason, str):
+        raise ValueError(
+            f"forward_guidance_check.override_reason must be a string or null, "
+            f"got {type(override_reason).__name__}"
+        )
+
+    waive_reason = raw.get("waive_reason")
+    if waive_reason is not None and not isinstance(waive_reason, str):
+        raise ValueError(
+            f"forward_guidance_check.waive_reason must be a string or null, "
+            f"got {type(waive_reason).__name__}"
+        )
+
+    raw_metrics = raw.get("thresholded_metrics")
+    if raw_metrics is None:
+        raise ValueError(
+            "forward_guidance_check.thresholded_metrics is required"
+        )
+    if not isinstance(raw_metrics, list):
+        raise ValueError(
+            f"forward_guidance_check.thresholded_metrics must be a list, "
+            f"got {type(raw_metrics).__name__}"
+        )
+
+    metrics: list[ThresholdedMetric] = []
+    for idx, entry in enumerate(raw_metrics):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"forward_guidance_check.thresholded_metrics[{idx}] must be a "
+                f"mapping, got {type(entry).__name__}"
+            )
+        metric = _require_str(
+            entry.get("metric"),
+            f"forward_guidance_check.thresholded_metrics[{idx}].metric",
+        )
+        locked_threshold_text = _require_str(
+            entry.get("locked_threshold_text"),
+            f"forward_guidance_check.thresholded_metrics[{idx}].locked_threshold_text",
+        )
+        guide_source_text = _require_str(
+            entry.get("guide_source_text"),
+            f"forward_guidance_check.thresholded_metrics[{idx}].guide_source_text",
+        )
+        guide_range_text = _require_str(
+            entry.get("guide_range_text"),
+            f"forward_guidance_check.thresholded_metrics[{idx}].guide_range_text",
+        )
+        try:
+            sits_inside_guide = _coerce_bool(entry.get("sits_inside_guide"))
+        except ValueError as exc:
+            raise ValueError(
+                f"forward_guidance_check.thresholded_metrics[{idx}].sits_inside_guide: "
+                f"{exc}"
+            ) from exc
+        operator_note = entry.get("operator_note")
+        if operator_note is not None and not isinstance(operator_note, str):
+            raise ValueError(
+                f"forward_guidance_check.thresholded_metrics[{idx}].operator_note "
+                f"must be a string or null, got {type(operator_note).__name__}"
+            )
+        metrics.append(
+            ThresholdedMetric(
+                metric=metric,
+                locked_threshold_text=locked_threshold_text,
+                guide_source_text=guide_source_text,
+                guide_range_text=guide_range_text,
+                sits_inside_guide=sits_inside_guide,
+                operator_note=operator_note,
+            )
+        )
+
+    return ForwardGuidanceCheck(
+        completed_at=completed_at,
+        status=status,
+        override_reason=override_reason,
+        waive_reason=waive_reason,
+        thresholded_metrics=metrics,
+    )
+
+
+def validate_forward_guidance_check(fgc: ForwardGuidanceCheck | None) -> None:
+    """Enforce the MVP-3 validator matrix. Raises ``ValueError`` with a
+    structured message naming which rule failed.
+
+    Matrix:
+      - status="pass": all metrics must have sits_inside_guide=false
+      - status="override": any inside-guide accepted; override_reason >= 20 required
+      - status="waive": empty list OK; waive_reason >= 20 required
+      - missing block, malformed fields, or missing reasons → raise
+    """
+    if fgc is None:
+        raise ValueError(
+            "forward_guidance_check block is missing from strategy frontmatter; "
+            "required for all new approvals per L-2026-04-27-005"
+        )
+
+    if fgc.status not in ALLOWED_FGC_STATUSES:
+        raise ValueError(
+            f"forward_guidance_check.status={fgc.status!r} not in allowed enum "
+            f"{sorted(ALLOWED_FGC_STATUSES)}"
+        )
+
+    if fgc.status == "pass":
+        for tm in fgc.thresholded_metrics:
+            if tm.sits_inside_guide:
+                raise ValueError(
+                    f"forward_guidance_check.status == 'pass' but "
+                    f"thresholded_metric '{tm.metric}' has sits_inside_guide=true"
+                )
+        return
+
+    if fgc.status == "override":
+        reason = fgc.override_reason or ""
+        if len(reason) < MIN_FGC_REASON_LEN:
+            raise ValueError(
+                f"forward_guidance_check.status == 'override' requires "
+                f"override_reason >= {MIN_FGC_REASON_LEN} chars, got {len(reason)}"
+            )
+        return
+
+    if fgc.status == "waive":
+        reason = fgc.waive_reason or ""
+        if len(reason) < MIN_FGC_REASON_LEN:
+            raise ValueError(
+                f"forward_guidance_check.status == 'waive' requires "
+                f"waive_reason >= {MIN_FGC_REASON_LEN} chars, got {len(reason)}"
+            )
+        return
 
 
 # ---------- parsing ----------

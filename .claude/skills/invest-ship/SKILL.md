@@ -242,6 +242,48 @@ Verify the journal shows strategy_loaded + order_proposed + order_submitted
 for <slug> (or a clean validator-rejected outcome).
 ```
 
+### Forward-guidance check (--approve-strategy gate)
+
+Every `/invest-ship --approve-strategy` call now requires a `forward_guidance_check:` block in the strategy spec frontmatter. This gate exists to prevent rule-vs-thesis self-contradiction: a locked threshold that sits inside management's published forward guidance would mechanically trigger at a level the company explicitly framed as transitory (see L-2026-04-27-005 and the 2026-04-27 pre-approval audit).
+
+**When it fires:** every `/invest-ship --approve-strategy` call.
+
+**Operator workflow:**
+1. Identify each thresholded metric in the strategy's bucket-rule / kill-criterion logic.
+2. Paste the most recent management forward guidance for that metric (operator-pasted text is the primary path; LLM-extraction is Phase 4).
+3. Determine whether the locked threshold sits inside the guide range. Mark `sits_inside_guide: true | false`.
+4. Choose aggregate `status`:
+   - `pass` -- no threshold inside any guide
+   - `override` -- intentional acceptance of an inside-guide threshold (requires `override_reason >= 20` chars)
+   - `waive` -- no thresholded metrics, or no published guide for any metric (requires `waive_reason >= 20` chars)
+
+**Frontmatter schema:**
+
+```yaml
+forward_guidance_check:
+  completed_at: "<ISO 8601 with timezone, e.g., '2026-04-27T15:30:00+08:00'>"
+  status: "pass" | "override" | "waive"
+  override_reason: "<required if status == override; >= 20 chars; explains why an inside-guide threshold is intentional>"
+  waive_reason: "<required if status == waive; >= 20 chars; explains why no published guide applies (e.g., 'no thresholded metrics in this MA-crossover strategy' or 'small-cap with no analyst guide coverage')>"
+  thresholded_metrics:
+    - metric: "<short name, e.g., 'GM TTM', 'Revenue TTM Growth', 'EPS Q-next'>"
+      locked_threshold_text: "<human-readable threshold rule, e.g., '<56% triggers bucket-4 EXIT'>"
+      guide_source_text: "<provenance; e.g., 'Q1 2026 earnings transcript published 2026-04-21' or 'operator-pasted: <verbatim excerpt>'>"
+      guide_range_text: "<the actual guide, e.g., '54.25%-57.25%' or 'no quantitative guide given for this metric'>"
+      sits_inside_guide: true | false
+      operator_note: "<optional context per metric>"
+```
+
+**What the validator refuses on:**
+- Missing `forward_guidance_check:` block entirely
+- Missing required sub-fields (e.g., `metric:` on a `thresholded_metrics` entry)
+- `status: pass` with any `sits_inside_guide: true`
+- `status: override` without `override_reason >= 20` chars
+- `status: waive` without `waive_reason >= 20` chars
+- Any structural malformation (wrong types, non-bool `sits_inside_guide`, etc.)
+
+**Cross-link:** L-2026-04-27-005
+
 #### `/ship --reject-strategy <path> --reason "<text>"`
 
 Variant of the approve workflow; spec §3.2 "Reject-Strategy variant" note.

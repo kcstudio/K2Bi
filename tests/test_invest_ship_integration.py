@@ -185,6 +185,18 @@ def _seed_proposed_strategy(
         regime_filter=["risk_on"],
         order=default_order(),
     )
+    fgc_block = (
+        "forward_guidance_check:\n"
+        '  completed_at: "2026-04-19T10:00:00+08:00"\n'
+        '  status: "pass"\n'
+        "  thresholded_metrics:\n"
+        '    - metric: "GM TTM"\n'
+        '      locked_threshold_text: ">0%"\n'
+        '      guide_source_text: "default test fixture"\n'
+        '      guide_range_text: "any"\n'
+        "      sits_inside_guide: false\n"
+    )
+    content = content.replace("\n---\n\n", f"\n{fgc_block}---\n\n")
     rel = f"wiki/strategies/strategy_{slug}.md"
     path = write_file(repo, rel, content)
     result = harness_commit(repo, env, f"draft: {slug}", rel)

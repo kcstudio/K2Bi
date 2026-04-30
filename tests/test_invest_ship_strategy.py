@@ -120,13 +120,21 @@ def _write_strategy(
     missing_order_fields: list[str] | None = None,
     name_override: str | None = None,
     filename_override: str | None = None,
+    skip_fgc: bool = False,
 ) -> Path:
     """Author a strategy file matching spec §2.1 + K2Bi File Conventions.
 
     Lets individual tests knock out specific fields to exercise the
     Step-A negative paths without duplicating the scaffolding in each
     test method.
+
+    Phase 3.8.6 MVP-3: a default valid ``forward_guidance_check`` block
+    is auto-included for ``status: proposed`` so existing happy-path
+    tests do not need to change. Tests that exercise the missing-block
+    refusal path pass ``skip_fgc=True``.
     """
+    import yaml as _yaml
+
     missing_fields = set(missing_fields or [])
     missing_order_fields = set(missing_order_fields or [])
     base_order = {
@@ -159,6 +167,29 @@ def _write_strategy(
             if k in missing_order_fields:
                 continue
             lines.append(f"  {k}: {v}")
+    # Phase 3.8.6 MVP-3: auto-insert a default valid FGC block for
+    # proposed strategies so pre-existing tests continue to pass.
+    if status == "proposed" and not skip_fgc:
+        default_fgc = {
+            "forward_guidance_check": {
+                "completed_at": "2026-04-19T10:00:00+08:00",
+                "status": "pass",
+                "thresholded_metrics": [
+                    {
+                        "metric": "GM TTM",
+                        "locked_threshold_text": ">0%",
+                        "guide_source_text": "default test fixture",
+                        "guide_range_text": "any",
+                        "sits_inside_guide": False,
+                    }
+                ],
+            }
+        }
+        fgc_yaml = _yaml.safe_dump(
+            default_fgc, default_flow_style=False, allow_unicode=True
+        )
+        for line in fgc_yaml.rstrip("\n").splitlines():
+            lines.append(line)
     # Append extras verbatim (for tests that need approved_at pre-existing,
     # retired_at pre-existing, etc.).
     for line in extras or []:
@@ -796,6 +827,243 @@ class BearCaseGateThroughApprovalTests(unittest.TestCase):
         # message -- this proves the ordering: shape check precedes the
         # bear-case scan so a malformed strategy does not hit the gate.
         self.assertIn("ticker", str(cm.exception).lower())
+
+
+# ---------- Phase 3.8.6 MVP-3: forward-guidance gate through handle_approve_strategy ----------
+
+
+class ForwardGuidanceGateThroughApprovalTests(unittest.TestCase):
+    """End-to-end tests that the forward-guidance gate correctly propagates
+    through handle_approve_strategy -- exercising extract + validate +
+    ValidationError surfacing.
+    """
+
+    def setUp(self):
+        self.repo, self.parent_sha = _make_tmp_repo()
+        self.today = _dt.date(2026, 4, 19)
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", str(self.repo)], check=False)
+
+    def _fgc_extras(self, fgc_dict: dict) -> list[str]:
+        """Serialize a forward_guidance_check dict into frontmatter lines."""
+        import yaml
+        dumped = yaml.safe_dump(
+            {"forward_guidance_check": fgc_dict},
+            default_flow_style=False,
+            allow_unicode=True,
+        )
+        return dumped.rstrip("\n").splitlines()
+
+    def _seed_gates(self, slug: str = "spy"):
+        """Seed bear-case + backtest so only the FGC gate decides."""
+        _seed_bear_case_proceed(
+            self.repo, ticker="SPY", today=self.today.isoformat(),
+        )
+        _seed_backtest_passed(self.repo, slug=slug, date="2026-04-19")
+
+    def test_pass_valid_block_approves(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "pass",
+            "thresholded_metrics": [
+                {
+                    "metric": "GM TTM",
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "Q1 2026 earnings transcript published 2026-04-21",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": False,
+                }
+            ],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        hints = iss.handle_approve_strategy(
+            path,
+            parent_sha=self.parent_sha,
+            today=self.today,
+            vault_root=self.repo,
+        )
+        self.assertEqual(hints.slug, "spy")
+        self.assertEqual(hints.transition, "proposed -> approved")
+        rewritten = path.read_text(encoding="utf-8")
+        self.assertIn("status: approved", rewritten)
+
+    def test_override_with_reason_approves(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "override",
+            "override_reason": "Management guide is conservative; threshold intentional.",
+            "thresholded_metrics": [
+                {
+                    "metric": "GM TTM",
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "operator-pasted: 'we expect Q2 GM in the 54.25%-57.25% range'",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": True,
+                }
+            ],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        hints = iss.handle_approve_strategy(
+            path,
+            parent_sha=self.parent_sha,
+            today=self.today,
+            vault_root=self.repo,
+        )
+        self.assertEqual(hints.slug, "spy")
+        rewritten = path.read_text(encoding="utf-8")
+        self.assertIn("status: approved", rewritten)
+
+    def test_waive_empty_metrics_approves(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "waive",
+            "waive_reason": "No thresholded metrics in this MA-crossover strategy.",
+            "thresholded_metrics": [],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        hints = iss.handle_approve_strategy(
+            path,
+            parent_sha=self.parent_sha,
+            today=self.today,
+            vault_root=self.repo,
+        )
+        self.assertEqual(hints.slug, "spy")
+        rewritten = path.read_text(encoding="utf-8")
+        self.assertIn("status: approved", rewritten)
+
+    def test_missing_block_refuses(self):
+        self._seed_gates()
+        path = _write_strategy(self.repo, slug="spy", skip_fgc=True)
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path,
+                parent_sha=self.parent_sha,
+                today=self.today,
+                vault_root=self.repo,
+            )
+        self.assertIn("missing", str(cm.exception).lower())
+        self.assertIn("forward_guidance_check", str(cm.exception).lower())
+        # File must NOT have been mutated.
+        self.assertIn("status: proposed", path.read_text(encoding="utf-8"))
+        self.assertNotIn("approved_at:", path.read_text(encoding="utf-8"))
+
+    def test_pass_with_inside_guide_refuses(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "pass",
+            "thresholded_metrics": [
+                {
+                    "metric": "GM TTM",
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "s",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": True,
+                }
+            ],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path,
+                parent_sha=self.parent_sha,
+                today=self.today,
+                vault_root=self.repo,
+            )
+        self.assertIn("pass", str(cm.exception))
+        self.assertIn("GM TTM", str(cm.exception))
+        self.assertIn("status: proposed", path.read_text(encoding="utf-8"))
+
+    def test_override_without_reason_refuses(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "override",
+            "override_reason": "",
+            "thresholded_metrics": [
+                {
+                    "metric": "GM TTM",
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "s",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": True,
+                }
+            ],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path,
+                parent_sha=self.parent_sha,
+                today=self.today,
+                vault_root=self.repo,
+            )
+        self.assertIn("override", str(cm.exception))
+        self.assertIn("20", str(cm.exception))
+        self.assertIn("status: proposed", path.read_text(encoding="utf-8"))
+
+    def test_waive_without_reason_refuses(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "waive",
+            "waive_reason": "short",
+            "thresholded_metrics": [],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", extras=self._fgc_extras(fgc),
+        )
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path,
+                parent_sha=self.parent_sha,
+                today=self.today,
+                vault_root=self.repo,
+            )
+        self.assertIn("waive", str(cm.exception))
+        self.assertIn("20", str(cm.exception))
+        self.assertIn("status: proposed", path.read_text(encoding="utf-8"))
+
+    def test_malformed_block_missing_metric_refuses(self):
+        self._seed_gates()
+        fgc = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "pass",
+            "thresholded_metrics": [
+                {
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "s",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": False,
+                }
+            ],
+        }
+        path = _write_strategy(
+            self.repo, slug="spy", skip_fgc=True, extras=self._fgc_extras(fgc),
+        )
+        with self.assertRaises(iss.ValidationError) as cm:
+            iss.handle_approve_strategy(
+                path,
+                parent_sha=self.parent_sha,
+                today=self.today,
+                vault_root=self.repo,
+            )
+        self.assertIn("metric", str(cm.exception).lower())
+        self.assertIn("status: proposed", path.read_text(encoding="utf-8"))
 
 
 # ---------- handle_reject_strategy ----------

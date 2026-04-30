@@ -903,5 +903,209 @@ class HasSectionTests(unittest.TestCase):
         self.assertFalse(sf.has_section(body, "How This Works"))
 
 
+# ---------- forward-guidance check (Phase 3.8.6 MVP-3) ----------
+
+
+class ForwardGuidanceExtractTests(unittest.TestCase):
+    def _block(self, **kwargs) -> dict[str, Any]:
+        """Build a minimal valid forward_guidance_check dict."""
+        base = {
+            "completed_at": "2026-04-27T15:30:00+08:00",
+            "status": "pass",
+            "thresholded_metrics": [
+                {
+                    "metric": "GM TTM",
+                    "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                    "guide_source_text": "Q1 2026 earnings transcript published 2026-04-21",
+                    "guide_range_text": "54.25%-57.25%",
+                    "sits_inside_guide": False,
+                }
+            ],
+        }
+        base.update(kwargs)
+        return base
+
+    def test_missing_block_returns_none(self):
+        fm = {"name": "x", "status": "proposed"}
+        self.assertIsNone(sf.extract_forward_guidance_check(fm))
+
+    def test_valid_block_with_one_metric(self):
+        fm = {"forward_guidance_check": self._block()}
+        fgc = sf.extract_forward_guidance_check(fm)
+        self.assertIsNotNone(fgc)
+        self.assertEqual(fgc.status, "pass")
+        self.assertEqual(len(fgc.thresholded_metrics), 1)
+        self.assertEqual(fgc.thresholded_metrics[0].metric, "GM TTM")
+        self.assertFalse(fgc.thresholded_metrics[0].sits_inside_guide)
+
+    def test_valid_override_block(self):
+        fm = {
+            "forward_guidance_check": self._block(
+                status="override",
+                override_reason="Management guide is conservative; threshold is intentional.",
+                thresholded_metrics=[
+                    {
+                        "metric": "GM TTM",
+                        "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                        "guide_source_text": "operator-pasted: 'we expect Q2 GM in the 54.25%-57.25% range'",
+                        "guide_range_text": "54.25%-57.25%",
+                        "sits_inside_guide": True,
+                    }
+                ],
+            )
+        }
+        fgc = sf.extract_forward_guidance_check(fm)
+        self.assertEqual(fgc.status, "override")
+        self.assertTrue(fgc.thresholded_metrics[0].sits_inside_guide)
+
+    def test_valid_waive_block(self):
+        fm = {
+            "forward_guidance_check": self._block(
+                status="waive",
+                waive_reason="No thresholded metrics in this MA-crossover strategy.",
+                thresholded_metrics=[],
+            )
+        }
+        fgc = sf.extract_forward_guidance_check(fm)
+        self.assertEqual(fgc.status, "waive")
+        self.assertEqual(fgc.thresholded_metrics, [])
+
+    def test_malformed_block_not_dict_raises(self):
+        fm = {"forward_guidance_check": "not-a-dict"}
+        with self.assertRaises(ValueError) as cm:
+            sf.extract_forward_guidance_check(fm)
+        self.assertIn("mapping", str(cm.exception).lower())
+
+    def test_missing_metric_field_raises(self):
+        metrics = [
+            {
+                "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                "guide_source_text": "s",
+                "guide_range_text": "54.25%-57.25%",
+                "sits_inside_guide": False,
+            }
+        ]
+        fm = {"forward_guidance_check": self._block(thresholded_metrics=metrics)}
+        with self.assertRaises(ValueError) as cm:
+            sf.extract_forward_guidance_check(fm)
+        self.assertIn("metric", str(cm.exception).lower())
+
+    def test_invalid_sits_inside_guide_type_raises(self):
+        metrics = [
+            {
+                "metric": "GM TTM",
+                "locked_threshold_text": "<56% triggers bucket-4 EXIT",
+                "guide_source_text": "s",
+                "guide_range_text": "54.25%-57.25%",
+                "sits_inside_guide": "false",
+            }
+        ]
+        fm = {"forward_guidance_check": self._block(thresholded_metrics=metrics)}
+        with self.assertRaises(ValueError) as cm:
+            sf.extract_forward_guidance_check(fm)
+        self.assertIn("bool", str(cm.exception).lower())
+
+    def test_missing_thresholded_metrics_raises(self):
+        block = self._block()
+        del block["thresholded_metrics"]
+        fm = {"forward_guidance_check": block}
+        with self.assertRaises(ValueError) as cm:
+            sf.extract_forward_guidance_check(fm)
+        self.assertIn("thresholded_metrics", str(cm.exception).lower())
+
+    def test_invalid_completed_at_raises(self):
+        fm = {"forward_guidance_check": self._block(completed_at="not-a-date")}
+        with self.assertRaises(ValueError) as cm:
+            sf.extract_forward_guidance_check(fm)
+        self.assertIn("completed_at", str(cm.exception).lower())
+
+
+class ForwardGuidanceValidateTests(unittest.TestCase):
+    def _metric(self, sits_inside_guide: bool = False) -> sf.ThresholdedMetric:
+        return sf.ThresholdedMetric(
+            metric="GM TTM",
+            locked_threshold_text="<56% triggers bucket-4 EXIT",
+            guide_source_text="Q1 2026 earnings transcript published 2026-04-21",
+            guide_range_text="54.25%-57.25%",
+            sits_inside_guide=sits_inside_guide,
+        )
+
+    def test_pass_with_all_outside_guide_ok(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="pass",
+            thresholded_metrics=[self._metric(sits_inside_guide=False)],
+        )
+        sf.validate_forward_guidance_check(fgc)  # must not raise
+
+    def test_pass_with_inside_guide_refuses(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="pass",
+            thresholded_metrics=[self._metric(sits_inside_guide=True)],
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_forward_guidance_check(fgc)
+        self.assertIn("pass", str(cm.exception))
+        self.assertIn("GM TTM", str(cm.exception))
+
+    def test_override_with_reason_ok(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="override",
+            override_reason="Management guide is conservative; threshold intentional.",
+            thresholded_metrics=[self._metric(sits_inside_guide=True)],
+        )
+        sf.validate_forward_guidance_check(fgc)  # must not raise
+
+    def test_override_without_reason_refuses(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="override",
+            override_reason="",
+            thresholded_metrics=[self._metric(sits_inside_guide=True)],
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_forward_guidance_check(fgc)
+        self.assertIn("override", str(cm.exception))
+        self.assertIn("20", str(cm.exception))
+
+    def test_waive_with_reason_ok(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="waive",
+            waive_reason="No thresholded metrics in this MA-crossover strategy.",
+            thresholded_metrics=[],
+        )
+        sf.validate_forward_guidance_check(fgc)  # must not raise
+
+    def test_waive_without_reason_refuses(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="waive",
+            waive_reason="short",
+            thresholded_metrics=[],
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_forward_guidance_check(fgc)
+        self.assertIn("waive", str(cm.exception))
+        self.assertIn("20", str(cm.exception))
+
+    def test_missing_block_refuses(self):
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_forward_guidance_check(None)
+        self.assertIn("missing", str(cm.exception).lower())
+
+    def test_unknown_status_refuses(self):
+        fgc = sf.ForwardGuidanceCheck(
+            completed_at="2026-04-27T15:30:00+08:00",
+            status="maybe",
+            thresholded_metrics=[],
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_forward_guidance_check(fgc)
+        self.assertIn("maybe", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

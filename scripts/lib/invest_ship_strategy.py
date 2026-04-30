@@ -2483,6 +2483,15 @@ def handle_approve_strategy(
         fm, ["approved_at", "approved_commit_sha"], path
     )
 
+    # Phase 3.8.6 MVP-3: forward-guidance gate. Runs AFTER syntactic
+    # validation and BEFORE the bear-case + backtest gates so a malformed
+    # or missing block refuses early with a clear message.
+    try:
+        fgc = sf.extract_forward_guidance_check(fm)
+        sf.validate_forward_guidance_check(fgc)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
     # Bundle 4 cycle 2: bear-case freshness gate. Runs AFTER syntactic
     # validation (we need order.ticker to scan) and BEFORE capture_parent_
     # sha + the atomic rewrite (so a REFUSE leaves the working tree
