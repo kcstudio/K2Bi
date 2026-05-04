@@ -1,3 +1,38 @@
+## 2026-05-04 -- review-runner reconnect-stall detector: closes Codex cold-start flake window
+
+**Commit:** `14f2a36`
+
+**Triggered by:** 2026-05-04T07:22:22Z `/invest-ship` adversarial re-review of an `invest_coach.py` HIGH fix wedged for the full 300s `--deadline` (`.code-reviews/2026-05-04T07-22-22Z_fad916.log`). Codex companion emitted `Reconnecting... 5/5` then went silent indefinitely; the runner had no signal between exhausted-reconnect and `HARD_DEADLINE`. Same surface succeeded contemporaneously at 07:08 (`8038b5`, 110.7s) after going through the same 5/5 reconnect cycle. Codex Agent path (`subagent_type=codex:codex-rescue`, fresh subprocess in clean execution context) succeeded in 176s, proving the failure is in the wedged-runner-state path, not in Codex itself. Architect handoff from K2B-side build session 2026-05-04 routed the diagnostic + fix to K2Bi as upstream.
+
+**What shipped:**
+- `scripts/lib/review_runner.py` (+171 / -13). New constants `DEFAULT_RECONNECT_STALL_S = 45` and `_RECONNECT_RE = re.compile(r"Reconnecting\.\.\.\s+(\d+)\s*/\s*(\d+)")`. `reader_thread` accepts a shared `reconnect_state: dict | None` and arms `saw_final = True` only when `attempt == cap` with `cap > 0`; resets to False on any non-reconnect line so post-recovery inference pauses cannot false-fire; preserves prior state on malformed N/M shapes. `watchdog_thread` adds a new branch firing before `HEARTBEAT_STALE` / `WEDGE_SUSPECTED`: when `saw_final` and `stale >= reconnect_stall_s > 0`, re-polls `proc.poll()` to avoid killing an already-exiting child, then `SIGTERM`s the process group with the existing `KILL_GRACE_S` path. `run_one_reviewer` clears `killed_by_reconnect_stall` and `phase` on attempt entry to prevent cross-attempt state corruption; new effective rc=126 distinct from rc=124 (deadline) and rc=125 (verdict-marker quality gate). `run_fallback_chain` maps rc=126 to `result="reconnect_stalled"` in `reviewer_attempts[]`. New `--reconnect-stall-threshold-s` CLI flag (default 45, 0 disables).
+- `tests/test_review_runner_reconnect_stall.py` (new file). 5 binary MVP gates (synthetic flake, reconnect-then-recover, recover-then-long-pause false-positive guard, no-reconnect baseline, threshold-zero kill-switch) + 2 cross-attempt isolation tests + 3 regex-parser tests. All 10 pass on first run after each Kimi-driven iteration.
+- `wiki/concepts/feature_review-runner-reconnect-stall-detect.md` (new file). MVP-gate spec + accepted-trade-offs section documenting the 3 architect-overruled review concerns from Kimi R3 (reader-thread stale-undershoot under heavy scheduling jitter, phase-popping between attempts, rc=125-vs-126 paths for clean-exit-after-exhaustion).
+
+**Tests:** 1462 passed, 1 skipped, 0 regressions across full suite (was 1452 prior to this commit; +10 new from this fix).
+
+**Adversarial review:** 3 Kimi rounds via `scripts/review.sh diff --primary minimax`. R1 surfaced 6 findings (`saw_final` never reset → false-positive on post-recovery inference; `reconnect_state` init unconditional; rc=126 inferred from phase + race-prone; regex `N>=M` arming on malformed `N>cap`; gate 2 inadequate without recovery+long-pause coverage; minor cleanups). All addressed inline plus new gate 2b. R2 surfaced 1 CRITICAL (`killed_by_reconnect_stall` not reset between attempts → corrupts second reviewer's rc) + 1 HIGH (regex disarm on malformed inputs unconditionally drops armed state). Both fixed inline plus new cross-attempt + clean-exit-after-5/5 tests. R3 surfaced 1 CRITICAL (poll-before-killpg race) + 1 MEDIUM (`last_reconnect_ts` unused → dead code). Both fixed inline (poll() check before SIGTERM, `since_final_reconnect_s` logged + persisted in state). 3 remaining R3 concerns documented as accepted trade-offs in the feature note per the K2Bi review-discipline round-3-stop rule. Codex review skipped: chicken-and-egg on the runner that invokes Codex (`--skip-codex codex-runner-fix-kimi-3-rounds`).
+
+**Reproduction:** Gate 1 unit test (`test_gate1_synthetic_flake_triggers_stall_detector`) is the deterministic reproduction case for the production flake — a bash one-liner emits `[codex] Codex error: Reconnecting... 5/5\n` then `sleep 60`, the runner now SIGTERMs at threshold (3s in test, 45s default in production) instead of waiting full HARD_DEADLINE, and rc=126 distinguishes this failure mode from generic deadline timeout in `reviewer_attempts[]`. Gate 2b (`test_gate2b_reconnect_recover_then_long_pause_does_not_stall`) is the false-positive regression guard — proves the detector stays disarmed during legitimate post-recovery inference pauses.
+
+**Forensic artifacts:**
+- `.code-reviews/2026-05-04T07-22-22Z_fad916.log` -- the production flake (frozen at elapsed=55s after user gave up)
+- `.code-reviews/2026-05-04T07-08-49Z_8038b5.log` -- contemporaneous success (110.7s, same 5/5 reconnect cycle but recovered)
+- `.code-reviews/2026-05-04T08-16-46Z_8ceaed.log` -- Kimi R1 (6 findings, all addressed)
+- `.code-reviews/2026-05-04T08-22-51Z_6727e1.log` -- Kimi R2 (1 CRITICAL + 1 HIGH + 2 MEDIUM, all addressed)
+- `.code-reviews/2026-05-04T08-25-40Z_9146ac.log` -- Kimi R3 (2 real fixes inline, 3 documented trade-offs)
+
+**Out of scope (queued, not scoped here):**
+- Codex-fresh-subprocess as Tier 3 fallback (`Codex-companion → Codex-fresh-subprocess → Kimi`) — would address the case where `Reconnecting... 5/5` reflects a stale broker that a fresh `node codex-companion.mjs` invocation would re-init cleanly. Spec separately if reconnect-stall recurs after this fix lands.
+- K2B-side runner improvements to backport upstream-to-K2Bi: `process_group=0` for Python 3.12+ DeprecationWarning, defensive `MINIMAX_API_KEY` injection in `spawn_child`. Hygiene drift identified during this diagnostic; separate follow-up so this feature stays single-purpose.
+- Codex CLI version bump audit: `codex-cli 0.128.0` was in production when the flake was observed; out-of-scope per "do not bump without changelog" architect rule.
+
+**K2B mirror:** This fix should be ported to `~/Projects/K2B/scripts/lib/review_runner.py` per the K2Bi-upstream / K2B-downstream rule. Cross-project work via `gh` CLI per the K2B Subprojects rule.
+
+**Cross-link:** Architect handoff captured in this session's invest-ship paste (2026-05-04T08:30Z); relates to L-2026-04-30-001 (override-as-default anti-pattern) — the runner's `--skip-codex <reason>` gate is preserved unchanged; the new detector is automatic-fallback acceleration, not a new escape hatch. Kimi R1+R2+R3 logs preserved in `.code-reviews/` for audit.
+
+---
+
 ## 2026-05-04 -- Q42 +1 week carry-forward fix: extended-lookback for engine_recovered + orphan_stop_adopted
 
 **Commit:** `c55cf21` (squash merge of PR #8 from `q42-carryforward-fix` branch, pre-squash commit `b5af2d8`)
