@@ -1,3 +1,65 @@
+## 2026-05-08 -- first MKT/null strategy approval shipped: G 2nd-wave paper trade (Path B engine bundle + 6-round schema reconciliation)
+
+**Commits:**
+- `fcf5b0f` feat(engine): order_type as first-class concept through engine pipeline
+- `8e9c6ed` chore(strategy): land strategy_g-2026-05_2nd-wave-paper-trade draft at status=proposed
+- `69908ef` feat(strategy): approve g-2026-05_2nd-wave-paper-trade
+
+**Triggered by:** `/invest-ship --approve-strategy g-2026-05_2nd-wave-paper-trade`. First MKT/null strategy approval in K2Bi history. Genpact (NYSE: G) 2nd-wave-AI-adopter paper trade for Phase 3.8b -- 71 shares MKT at next regular open, technical stop $30, fair-value target $48.18, 0.25% NAV-at-risk locked at T3 close.
+
+**Schema reconciliation iterations (Rounds 1-4):** Spec authored via invest-coach Phase 3.8a multi-turn flow used a different frontmatter shape than the cycle-5 helper expects. Each helper run surfaced the next layer:
+
+- Round 1 (top-level): added `name`, `strategy_type`, `risk_envelope_pct`, `regime_filter`; renamed `quantity`->`qty` and `stop_loss_usd`->`stop_loss` inside `order:`.
+- Round 2 (forward_guidance_check): reshaped from T11-coach to MVP-3 cycle-5 schema (rename `t11_completed_at`->`completed_at`, `thresholds_evaluated` mapping -> `thresholded_metrics` list with per-entry `sits_inside_guide` bools). Status flipped pass->override with 20+ char `override_reason` per L-2026-04-27-005.
+- Round 3 (ticker file): K2Bi-Vault/wiki/tickers/G.md surfaced thesis_score (66 = thesis_5dim_pct), symbol, bear_verdict, bear-last-verified, bear_conviction, bear_top_counterpoints from nested bear_case + t6_close_summary blocks to top level. Plus Round 3a: surgical YAML syntax fix at line 604 (mixed list+mapping).
+- Round 4 (invalidation scenarios): surfaced `bear_invalidation_scenarios` from `bear_case` to top-level list of 5.
+
+**Round 5 + 6 (engine bundle, fcf5b0f):** cycle-5 helper accepted MKT/null but engine `loader._required_decimal('limit_price')` rejected it. Path B + Boundary D made `order_type` a first-class field through every layer the order shape touches:
+
+- Loader: `_parse_order_spec` reads `order_type`, dispatches limit_price parsing per type; default LMT for backward compat; unknown types rejected explicitly.
+- Runner: propagates `spec.order_type` into CandidateOrder; naked-short fast-path resolves reference price from MarketSnapshot.marks.
+- Validator types: Order gains `order_type` field for journaling; limit_price stays Decimal (engine resolves reference for MKT before construction).
+- Engine main: `_to_validator_order` takes marks, raises ValueError for MKT without usable mark; tick-loop wraps in try/except + journals `order_rejected` reason=`no_safe_reference_price_for_mkt_order` instead of crashing.
+- Engine `_submit`: takes `candidate` kwarg; uses CANDIDATE-level wire intent (None for true MKT, Decimal for LMT). Defensive wire-safety override forces `wire_limit_price=None` when `wire_order_type=='MKT'` regardless of upstream-supplied sentinel.
+- Recovery: PendingFromJournal gains `order_type`; journal scanner reads payload.order_type with LMT default for backward compat. _pending_payload includes order_type. _validate_journal_view validates + refuses unknown values. _pick_resumable_awaiting passes order_type to Order().
+- Connector protocol + IBKR connector + mock connector: `submit_order(order_type='LMT')` kwarg; IBKR branches `MarketOrder` vs `LimitOrder`; mock mirrors and rejects LMT+null.
+- Journal payloads (order_proposed, order_submitted): both carry order_type. order_submitted uses WIRE-level limit_price (None for MKT) so recovery replay reconstructs the wire shape faithfully.
+
+**Tests:** 8 new in `test_strategies_loader.py` (matrix coverage including case-insensitive + unknown-type-reject + backward-compat). 13 new in `test_order_type_e2e.py` (mock-connector branching, engine MKT/null fail-closed, MKT-with-hint stays MKT on wire, recovery resume rebuilds MKT faithfully, refuses unknown order_type, wire-safety override). Full suite: 1482 pass, 1 skipped, 1 deselected (unrelated `handoffs/` deploy-coverage from a parallel session).
+
+**Adversarial review (Codex Checkpoint 2):**
+
+- R1 on engine bundle: 5 findings, 1 CRITICAL + 2 HIGH on recovery propagation gap (order_type not surfacing through journal_view; order_submitted journaled validator-reference instead of wire limit; no recovery resume test). All three addressed in R2.
+- R2 on engine bundle: 4 findings, 2 HIGH on resume-path wire-safety (resume rebuilds limit_price=Decimal('0') sentinel for MKT; _submit fallback could leak sentinel to wire). Closed via the defensive wire-safety override at _submit seam. 2 MEDIUMs explicitly deferred to `feature_invest-coach-cycle5-helper-schema-reconciliation`: (a) IBKR `get_open_orders` lmtPrice=0 for MKT regardless of orderType (inert today post-override), (b) runner Decimal('0') silent fallback for missing mark on MKT sell pre-check (observability improvement).
+- Strategy approval commit (69908ef): Codex skipped due to handoffs/ EISDIR + Kimi network timeout (4 retries). Strategy file content was already reviewed at plan-review (Step B Kimi, .code-reviews/2026-05-08T04-27-56Z_760b87.log; 6 findings explicitly accepted with documented reasoning -- 4 thesis-level findings carried forward to Phase 3.8b learning cycle, 2 cheap fixes #5 + #6 applied: pedagogical glosses + validator_blocker_status refresh).
+
+**Path C cheap fixes applied to strategy spec body:**
+
+- Pedagogical glosses on first use of: basis points, P/E, forward P/E, re-rate, notional, STP, NAV-at-risk, SMA crossover, lag-1, Sharpe, Sortino, drawdown, momentum, walk-forward. Concrete dollar/dinner-out anchor: "0.25% NAV at-risk = $319.50 USD = HKD 2,492 = roughly one moderate dinner-out for two on the paper account".
+- 6 new entries stubbed in K2Bi-Vault/wiki/reference/glossary.md.
+- validator_blocker_status refreshed: G now `whitelisted` at `c73ccbf` (was stale `NOT yet whitelisted` at T3 close drafting).
+
+**Feature status change:** none for this commit (cycle-5 approval helper, propose-limits, and engine bundles all already at `status: shipped`). Round 5+6 engine work belongs to a NEW follow-up: `feature_invest-coach-cycle5-helper-schema-reconciliation` -- captures N=4 schema-drift manifestations (T8 invest-bear-case precondition, T9 invest-backtest precondition, Round 2 forward_guidance_check, Round 3 ticker-file top-level fields) PLUS Round 5+6 approval-helper-vs-engine-loader-contract drift PLUS plan-review-spawned thesis-architecture findings (conviction-linked sizing, regime_filter discipline, opening-range order types). To be filed when Keith promotes it to In Progress in `wiki/concepts/index.md`.
+
+**Engine refresh verified:** `python -m execution.engine.main --diagnose-approved` post-VPS-restart shows engine PID 160127 booted at 2026-05-08T07:42:46Z with `g-2026-05_2nd-wave-paper` at approved_commit_sha=8e9c6ed in the approved-set. Post-commit hook mirrored repo->vault cleanly (vault file at status=approved + identical approved_at + approved_commit_sha).
+
+**NYSE next regular open:** 2026-05-08 21:30 HKT (09:30 ET). Order should fire at next tick post-open per `d1_entry_order_type: (i) market order at next regular trading open` lock at T10. Operator watches IBKR Gateway / demo account portal for fill confirmation.
+
+**Follow-ups:**
+
+- File `feature_invest-coach-cycle5-helper-schema-reconciliation` feature note in `K2Bi-Vault/wiki/concepts/` capturing the N=4 + Round-5/6 + plan-review-spawned-architecture findings under one home; promote to In Progress.
+- Conviction-linked sizing formula (plan-review #3) for trade #2 onwards.
+- Minimum regime_filter (plan-review #4): SPY > 200d SMA AND VIX < 25 AND AI-sector momentum positive.
+- Opening-range-confirmation order type (plan-review #2): wait 5min post-open + MOO with 2% slippage guard.
+- Codex MEDIUM #4 (runner Decimal('0') silent fallback) + #5 (IBKR get_open_orders lmtPrice for MKT) -- observability + edge-case improvements.
+- 50%-of-guide conviction-tail-weighted threshold variant (plan-review #1) as alternative kill-criterion design exploration.
+
+**Key decisions:**
+
+- Path B (engine MKT-awareness) over Path A (force LMT with limit_price) to preserve d1=MKT lock at T10 -- changing order type would have changed the trading decision, not the packaging.
+- Cycle-4 hook contract requires draft-then-approve as TWO separate commits; surfaced as commit-msg hook rejecting `(new file) -> approved`. Split into `8e9c6ed` (proposed) + `69908ef` (approved) accordingly.
+- `--skip-codex` on the approval-only commit (69908ef): wrapper hit `handoffs/` EISDIR for codex + Kimi network timeout; prior plan-review covered the strategy file content; engine work was already Codex-reviewed at fcf5b0f. Audit-trail rationale recorded in commit footer.
+- Used `K2BI_ALLOW_CONFIG_EDIT=1` override at c73ccbf earlier this session for the limits approval (gitignored review/ vs Check C structural conflict). Documented in that commit body. Same structural issue still open; orthogonal to today's strategy approval flow.
 ## 2026-05-08 -- discipline-cleanup tracker: 7 review findings deferred to a focused session
 
 **Commit:** `f976d53` docs(discipline-cleanup): tracker note bundling 7 deferred review findings
