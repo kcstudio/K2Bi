@@ -1,3 +1,38 @@
+## 2026-05-08 -- invest-coach round-3 closures: multi-turn cross-refs, clientId convention, (F) correction
+
+**Commit:** `4830e34` docs(invest-coach): cross-link multi-turn rows + clientId convention + correct (F) follow-up
+
+**Triggered by:** Post-c61b55a "what else is missing" retrospective. Keith asked to keep looking for unwired connections after the read-side principle landed. Three additional closures fell out, plus a memory + ledger entry.
+
+**What shipped:**
+
+- `.claude/skills/invest-coach/SKILL.md`: T8/T9/T10/T11 rows in the Multi-turn conversation pattern table cross-reference the Data sources section that landed in c61b55a. T9 row corrects the clientId hazard framing (Phase 2 MVP yfinance-only, no broker connection); T10 row inlines the `share_count: pending` discipline; T11 row adds the NY-time anchor reminder per L-2026-04-22.
+- `CLAUDE.md`: new "clientId convention" paragraph alongside the 2026-05-08 read-side counterpart. clientId 1 = engine reserved; 90-99 = ad-hoc / backtest / operator. Hazard documented but NOT yet code-enforced; enforcement belongs with the engine snapshot pipeline ship at Phase 4.
+- `wiki/concepts/feature_invest-coach.md`: corrects the (F) entry from c61b55a -- I had asserted invest-backtest opens an `ib_async` connection. Reading the actual SKILL.md proved Phase 2 MVP uses yfinance only. Entry rewritten to reflect the hazard applies to FUTURE callers (Phase 4 walk-forward, gateway-query.sh, ad-hoc operator python), not Phase 2 invest-backtest. Honesty trail: entry names the assertion-without-checking pattern that produced the wrong premise.
+
+**What shipped (memory + ledger, vault-side, not in this repo diff):**
+
+- `self_improve_learnings.md`: L-2026-05-08-002 -- "infra-migration ship gates must include at least one operator-driven liveness criterion." Phase 3.9 Stage 1's 7 engine-side criteria + 0 operator-side criteria are the structural reason both the doc drift AND the credential dormancy went unnoticed for 13 days.
+- `policy-ledger.jsonl`: matching guard for `* / infra_migration_ship_gate` at medium risk, sourced to L-2026-05-08-002.
+
+**Downstream cause-effect with c73ccbf:** My commit `d2ab03f` added `review/` to `.gitignore` to clear the deploy-coverage preflight on the original 8b94436 ship. That made cycle-4 pre-commit Check C structurally unsatisfiable (Check C requires the limits-proposal to be staged in the same commit as `config.yaml`, but gitignored files can't be staged). The concurrent `/ship --approve-limits` flow at c73ccbf had to use `K2BI_ALLOW_CONFIG_EDIT=1` override as a result. The structural mismatch -- K2B's pattern is "stage proposals", K2Bi's now-encoded pattern is "gitignore proposals" -- needs a decision: either reconcile Check C to read from disk via Syncthing, or drop `review/` from gitignore and stage proposals normally. Captured in the c73ccbf DEVLOG entry's follow-ups; not fixed in this commit.
+
+**Adversarial review:** skipped per `invest-ship SKILL.md` "Config tweaks / typo fixes / one-line changes" exception. Pure prose + table edits + memory append.
+
+**Feature status change:** `feature_invest-coach.md` Known follow-ups section grew by zero entries (entry F was rewritten in place; no new entries). The five entries from c61b55a stand. The new vault planning note `feature_engine-vault-snapshots.md` stays at `status: proposed`.
+
+**Follow-ups:**
+- All "Not touched" items from the c61b55a session-close are now closed in scope: (a) cross-reference + (b) clientId convention + (c) phase-gate /learn.
+- Out-of-scope by design: K2B-side stale ControlMaster forward (needs the K2B session that opened it).
+- Newly surfaced: cycle-4 Check C vs `.gitignore review/` structural conflict (above).
+
+**Key decisions:**
+- Did NOT mirror a clientId reservation note into invest-backtest's SKILL.md. The skill body uses yfinance and has no current call site for the convention; pre-emptive doc would be cargo-culted. Convention lives in CLAUDE.md and applies to whichever skill ships an `ib_async` call site next.
+- Did NOT add the Data sources section pattern to other skills (invest-thesis, invest-screen, invest-narrative). Those skills do not currently need live broker state at any turn; pre-emptive section addition would be dead documentation.
+- Skipped Codex review on this commit per the doc-only exception. Documented in commit body.
+- The (F) correction is itself a small honesty exercise -- recording that the original premise was wrong rather than silently rewriting.
+
+
 ## 2026-05-08 -- limits proposal approved: instrument_whitelist add G
 
 **Commit:** `c73ccbf` feat(limits): approve instrument_whitelist-add-G
