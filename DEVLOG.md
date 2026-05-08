@@ -1,3 +1,30 @@
+## 2026-05-08 -- discipline-cleanup tracker: 7 review findings deferred to a focused session
+
+**Commit:** `f976d53` docs(discipline-cleanup): tracker note bundling 7 deferred review findings
+
+**Triggered by:** Operator request 2026-05-08 21:00 HKT to defer all 7 findings from the end-of-session adversarial review (Kimi pass at `.code-reviews/2026-05-08T04-22-34Z_d294dc.log`) to a separate session, NOT bundle with Path B engine-loader work currently in flight in a parallel K2Bi session (4-hour budget, 18:00 HKT hard cutoff against the 21:30 HKT NYSE open).
+
+**What shipped:** `wiki/concepts/feature_k2bi-discipline-cleanup.md` -- new tracker note at `status: proposed`. Captures all 7 findings (1 critical, 3 high, 3 medium) with per-finding disposition + sub-bundle grouping (A: gateway-discipline F1+F6; B: engine-vault-snapshots F2+F5; C: review-process discipline F3; D: gitignore decision F4; E: rule operationalization F7). Cross-references the existing `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md` proposal and forward-references the pending `feature_invest-coach-cycle5-helper-schema-reconciliation` note that the parallel session is creating.
+
+**Adversarial review:** not invoked. Tracker notes capturing deferral decisions are TODO artifacts, not architectural principles -- the originating principles were already in the Kimi review pass that this tracker references. (Note: F3 itself critiques over-use of the doc-only review-skip exception. The disposition is conservative: F3's amendment to invest-ship SKILL.md will ship with full Codex review when the discipline-cleanup pass runs.)
+
+**Feature status change:** new `feature_k2bi-discipline-cleanup.md` at `status: proposed`. Promote when a focused cleanup session is scoped.
+
+**Follow-ups:**
+
+The tracker note IS the follow-up registry. Sub-bundles A-E run in any order (B is gated on engine-vault-snapshots being scoped). The parallel session's `feature_invest-coach-cycle5-helper-schema-reconciliation` is separate scope; cross-reference at cleanup time to avoid double-fix.
+
+**Key decisions:**
+
+- Deferred F1 (CRITICAL clientId allocator) explicitly. Probability of firing in the 7-hour window before tonight's NYSE open is near-zero (engine on clientId 1; no concurrent operator-side queries planned; gateway-query.sh has not been invoked since the post-recovery NAV pull at 03:12 UTC). Fix this week.
+- F3 retroactive flag satisfied by the Kimi pass that produced the finding. No additional retroactive action required; the audit trail is in `.code-reviews/2026-05-08T04-22-34Z_d294dc.log` + `.minimax-reviews/2026-05-08T04-24-59Z_plan.json`.
+- Did NOT auto-stage `wiki/strategies/strategy_g-2026-05_2nd-wave-paper-trade.md` -- it was inadvertently picked up by `git add` during commit prep, then unstaged with `git reset HEAD`. That file is the parallel Path B session's strategy spec; the strategy-transition pre-commit hook caught the staging mismatch and refused, which is exactly correct hook behavior. Cross-session commit-isolation discipline preserved.
+
+**Reasoning for the bundled defer (per operator):**
+
+> "Path B has a tight 4-hour budget with a 6:00 PM HKT hard cutoff to land the engine-loader fix and re-fire the strategy approval before tonight's NYSE open at 9:30 PM HKT. The 7 findings are K2Bi platform/architecture concerns from a different scope; bundling them expands Path B's session into a full platform-discipline session and burns the budget without delivering the engine fix."
+
+
 ## 2026-05-08 -- invest-coach round-3 closures: multi-turn cross-refs, clientId convention, (F) correction
 
 **Commit:** `4830e34` docs(invest-coach): cross-link multi-turn rows + clientId convention + correct (F) follow-up
