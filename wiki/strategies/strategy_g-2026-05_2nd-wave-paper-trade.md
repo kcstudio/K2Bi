@@ -10,7 +10,7 @@ risk_envelope_pct: 0.0025
 regime_filter: []
 slug: g-2026-05_2nd-wave-paper-trade
 ticker: G
-status: proposed
+status: approved
 sigid: 2026-05-04-ai-agentic-2nd-wave-adopters
 thesis_ref: "[[../tickers/G]]"
 position_size_at_risk_pct_nav: 0.25
@@ -190,6 +190,8 @@ forward_guidance_check:
   ready_for_t12: true
 t9_skill_invocation_note: "invest-backtest skill loaded at T9; precondition format mismatch detected (skill Step 1 expects strategy file at wiki/strategies/strategy_<slug>.md to exist; coach pipeline T9-then-T10 ordering means T9 fires BEFORE T10 produces strategy file). Adapted via Option X (operator-confirmed at T9 entry recalibration): authored this minimal placeholder pre-T10 to satisfy skill precondition. Skill backtests fixed lag-1 SMA(20)/SMA(50) crossover baseline (NOT strategy bucket rules per Phase 2 MVP) so placeholder is functionally equivalent to drafted strategy file from skill's perspective. T10 will overwrite/extend this placeholder with full bucket rules + concrete entry price + stop-loss distance + share count against live IBKR demo paper account NAV. Skill's raw/backtests/ audit-trail capture preserved. Coach skill T9-then-T10 ordering preserved."
 pattern_observation_n2_skill_precondition_mismatch: "Second skill-precondition mismatch caught at coach pipeline transition (T8 invest-bear-case expected thesis_score top-level field per skill Step 2; T9 invest-backtest expects strategy_<slug>.md per skill Step 1). Both resolved via in-line adaptation with explicit documentation. Pattern is now N=2; flag at /ship close audit summary as recurring coach-skill / individual-skill ordering interface issue (not blocking; pattern documents the interface gap; future architect Q-entry candidate alongside Q37+ vendor-confabulation discipline)."
+approved_at: '2026-05-08T07:41:21.194489+00:00'
+approved_commit_sha: 8e9c6ed
 ---
 
 # Strategy: G 2nd-wave AI adopters paper trade
