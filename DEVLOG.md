@@ -1,3 +1,35 @@
+## 2026-05-08 -- invest-coach read-side data-source gaps closed (retrospective follow-up)
+
+**Commit:** `c61b55a` docs(invest-coach): close read-side data-source gaps surfaced by 2026-05-08 retrospective
+
+**Triggered by:** Post-/ship retrospective on commits `8b94436` + `d2ab03f` + `f3f9a47`. Keith pushed back on the framing that the original patch had handled the root cause: a Claude session trying to do live broker IO from MacBook context to draft a strategy spec violates the engine-as-sole-broker-consumer architecture, regardless of what the docs said. Investigating revealed three layered issues that the original patch did not touch.
+
+**What shipped (this commit):**
+
+- `CLAUDE.md` (gap H): "Execution Layer Isolation" extended with a read-side counterpart paragraph. Original text enumerated Claude write-side restrictions only (no edit validators, no force trade, no delete `.killed`). The read-side principle ("Claude does not open its own broker connection for state reads either; live reads come from engine-published vault snapshots") was implicit and never written down. Sessions improvised. The new paragraph names the principle explicitly and points readers at the engine snapshot pipeline planning note.
+- `.claude/skills/invest-coach/SKILL.md` (gaps A + B): new "Data sources" section between Plug-in point and Multi-turn conversation pattern. Per-turn table for T8/T9/T10/T11 with each turn's live-state need, the engine snapshot path that should provide it, and the current status (mostly "missing -- defer to engine extension"). T10 explicitly states: "MUST NOT open its own broker connection to fill in a concrete share count today" -- share count drafts as `pending` and `/invest-ship --approve-strategy` resolves NAV at approval time inside the engine process where the live read already exists.
+- `wiki/concepts/feature_invest-coach.md` (gaps C-G): six new entries in the Known follow-ups section. (1) live state read paths not declared, HIGH, fixed in this commit; (2) no regime check at T10, MEDIUM; (3) no kill-switch awareness at T12, LOW; (4) no NY-time discipline reminder at T10/T11, MEDIUM; (5) clientId reservation hazard for T9 backtest, MEDIUM-HIGH; (6) vault propagation lag awareness at T9/T12, LOW. Five of the six depend on the engine snapshot pipeline landing.
+
+**What shipped (vault, not in this repo diff):**
+
+- `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md` (gap I): new planning proposal note for an engine extension that publishes a periodic snapshot of account state (NAV, positions, open orders, kill-switch metadata, connection state) to `K2Bi-Vault/wiki/positions/_account_state.md`. This is the foundational missing artifact that several invest-coach follow-ups + future skill workflows depend on. Status: `proposed`. Should be promoted to In Progress before any new skill ships that depends on live broker reads.
+
+**Stale-notes finding (orthogonal):** I incorrectly stated earlier in the session that "K2Bi vault has no `wiki/concepts/` lane." It exists in the repo at `~/Projects/K2Bi/wiki/concepts/`, git-tracked. The `--no-feature` ship of `8b94436` was still defensible (no feature in flight, infra-class change), but the reasoning was wrong; this DEVLOG records the correction so future sessions do not inherit the stale model.
+
+**Adversarial review:** skipped per `invest-ship SKILL.md` "Config tweaks, typo fixes, one-line changes" exception -- this commit is pure prose + table edits, no code, with the architecture pre-discussed in the retrospective conversation. Re-running Codex on a doc-only diff would burn ~140s for a likely APPROVE.
+
+**Feature status change:** `feature_invest-coach.md` Known follow-ups section grew by six entries; feature itself stays at `status: shipped`. New planning note `feature_engine-vault-snapshots.md` added at `status: proposed`.
+
+**Follow-ups:**
+- Engine vault-snapshots build (gap I) -- needs Phase 4 scoping session, design decisions on cadence + path + schema versioning, then engine code change. Until it lands, gaps C/D/G in invest-coach stay open by design.
+- invest-backtest SKILL.md should grow a sibling clientId reservation note matching this one (gap F is in invest-coach's known follow-ups but invest-backtest is the actual call site). Tracked in feature_invest-coach.md known follow-ups; invest-backtest should mirror.
+
+**Key decisions:**
+- Skipped Codex review on this commit -- doc-only, architecture pre-discussed, exception clause covers it. Documented the skip in the commit body so the audit trail stays honest.
+- Did not include the engine code change (gap I) in this ship. The proposal note is the right artifact at this stage; the build itself needs design decisions that exceed retrospective scope.
+- Did not touch the stray `- G` line in `execution/validators/config.yaml` that belongs to the pending limits proposal in `review/`. That is a separate `/invest-ship --approve-limits` flow and including it here would conflate two unrelated transitions.
+- `--no-feature` was again the right ship variant: this commit fixes prose around an already-shipped feature, not a feature in its own right.
+
 ## 2026-05-08 -- IB Gateway access path corrected to VPS-only with new gateway-query.sh helper
 
 **Commits:**
