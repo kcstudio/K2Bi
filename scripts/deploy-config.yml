@@ -99,3 +99,8 @@ excludes:
   # (modifies the Syncthing-managed K2Bi-Vault planning mirror docs);
   # nothing here is rsync-deployed.
   - .kimi
+  # Operator handoff drops + ad-hoc temporary build scratch -- MacBook
+  # only, never deployed. handoffs/ is where /agent-handoff drops job
+  # specs + result archives; tmp_*.py are throwaway build helpers.
+  - handoffs
+  - tmp_build_g_memo_docx.py
