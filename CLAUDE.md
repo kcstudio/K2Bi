@@ -56,6 +56,8 @@ Why: prompt-text rules fail under cognitive load. "Never exceed 5% position size
 
 **Read-side counterpart (added 2026-05-08):** the same isolation applies to broker reads. Claude in any session -- coaching, drafting, review, observer -- does NOT open its own broker connection. Live broker state (NAV, positions, open orders, kill-switch metadata, last-broker-error class) is published by the engine to vault snapshots; sessions read those snapshots. If a workflow needs live state and no engine snapshot exists, the answer is to extend the engine, NOT to open a session-side `ib_async` connection. The single exception is `scripts/gateway-query.sh`, which is operator-forensics ONLY (incident debugging, ad-hoc account checks); skill bodies and skill-driven workflows MUST NOT call it. The engine snapshot pipeline is tracked in `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md`. Motivating incident: 2026-05-08 outage (commit `8b94436` retrospective + L-2026-05-08-001).
 
+**clientId convention (related to read-side):** clientId `1` is reserved for the engine. Ad-hoc operator queries via `gateway-query.sh` and any future skill that legitimately opens `ib_async` use `90-99`. Backtests + any other ib_async caller (Phase 4+ walk-forward harness, future broker-data tools) use the 90-99 range. **Never pick `1` from a session.** Picking `1` kicks the engine off the gateway and triggers the orphan-STOP recovery path that Q42 was patched against. The convention is documented (here + in `gateway-query.sh` comments) but not yet code-enforced; enforcement belongs with the engine snapshot pipeline ship.
+
 ## Memory Layer Ownership
 
 Every fact has exactly one home. When a rule or procedure lives in more than one place, the second copy rots first.

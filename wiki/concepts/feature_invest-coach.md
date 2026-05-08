@@ -165,12 +165,16 @@ Fail: Vendor section hidden when T5.5 elected, OR present with empty values when
   convention at T10 entry as a Teach Mode bullet for novice stage. Cross-link
   `[[wiki/context/teach-mode]]`.
 
-- **clientId reservation hazard for T9 backtest (MEDIUM-HIGH from 2026-05-08 ship retrospective).**
-  invest-backtest invokes `ib_async`; if it picks clientId 1 (engine reservation) it kicks
-  the engine off the gateway -- the orphan-STOP-class outage that Q42 was patched against.
-  Coach AND invest-backtest both need to document the convention (ad-hoc / backtest =
-  clientId 90-99). Today the convention lives in `scripts/gateway-query.sh` comments only;
-  not surfaced to either skill body. Tracked separately in invest-backtest's known follow-ups too.
+- **clientId convention not yet code-enforced (MEDIUM, corrected 2026-05-08 ship retrospective).**
+  Original entry was based on a wrong premise -- it asserted invest-backtest opens an
+  `ib_async` connection. Reading the actual invest-backtest SKILL.md confirmed Phase 2 MVP
+  uses yfinance only; no broker connection, no clientId hazard. The hazard IS real for any
+  session that DOES open `ib_async` -- `scripts/gateway-query.sh`, future Phase 4 walk-forward
+  harness, future broker-data tools, ad-hoc python through the helper. Convention:
+  clientId 1 = engine; 90-99 = ad-hoc / backtest / operator. Now documented in CLAUDE.md
+  "Execution Layer Isolation" (clientId convention paragraph). Code enforcement (validator
+  that rejects clientId 0-89 from any session-spawned process) belongs with the engine
+  snapshot pipeline ship.
 
 - **Vault propagation lag awareness at T9 / T12 (LOW from 2026-05-08 ship retrospective).**
   Coach writes vault files MacBook-side; engine on VPS reads via Syncthing. Documented <5s
