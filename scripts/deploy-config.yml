@@ -70,6 +70,11 @@ excludes:
   - .minimax-reviews
   - .code-reviews
   - .sync-state
+  # Local human-judgment workspace -- pending strategy / limits proposals awaiting
+  # /ship --approve-strategy or /ship --approve-limits. Once approved the file
+  # transitions into git-tracked wiki/strategies/ or wiki/strategy-limits/; the
+  # pre-approval staging directory is local-only.
+  - review
   # Vault is Syncthing-managed, not rsync-managed
   - K2Bi-Vault
   # Code repo wiki/ is the authorial source of truth for strategy + thesis specs:

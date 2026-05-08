@@ -18,6 +18,12 @@ ibkr_credentials*
 # Kill switch lock (created at 10% drawdown; human-only deletion -- never commit)
 .killed
 
+# Local human-judgment staging area for strategy + limits proposals awaiting
+# /ship --approve-strategy or /ship --approve-limits. Approved files move into
+# git-tracked wiki/ paths at approval time; the pre-approval workspace is
+# local-only. Mirrors the .pending-sync / .code-reviews / .kimi convention.
+review/
+
 # OS / editor
 .DS_Store
 .idea/
