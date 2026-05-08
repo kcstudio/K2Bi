@@ -1,3 +1,54 @@
+## 2026-05-08 -- invest-coach <-> cycle-5 helper schema reconciliation shipped
+
+**Commit:** `0a96b9d` feat(invest-coach): canonical frontmatter builders + cycle-5 schema reconciliation
+
+**Triggered by:** Operator append of the implementation spec to `K2Bi-Vault/wiki/planning/feature_invest-coach-cycle5-helper-schema-reconciliation.md` (Spec A) earlier in the same session, then "ship here in this session" to take it end-to-end without an agent-handoff.
+
+**What shipped:** Boundaries A + A.1 + A.2 + B.2 + C + D + E from the spec's "Implementation breakdown" section.
+
+- `scripts/lib/invest_coach.py` (+404 lines) gains four new builders that form the single seam between coach pipeline state and downstream-consumer-readable on-disk frontmatter:
+  - `build_canonical_ticker_frontmatter` (T6 / T8 close): surfaces `thesis_score` + `symbol` + `bear_verdict` + `bear-last-verified` + `bear_conviction` + `bear_top_counterpoints` top-level so cycle-5 helper Step A and T8 invest-bear-case read them without walking nested blocks; preserves nested `bear_case:` for audit-trail richness.
+  - `build_canonical_strategy_frontmatter` (T10 / T11 close): emits `name` + `strategy_type: hand_crafted` + `risk_envelope_pct` + `regime_filter: []` (default empty per Boundary C accepted-gap) + canonical `order:` block (`qty` + `stop_loss` + `order_type`) + MVP-3 `forward_guidance_check` block via `assemble_forward_guidance_check`. Rejects deprecated `quantity` / `stop_loss_usd` input keys with ValueError at the seam (so the contract violation surfaces at write time, not hours later at /invest-ship). MKT orders MUST carry `limit_price=None`; LMT MUST carry a decimal `limit_price`.
+  - `build_t9_placeholder_strategy_frontmatter` (T9 entry): writes a `status: proposed-t9-placeholder` skeleton with `order.ticker` so invest-backtest's precondition passes; T10 close detects the placeholder status and overwrites with the full canonical frontmatter.
+  - `render_accepted_gaps_section` (T10 close, body): four plan-review accepted-gap markdown blocks (kill-criterion override keyed to guide endpoints, MKT-gap-risk on small fractional sizing, conviction-linked sizing roadmap, empty regime_filter) emitted verbatim into every fresh strategy file body so plan-review at /ship time treats them as known gaps rather than novel surfaces.
+- `scripts/migrate_existing_theses_to_canonical_schema.py` (new) is an idempotent migration with `--check` / `--apply` modes. Pre-T8 ticker detection so a fresh ticker with no bear data anywhere is reported as expected state, not drift. Mixed-state normalization drops stale `quantity` / `stop_loss_usd` duplicates and raises on disagreeing values rather than silently picking a winner.
+- `.claude/skills/invest-coach/SKILL.md` (+15 lines) documents the canonical-builder seam at T6 / T8 / T9 / T10 close, the T9 placeholder sequencing detail, and the accepted-gaps body emission.
+- `tests/test_pipeline_schema_e2e.py` (new, 19 tests): integration tests including `FullPipelineSchemaTests` (the binary MVP test) that asserts a synthetic fresh-ticker pipeline emits frontmatter satisfying the cycle-5 helper Step A + REQUIRED_ORDER_FIELDS + `validate_forward_guidance_check` + the engine `loader.load_document` parse + the T9 `order.ticker` precondition. Plus `StrategyBuilderGuardTests` covering MKT+limit_price guard + deprecated-key rejection + operator_note empty-string omission.
+- `tests/test_migration_canonical_schema.py` (new, 14 tests): idempotence, mixed-state normalization, pre-T8 detection.
+
+**Adversarial review:** Codex Checkpoint 2 routed to the Kimi-backed reviewer because `codex --scope working-tree` would EISDIR on the untracked `.claude/skills/invest-memo/` directory (the wrapper auto-falls back when this happens). Kimi verdict: NEEDS-ATTENTION with 2 HIGH + 5 MEDIUM findings.
+
+Fixed inline before the commit landed:
+- HIGH #1 -- MKT order silently coerced non-None `limit_price` (would have looked like a marketable LMT downstream). Now raises ValueError at builder input.
+- MEDIUM #3 -- `operator_note: ''` was emitted on empty strings (downstream MVP-3 shape would have flagged). Guard now skips empty strings.
+- MEDIUM #4 -- builder did not reject `quantity` / `stop_loss_usd` keys in the input order dict (silently dropped them via the "ignore deprecated" continue; could mask double-specification bugs). Now raises ValueError at the seam.
+- MEDIUM #5 -- `FullPipelineSchemaTests` condition 5 was a duplicate of condition 1. Replaced with a distinct T9 precondition assertion (`order.ticker` extractable + non-empty).
+- MEDIUM #6 -- migration script was not idempotent for mixed-state files (file with both `qty` and `quantity`). Now drops the stale duplicate when values match; raises ValueError when they disagree.
+
+Deferred with rationale recorded in the commit body:
+- HIGH #2 -- `_atomic_write` lacks observability on `os.replace` failure. The temp-file cleanup IS attempted in the except handler (the leak concern is mitigated); the remaining concern is observability for a one-shot migration script run by a single operator. Acceptable.
+- MEDIUM #7 -- pre-T8 detection treats partial-bear-data as drift but the migration script can't fill gaps from partial data, only reports MISSING. Theoretical; T8 writes the full bear set atomically in practice. None of G / SPY / CALX exhibit partial bear state.
+
+Review log: `.code-reviews/2026-05-08T11-38-55Z_298e22.log`.
+
+**Live-vault migration:** `python3 scripts/migrate_existing_theses_to_canonical_schema.py --vault-root ~/Projects/K2Bi-Vault --apply` ran clean. G + SPY ticker files OK; all 3 strategy files OK; CALX correctly classified as PRE-T8. No file mutations needed because the G + SPY post-incident hand-reconciliation was already canonical.
+
+**Suite:** 1516 passed (+33 new vs 1483 baseline), 1 skipped (unrelated). Full suite re-run twice during the session.
+
+**Feature status change:** `feature_invest-coach-cycle5-helper-schema-reconciliation.md` flipped `status: proposed -> shipped` with `shipped-date: 2026-05-08` and `shipped-commit: 0a96b9d`. `## Updates` section appended documenting the ship, the Codex finding dispositions, and the explicit deferrals.
+
+**Follow-ups:**
+- HIGH #2 (atomic-write observability) -- pick up if the migration script ever runs on a heterogeneous multi-operator vault.
+- MEDIUM #7 (partial-bear-data classification) -- capture if a real ticker file ever lands in mid-T8 state.
+- Out-of-scope deferrals from the spec stand: conviction-linked-sizing implementation, ticker-specific `regime_filter` parameters, the 2 deferred Codex MEDIUMs from the engine-side Round 5/6 review (`get_open_orders` lmtPrice mapping + runner `Decimal('0')` silent fallback), the 7 discipline-cleanup findings under sibling spec `feature_k2bi-discipline-cleanup.md`.
+- First true cross-check is whichever fresh ticker reaches T11 next via the invest-coach pipeline.
+
+**Key decisions:**
+- Skipping the agent-handoff route (Kimi K2.6 builder) and shipping in-session was the operator's explicit choice. The implementation was concentrated enough that orchestration overhead would have outweighed Kimi's token-cost savings on a roughly 4-hour window.
+- Boundary D (migration) and Boundary B.2 (T9 placeholder) shipped together with the canonical builders rather than as separate commits because the integration test asserts them as one unit; splitting would have left the integration test red mid-ship.
+- `_atomic_write` observability accepted as-shipped per the deferral rationale above.
+
+
 ## 2026-05-08 -- skill clarification: two-commit pattern for new-file approve-strategy + deploy-config excludes
 
 **Commit:** `0a14534` docs(invest-ship): two-commit pattern for new-file approve-strategy + deploy-config excludes
