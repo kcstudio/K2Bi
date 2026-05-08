@@ -27,7 +27,7 @@ or delete the `.killed` lock file.
 
 - **Code repo**: `~/Projects/K2Bi/` (this directory), git-tracked, GitHub remote.
 - **Vault**: `~/Projects/K2Bi-Vault/` (Syncthing-managed, NOT a git repo).
-- **Broker**: IBKR HK demo paper account (IB Gateway on localhost:4002).
+- **Broker**: IBKR HK demo paper account. IB Gateway runs on the VPS at `127.0.0.1:4002`. The engine (also on the VPS) connects to it natively. Operator one-off queries from the MacBook go through `scripts/gateway-query.sh`, never directly.
 - **VPS server**: `ssh hostinger` (Hostinger KL, Phase 3.9+; Mac Mini deprecated for K2Bi compute).
 
 ---

@@ -40,23 +40,13 @@ Render as a Markdown report with headings `### Kill`, `### Recent events`, `### 
 
 Trigger one tick of the engine main loop.
 
-Phase 2: invoke locally from the MacBook (engine runs against the same IB Gateway 10.37 on `localhost:4002`).
+IB Gateway and the engine both run on the VPS. The engine connects to the gateway natively at `127.0.0.1:4002`. Manually triggering one tick from the MacBook means SSH'ing to the VPS and invoking the engine module there:
 
 ```bash
-cd "$HOME/Projects/K2Bi"
-python3 -m execution.engine.main --once
+ssh k2bi@hostinger "cd ~/Projects/K2Bi && .venv/bin/python3 -m execution.engine.main --once"
 ```
 
-If `ib_async` is not installed, print the install command and stop:
-
-```bash
-python3 -c "import ib_async" 2>/dev/null || {
-  echo "ib_async missing. Install with: pip install ib_async==2.1.0"
-  exit 1
-}
-```
-
-Phase 4 (not in this ship): SSH the Mac Mini and invoke via `pm2 restart invest-execute` instead.
+The `k2bi-engine.service` systemd unit is the normal driver; `--once` is for ad-hoc operator ticks only. Do NOT try to run the engine on the MacBook -- it cannot reach the gateway and there is no tunnel by design.
 
 After the tick returns, surface the newest journal events it produced by comparing `$(wc -l "$TODAY_JOURNAL")` before and after the call; print only the delta.
 
@@ -167,10 +157,10 @@ The Python engine in `execution/engine/main.py` is a state machine with these st
 
 State transitions are fully specified in `K2Bi-Vault/wiki/planning/m2.6-engine-state-machine.md`. Each transition emits one or more journal events (see `K2Bi-Vault/wiki/reference/journal-schema.md`).
 
-Claude never calls into any module under `execution/` directly. The only entry points are the bash commands above and (Phase 4) the pm2-managed daemon on the Mac Mini.
+Claude never calls into any module under `execution/` directly. The only entry points are the bash commands above and the `k2bi-engine.service` systemd unit on the VPS.
 
 ## Non-goals (not in Phase 2)
 
-- Continuous polling dashboard (Phase 4 if needed; pm2 cron already keeps the engine alive).
+- Continuous polling dashboard (Phase 4 if needed; the `k2bi-engine.service` systemd unit already keeps the engine alive on the VPS).
 - Cross-strategy view (Phase 2 runs one strategy at a time; multi-strategy view lands in Phase 4).
 - P&L attribution (Phase 2 P&L stub is manual; Bundle 5 wires IBKR fills; Phase 4 auto-attributes to strategies).

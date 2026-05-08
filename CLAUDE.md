@@ -31,7 +31,7 @@ Execute. Don't explain what you're about to do. Just do it. If you need clarific
 
 - **Vault**: `~/Projects/K2Bi-Vault/` (Syncthing-managed plain directory, NOT a git repo)
 - **Code repo**: `~/Projects/K2Bi/` on GitHub at `https://github.com/kcstudio/K2Bi`
-- **Broker**: IBKR HK demo paper account (IB Gateway on local workstation, port 4002, localhost-only, Read-Only API on). No live funding until Phase 5 metrics pass.
+- **Broker**: IBKR HK demo paper account. IB Gateway runs on the VPS at `127.0.0.1:4002` (localhost-only, Read-Only API on). The engine connects to it natively. Operator one-off queries from the MacBook go through `scripts/gateway-query.sh`, never directly. No live funding until Phase 5 metrics pass.
 - **Hostinger VPS**: `ssh hostinger`. Trader tier host. Code deployed via `/sync`. Vault synced via Syncthing. Engine runs under systemd (`k2bi-engine.service`).
 - **MiniMax API** (M2.7) -- worker model for bulk extraction. API key in `MINIMAX_API_KEY`.
 - **NotebookLM** -- first-class research pillar via `notebooklm-py` and the `notebooklm` skill.
