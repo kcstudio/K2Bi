@@ -137,6 +137,50 @@ Fail: Vendor section hidden when T5.5 elected, OR present with empty values when
   correctly. No live gap; defer to Phase 4 if crash-recovery observability
   becomes a priority.
 
+- **Live state read paths not declared in skill body (HIGH from 2026-05-08 ship retrospective).**
+  T8/T9/T10/T11 implicitly need live state (positions, NAV, regime, forward guidance) but
+  the SKILL.md body did not declare engine read paths. Sibling session improvised broker IO
+  from MacBook to populate T10 share-count math. Patched in this session by adding a
+  "Data sources" section that names each per-turn read path and the missing engine snapshot.
+  Engine extension proposed at `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md`;
+  several follow-ups below depend on it landing.
+
+- **No regime check in the flow (MEDIUM from 2026-05-08 ship retrospective).**
+  invest-regime classifies crash / bear / neutral / bull / euphoria. A novice drafting a
+  long-momentum spec during a "crash" regime gets no warning today. T10 "How This Works"
+  gate does not surface regime context. Add a regime cross-check at T10 entry; meanwhile
+  use `K2Bi-Vault/wiki/regimes/current.md` directly. Becomes a one-line read once the engine
+  snapshot lands.
+
+- **No kill-switch awareness at T12 (LOW from 2026-05-08 ship retrospective).**
+  If `.killed` is present, `/invest-ship --approve-strategy` still flips the spec to approved
+  status; the engine just will not act on it. Coach should set expectations at T12
+  ("kill-switch is on; this approved strategy will not fire orders until you
+  `rm K2Bi-Vault/System/.killed`"). Surface from the engine snapshot when it lands; today
+  check the file existence directly.
+
+- **No NY-time discipline reminder at T10/T11 (MEDIUM from 2026-05-08 ship retrospective).**
+  CLAUDE.md and L-2026-04-22 anchor strategy timing in NY trading time. T10 drafts time-bound
+  rules; T11 references forward-guidance timestamps. Coach should surface the NY-time
+  convention at T10 entry as a Teach Mode bullet for novice stage. Cross-link
+  `[[wiki/context/teach-mode]]`.
+
+- **clientId reservation hazard for T9 backtest (MEDIUM-HIGH from 2026-05-08 ship retrospective).**
+  invest-backtest invokes `ib_async`; if it picks clientId 1 (engine reservation) it kicks
+  the engine off the gateway -- the orphan-STOP-class outage that Q42 was patched against.
+  Coach AND invest-backtest both need to document the convention (ad-hoc / backtest =
+  clientId 90-99). Today the convention lives in `scripts/gateway-query.sh` comments only;
+  not surfaced to either skill body. Tracked separately in invest-backtest's known follow-ups too.
+
+- **Vault propagation lag awareness at T9 / T12 (LOW from 2026-05-08 ship retrospective).**
+  Coach writes vault files MacBook-side; engine on VPS reads via Syncthing. Documented <5s
+  lag (Phase 3.9 Stage 1 kill-switch round-trip). T9 backtest is local and unaffected. T12
+  hands off to `/invest-ship --approve-strategy` (MacBook-side, with code pre-commit
+  validation), then Syncthing propagates the approved spec to the VPS. If a session pulls
+  `/execute status` immediately after `/invest-ship --approve-strategy`, it can race the
+  propagation. Add a "wait for propagation OR re-query in 10s" pattern at T12 close once
+  `invest-execute status` reads from the engine snapshot.
+
 ## Updates
 
 ### 2026-05-04 -- SHIPPED at `4f8bcd5`

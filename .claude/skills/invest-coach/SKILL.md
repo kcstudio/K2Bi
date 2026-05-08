@@ -29,6 +29,20 @@ Front-end before invest-narrative; orchestrates the full pipeline through to `/i
 
 The coach OWNS the multi-turn conversation. It INVOKES existing skills for their specialized work. It does NOT modify them.
 
+## Data sources (read paths for live state)
+
+invest-coach reads live state ONLY from engine-published vault artifacts. It does NOT open its own broker connection and does NOT shell out to `scripts/gateway-query.sh` (that helper is operator-forensics, not a skill data path; see CLAUDE.md "Execution Layer Isolation -- read-side counterpart").
+
+| Turn | Live state needed | Engine snapshot path | Status (2026-05-08) |
+|---|---|---|---|
+| T8 | Current regime + recent positions for the candidate ticker | `K2Bi-Vault/wiki/regimes/current.md` (regime exists) + engine `account_value` snapshot (does NOT exist yet) | Partial. Use regime today; defer position context until snapshot lands. |
+| T9 | invest-backtest does NOT need live broker state (yfinance only) but its underlying `ib_async` connection picks a clientId. **It MUST NOT pick clientId 1** (engine reservation). Convention: 90-99 for ad-hoc / backtest queries. | n/a | Convention only; not yet enforced in invest-backtest. |
+| T10 | NAV at draft time, for share-count math on the `order` block | engine snapshot (does NOT exist yet -- see `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md`) | **Missing.** Until the snapshot lands, T10 drafts share count as `pending` and `/invest-ship --approve-strategy` resolves NAV at approval time inside the engine process where the live read already exists. T10 MUST NOT open its own broker connection to fill in a concrete share count today. |
+| T11 | Forward guidance for thresholded metrics. NOT live broker state -- operator-pasted from earnings transcripts / IR pages. | n/a -- operator paste | Working as designed. |
+| T12 | Approval handoff. NOT live broker state. Coach should surface kill-switch state if `.killed` is present (snapshot will provide this; until then check `K2Bi-Vault/System/.killed` directly as a file-existence boolean only). | `K2Bi-Vault/System/.killed` (existence) | Partial. |
+
+If a future invest-coach iteration needs live state that has no engine snapshot yet, the path is: (1) propose the snapshot extension via a planning note in `K2Bi-Vault/wiki/planning/`; (2) ship the engine extension; (3) only then update this skill to read it. The reverse order (skill reads first, engine catches up) is what produced the 2026-05-08 outage diagnosis derail (sibling session improvised broker IO from MacBook because no snapshot existed). See L-2026-05-08-001.
+
 ## Multi-turn conversation pattern
 
 | Turn | Coach posture | Operator action | Output |

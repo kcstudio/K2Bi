@@ -54,6 +54,8 @@ Why: prompt-text rules fail under cognitive load. "Never exceed 5% position size
 
 **Claude CANNOT:** directly edit validator config mid-session, bypass validators to "force" a trade, delete the `.killed` lock file (human-only operation). The user creates `.killed` by sending `/invest kill` via Telegram (Phase 4+) and deletes it manually when ready to resume.
 
+**Read-side counterpart (added 2026-05-08):** the same isolation applies to broker reads. Claude in any session -- coaching, drafting, review, observer -- does NOT open its own broker connection. Live broker state (NAV, positions, open orders, kill-switch metadata, last-broker-error class) is published by the engine to vault snapshots; sessions read those snapshots. If a workflow needs live state and no engine snapshot exists, the answer is to extend the engine, NOT to open a session-side `ib_async` connection. The single exception is `scripts/gateway-query.sh`, which is operator-forensics ONLY (incident debugging, ad-hoc account checks); skill bodies and skill-driven workflows MUST NOT call it. The engine snapshot pipeline is tracked in `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md`. Motivating incident: 2026-05-08 outage (commit `8b94436` retrospective + L-2026-05-08-001).
+
 ## Memory Layer Ownership
 
 Every fact has exactly one home. When a rule or procedure lives in more than one place, the second copy rots first.
