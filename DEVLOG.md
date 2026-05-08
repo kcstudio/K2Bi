@@ -1,3 +1,24 @@
+## 2026-05-08 -- skill clarification: two-commit pattern for new-file approve-strategy + deploy-config excludes
+
+**Commit:** `0a14534` docs(invest-ship): two-commit pattern for new-file approve-strategy + deploy-config excludes
+
+**What shipped:** Two small docs/config edits surfaced during the post-G-approval vault-staleness pass:
+
+- `.claude/skills/invest-ship/SKILL.md` Step E now documents the two-commit pattern for the new-file-to-git-history case. The cycle-4 pre-commit Check D requires HEAD to have `status: proposed` and staged to have `status: approved`. When Keith authors a strategy in the Syncthing-managed vault and the file lands in the repo as part of the approval (no prior `proposed`-state commit), HEAD has no version of the file at all and Check D rejects the single-commit form as the forged-approved-new-file case. Fix: land a separate chore-typed commit first that puts the file into HEAD at `status: proposed` (no strategy-transition trailers), then re-run the approve-strategy helper which captures the new HEAD as parent_sha and edits to `status: approved` as a second commit. Five paragraphs added covering when this applies, the fix, the telltale (helper exit 0 + Codex pass + git commit fails on Check D), and the trailer-scope rule. This is the workflow Keith and I followed at commits `8e9c6ed` (proposed-state landing) and `69908ef` (approval) earlier today; previously implicit, now documented.
+- `scripts/deploy-config.yml` excludes block grew two entries: `handoffs/` (the `/agent-handoff` skill's drop directory for job specs + result archives) and `tmp_build_g_memo_docx.py` (an operator-side throwaway build helper). Both are MacBook-only by design; without these excludes, `/ship`'s deploy-coverage preflight blocked on the working tree.
+
+**Adversarial review:** skipped per invest-ship SKILL.md "Config tweaks, typo fixes, one-line changes" exception. Doc-only one-section addition + two excludes-list entries; no engine impact; the workflow constraint being documented was already pre-discussed in the `0ac1fcb` retrospective devlog entry from earlier today.
+
+**Feature status change:** none. Touches `feature_invest-coach-cycle5-helper-schema-reconciliation.md` (filed today via vault-staleness pass) tangentially — the two-commit pattern is one of the workflow consequences of today's coach-vs-helper schema drift. Not load-bearing for that feature; just operational discipline derived from it.
+
+**Follow-ups:**
+
+- The two-commit pattern is a soft signal of the same coach/helper schema drift the reconciliation feature targets. If the coach pipeline learns to author strategy drafts directly in the repo (rather than only in the vault) at T10 close, this pattern becomes obsolete because the proposed-state file would already be in HEAD when approve-strategy fires. Captured implicitly in `feature_invest-coach-cycle5-helper-schema-reconciliation.md` Boundary 1 sub-deliverable 1.
+- `handoffs/` exclusion is permanent. `tmp_build_g_memo_docx.py` is a one-shot operator helper that should be cleaned up at convenience; the exclude protects against silent deploy if Keith forgets to delete the file before next /ship.
+
+**Key decisions:** none beyond the routine doc-skip on Codex per the "config tweaks" exception clause already in the skill body.
+
+
 ## 2026-05-08 -- first MKT/null strategy approval shipped: G 2nd-wave paper trade (Path B engine bundle + 6-round schema reconciliation)
 
 **Commits:**
