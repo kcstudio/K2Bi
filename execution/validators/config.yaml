@@ -37,3 +37,4 @@ instrument_whitelist:
   # added via invest-propose-limits + strategy approval flow.
   symbols:
     - SPY
+    - G
