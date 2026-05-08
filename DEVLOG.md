@@ -1,3 +1,42 @@
+## 2026-05-08 -- limits proposal approved: instrument_whitelist add G
+
+**Commit:** `c73ccbf` feat(limits): approve instrument_whitelist-add-G
+
+**Triggered by:** `/invest-ship --approve-limits review/strategy-approvals/2026-05-04_limits-proposal_instrument_whitelist-add-G.md`. First limits-proposal in K2Bi history; surfaces the approval gate end-to-end against a real config.yaml mutation.
+
+**What shipped:**
+
+- `execution/validators/config.yaml`: `instrument_whitelist.symbols` transitions from `[SPY]` to `[SPY, G]`. Single-line edit applied atomically by the `scripts/lib/invest_ship_strategy.py approve-limits` helper; the helper also flipped the proposal's frontmatter `status: proposed -> approved` and stamped `approved_at` + `approved_commit_sha: f3f9a47` (parent sha) in the same write.
+- The proposal file itself lives in gitignored `review/strategy-approvals/` (Syncthing-managed), so the audit trail rides on the proposal's frontmatter on disk + this commit's trailers (`Limits-Transition: proposed -> approved`, `Approved-Limits: instrument_whitelist-add-G`, `Config-Change: instrument_whitelist:add`). Not in this commit's git diff.
+
+**Adversarial review:** Codex unavailable for plan scope (current `codex-companion.mjs` dropped `--path`); auto-fell-back to the Kimi-backed reviewer via `scripts/review.sh` -- 65s, exit 0. Surfaced 5 findings, 2 HIGH + 3 MEDIUM. None are bugs in this proposal: every finding is a pre-existing validator-architecture gap that bites at the next gate (`/invest-ship --approve-strategy` for any strategy that references G), not at this whitelist add. Findings recorded for that gate to reckon with:
+
+1. [HIGH 85%] `max_ticker_concentration_pct: 0.20` calibrated for SPY liquidity; mid-cap BPO has materially lower ADV.
+2. [HIGH 75%] G's ADR structure (currency, custody, dividend timing) absent from validator metadata.
+3. [MEDIUM 80%] No per-strategy or per-ticker position_size override -- the proposal's "0.25% NAV-at-risk fractional sizing" is intent, not enforced.
+4. [MEDIUM 70%] No halt / LULD / auction-state awareness in `market_hours` validator.
+5. [MEDIUM 75%] Config changes require engine restart -- no rapid rollback path.
+
+Adding G to the whitelist does not by itself fire orders. Findings carry forward to the strategy-approval gate.
+
+**Structural blocker (recorded for follow-up):** Cycle-4 pre-commit Check C at `.git/hooks/pre-commit:152-216` requires the limits-proposal to be staged in the same commit as `config.yaml`, with HEAD status `proposed` and staged status `approved`. K2Bi's `.gitignore` carries `review/` (per its own comment: "approved files move into git-tracked wiki/ paths at approval time"), so proposals are never git-tracked and Check C is structurally unsatisfiable. Commit landed via the documented escape hatch `K2BI_ALLOW_CONFIG_EDIT=1` (the override is logged by the hook). Follow-up needed: either (a) reconcile Check C with the local-only review/ convention -- e.g. switch Check C to consult the Syncthing-mirrored proposal path on disk + verify the trailers -- or (b) drop `review/` from .gitignore and stage proposals normally. K2B's pattern is (b); K2Bi has chosen (a) by gitignore. The mismatch needs a decision.
+
+**Feature status change:** none. Bundle 3 cycle 5 (`scripts/lib/invest_ship_strategy.py approve-limits`) and cycle 6 (`scripts/lib/propose_limits.py`) had already shipped to status: shipped; this is the first end-to-end exercise.
+
+**Follow-ups:**
+
+- (above) Reconcile Check C with K2Bi's gitignored `review/` convention.
+- Per-strategy / per-ticker position_size override schema in `execution/validators/config.yaml` (Codex finding #3, blocks any non-SPY single-name strategy approval that wants size discipline tighter than the global 1% / 5% caps).
+- Halt / LULD / auction-state validator (Codex finding #4) before any non-ETF whitelist expansion past G.
+- ADR metadata schema (Codex finding #2) -- captured as a known-gap for the next mid-cap whitelist add.
+- `python -m execution.engine.main --diagnose-approved` is the Bundle 3 verification CLI; for limits this is moot (no approved-strategy set changes), but Phase 6 pm2 should hot-reload `config.yaml` to remove the rapid-rollback hazard (Codex finding #5).
+
+**Key decisions:**
+
+- Accepted Codex findings rather than blocking: all 5 are systemic and gate at strategy-approval, not at whitelist add. Blocking here would lock K2Bi at SPY-only forever.
+- Used `K2BI_ALLOW_CONFIG_EDIT=1` override deliberately, not as a hack -- the structural gitignore conflict is the only path forward today and the hook logs the override for audit.
+
+
 ## 2026-05-08 -- invest-coach read-side data-source gaps closed (retrospective follow-up)
 
 **Commit:** `c61b55a` docs(invest-coach): close read-side data-source gaps surfaced by 2026-05-08 retrospective
