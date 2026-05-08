@@ -710,13 +710,14 @@ class IBKRConnector:
         ticker: str,
         side: str,
         qty: int,
-        limit_price: Decimal,
+        limit_price: Decimal | None,
         stop_loss: Decimal | None,
         time_in_force: str = "DAY",
         client_tag: str | None = None,
+        order_type: str = "LMT",
     ) -> BrokerOrderAck:
-        """Submit a limit order; if stop_loss is set, submit a linked
-        stop child so the broker itself holds the protective stop.
+        """Submit a limit or market order; if stop_loss is set, submit a
+        linked stop child so the broker itself holds the protective stop.
 
         Codex round-3 P1: if the engine journals a stop and the broker
         does not hold one, a disconnect or process crash leaves the
@@ -725,18 +726,46 @@ class IBKRConnector:
         parentId) tells IB Gateway to commit both orders atomically as
         a linked pair. The child is a GTC stop so it persists past the
         parent's DAY tif and survives engine restarts.
+
+        Round-6 (2026-05-08): order_type branches the parent order
+        construction. ``LMT`` requires a Decimal ``limit_price`` and
+        constructs ``ib_async.LimitOrder``. ``MKT`` ignores
+        ``limit_price`` (which may be a reference-price hint that
+        downstream consumers don't honour) and constructs
+        ``ib_async.MarketOrder``. Unknown order_type values are
+        rejected explicitly to prevent silent fallthrough to the LMT
+        path that would send the wrong broker contract.
         """
         self._require_connected()
         import ib_async  # type: ignore[import-not-found]
 
         contract = ib_async.Stock(ticker, "SMART", "USD")
         action = "BUY" if side.lower() == "buy" else "SELL"
-        parent = ib_async.LimitOrder(
-            action,
-            int(qty),
-            float(limit_price),
-            tif=time_in_force,
-        )
+        order_type_norm = (order_type or "LMT").strip().upper()
+        if order_type_norm == "LMT":
+            if limit_price is None:
+                raise BrokerRejectionError(
+                    "submit_order: LMT requires a Decimal limit_price; got None",
+                    broker_reason="lmt_missing_limit_price",
+                )
+            parent = ib_async.LimitOrder(
+                action,
+                int(qty),
+                float(limit_price),
+                tif=time_in_force,
+            )
+        elif order_type_norm == "MKT":
+            parent = ib_async.MarketOrder(
+                action,
+                int(qty),
+                tif=time_in_force,
+            )
+        else:
+            raise BrokerRejectionError(
+                f"submit_order: unknown order_type {order_type!r}; "
+                f"expected one of {{'LMT', 'MKT'}}",
+                broker_reason="unknown_order_type",
+            )
         # transmit=False means IB Gateway holds the parent until a
         # child order with transmit=True arrives referencing its
         # parentId. If there is no stop, parent transmits on its own.

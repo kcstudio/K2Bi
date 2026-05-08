@@ -25,11 +25,24 @@ class Order:
     ticker: str
     side: Side
     qty: int
+    # `limit_price` is the AUTHORITATIVE-or-REFERENCE price for risk
+    # math. For LMT orders, this is the actual broker limit. For MKT
+    # orders, the engine resolves a reference price from market marks
+    # before constructing the Order so notional / per_share_risk math
+    # always has a Decimal anchor. The Order type therefore continues
+    # to require Decimal here -- callers that have None must resolve
+    # it (or fail-closed) before construction. See engine/main.py
+    # `_to_validator_order` for the bridge.
     limit_price: Decimal
     stop_loss: Decimal | None
     strategy: str
     submitted_at: datetime
     extended_hours: bool = False
+    # Round-6 (2026-05-08): order_type carried through for connector
+    # branching + journaling. Default LMT preserves backward compat
+    # for any test or recovery path that builds an Order without
+    # specifying it.
+    order_type: str = "LMT"
 
     @property
     def notional(self) -> Decimal:

@@ -52,6 +52,9 @@ from .types import (
     ALLOWED_STATUSES,
     ALLOWED_STRATEGY_TYPES,
     ApprovedStrategySnapshot,
+    ALLOWED_ORDER_TYPES,
+    ORDER_TYPE_LMT,
+    ORDER_TYPE_MKT,
     STATUS_APPROVED,
     STRATEGY_TYPE_HAND_CRAFTED,
     StrategyDocument,
@@ -376,7 +379,64 @@ def _parse_order_spec(data: dict[str, Any], path: Path) -> StrategyOrderSpec:
         raise StrategyLoaderError(
             f"{path}: order.qty must be a positive int, got {qty!r}"
         )
-    limit_price = _required_decimal(data, "limit_price", path)
+
+    # order_type defaults to LMT for backward compatibility -- pre-MKT
+    # strategies authored before 2026-05-08 omitted the field and the
+    # loader required `limit_price` as a Decimal, which is LMT
+    # semantics. Unknown order_type values are rejected explicitly,
+    # not silently coerced. Path B / Round 5 from /invest-ship
+    # --approve-strategy g-2026-05_2nd-wave-paper-trade.
+    order_type_raw = data.get("order_type")
+    if order_type_raw is None:
+        order_type = ORDER_TYPE_LMT
+    else:
+        if not isinstance(order_type_raw, str) or not order_type_raw.strip():
+            raise StrategyLoaderError(
+                f"{path}: order.order_type must be a non-empty string, "
+                f"got {order_type_raw!r}"
+            )
+        order_type = order_type_raw.strip().upper()
+        if order_type not in ALLOWED_ORDER_TYPES:
+            raise StrategyLoaderError(
+                f"{path}: order.order_type must be one of "
+                f"{sorted(ALLOWED_ORDER_TYPES)}, got {order_type_raw!r}"
+            )
+
+    # limit_price parsing dispatches on order_type. Every order_type
+    # is explicitly handled; the else branch is unreachable because
+    # ALLOWED_ORDER_TYPES is the only set that gets through above,
+    # but we raise on it anyway so a future order-type addition that
+    # forgets to extend this dispatch fails loudly at load time
+    # rather than producing a half-loaded snapshot.
+    limit_price_raw = data.get("limit_price")
+    if order_type == ORDER_TYPE_MKT:
+        # MKT allows null limit_price; non-null is accepted as a
+        # reference-price hint (downstream consumers may ignore it,
+        # since a market order has no authoritative limit). Treating
+        # the value as Decimal here keeps the field's type discipline
+        # consistent for non-null cases.
+        if limit_price_raw is None or (
+            isinstance(limit_price_raw, str) and not limit_price_raw.strip()
+        ):
+            limit_price = None
+        else:
+            try:
+                limit_price = Decimal(str(limit_price_raw))
+            except (InvalidOperation, ValueError) as exc:
+                raise StrategyLoaderError(
+                    f"{path}: `limit_price` must be a decimal or null "
+                    f"for order_type=MKT, got {limit_price_raw!r}"
+                ) from exc
+    elif order_type == ORDER_TYPE_LMT:
+        # LMT requires Decimal -- this is the pre-2026-05-08 contract.
+        limit_price = _required_decimal(data, "limit_price", path)
+    else:
+        raise StrategyLoaderError(
+            f"{path}: order.order_type {order_type!r} is in "
+            f"ALLOWED_ORDER_TYPES but not handled by _parse_order_spec; "
+            f"this is a loader bug -- extend the dispatch."
+        )
+
     stop_loss = None
     if data.get("stop_loss") is not None:
         stop_loss = _required_decimal(data, "stop_loss", path)
@@ -386,6 +446,7 @@ def _parse_order_spec(data: dict[str, Any], path: Path) -> StrategyOrderSpec:
         side=side,
         qty=int(qty),
         limit_price=limit_price,
+        order_type=order_type,
         stop_loss=stop_loss,
         time_in_force=tif,
     )

@@ -256,6 +256,12 @@ class PendingFromJournal:
     limit_price: Decimal | None
     submitted_at: datetime
     stop_loss: Decimal | None = None
+    # Round-6 (2026-05-08): order_type carried so a crash-restart
+    # rebuild reconstructs the original wire intent. Default LMT
+    # preserves backward compat for older v1/v2 journals that predate
+    # the field; recovery falls back to LMT when the journal payload
+    # has no order_type, which matches pre-Round-6 engine behaviour.
+    order_type: str = "LMT"
 
 
 @dataclass(frozen=True)
@@ -1567,6 +1573,11 @@ def _pending_from_journal(
                     rec.get("qty") or payload.get("qty"),
                 )
                 qty_int = 0
+            order_type_raw = payload.get("order_type")
+            if isinstance(order_type_raw, str) and order_type_raw.strip():
+                order_type = order_type_raw.strip().upper()
+            else:
+                order_type = "LMT"  # backward-compat default
             per_key[key] = PendingFromJournal(
                 trade_id=rec.get("trade_id"),
                 strategy=rec.get("strategy"),
@@ -1578,6 +1589,7 @@ def _pending_from_journal(
                 limit_price=_safe_decimal(payload.get("limit_price")),
                 submitted_at=_parse_ts(rec.get("ts")) or datetime.now(timezone.utc),
                 stop_loss=_safe_decimal(payload.get("stop_loss")),
+                order_type=order_type,
             )
             per_key_filled.setdefault(key, 0)
         elif event_type == "order_filled":
@@ -1816,6 +1828,7 @@ def _pending_payload(pending: PendingFromJournal) -> dict[str, Any]:
             else None
         ),
         "submitted_at": pending.submitted_at.isoformat(),
+        "order_type": pending.order_type,
     }
 
 

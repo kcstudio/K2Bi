@@ -39,12 +39,13 @@ class SubmittedOrderRecord:
     ticker: str
     side: str
     qty: int
-    limit_price: Decimal
+    limit_price: Decimal | None
     stop_loss: Decimal | None
     time_in_force: str
     client_tag: str | None
     broker_order_id: str
     broker_perm_id: str
+    order_type: str = "LMT"
 
 
 @dataclass
@@ -156,16 +157,26 @@ class MockIBKRConnector:
         ticker: str,
         side: str,
         qty: int,
-        limit_price: Decimal,
+        limit_price: Decimal | None,
         stop_loss: Decimal | None,
         time_in_force: str = "DAY",
         client_tag: str | None = None,
+        order_type: str = "LMT",
     ) -> BrokerOrderAck:
         self._require_connected()
         if self.fail_next_submit is not None:
             err = self.fail_next_submit
             self.fail_next_submit = None
             raise err
+
+        # Round-6 (2026-05-08): MKT requires limit_price=None or non-null
+        # reference; LMT requires Decimal. Mirror the broker contract
+        # so tests catch shape mismatches.
+        if order_type == "LMT" and limit_price is None:
+            raise ValueError(
+                "MockIBKRConnector.submit_order: LMT requires a Decimal "
+                "limit_price; got None"
+            )
 
         broker_order_id = str(self._next_order_id)
         broker_perm_id = str(self._next_perm_id)
@@ -182,6 +193,7 @@ class MockIBKRConnector:
             client_tag=client_tag,
             broker_order_id=broker_order_id,
             broker_perm_id=broker_perm_id,
+            order_type=order_type,
         )
         self.submitted_orders.append(record)
 

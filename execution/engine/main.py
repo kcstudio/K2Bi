@@ -1245,7 +1245,40 @@ class Engine:
             if decision.candidate is None:
                 continue
             trade_id = new_ulid()
-            order = _to_validator_order(decision.candidate, now)
+            try:
+                order = _to_validator_order(
+                    decision.candidate, now, marks=market.marks
+                )
+            except ValueError as exc:
+                # Round-6 fail-closed path: MKT order with no usable
+                # reference price (mark missing / non-positive). Journal
+                # a clean order_rejected rather than crash the tick.
+                # `reason` is structured so the next tick can re-attempt
+                # if marks repopulate, and operator alerting can
+                # trigger on the literal string.
+                self.journal.append(
+                    "order_rejected",
+                    payload={
+                        "ticker": decision.candidate.ticker,
+                        "side": decision.candidate.side,
+                        "qty": decision.candidate.qty,
+                        "order_type": decision.candidate.order_type,
+                        "limit_price": (
+                            str(decision.candidate.limit_price)
+                            if decision.candidate.limit_price is not None
+                            else None
+                        ),
+                        "reason": "no_safe_reference_price_for_mkt_order",
+                        "detail": str(exc),
+                    },
+                    strategy=snap.name,
+                    trade_id=trade_id,
+                    ticker=decision.candidate.ticker,
+                    side=decision.candidate.side,
+                    qty=decision.candidate.qty,
+                )
+                result.orders_rejected += 1
+                continue
 
             # Engine-level pre-submit cash_only backstop for sell orders.
             # Bundle 1 architect flag: non-negotiable to call this BEFORE
@@ -1280,6 +1313,7 @@ class Engine:
                     "ticker": order.ticker,
                     "side": order.side,
                     "qty": order.qty,
+                    "order_type": order.order_type,
                     "limit_price": str(order.limit_price),
                     "stop_loss": str(order.stop_loss) if order.stop_loss else None,
                     "time_in_force": decision.candidate.time_in_force,
@@ -1300,6 +1334,7 @@ class Engine:
                 trade_id=trade_id,
                 tif=decision.candidate.time_in_force,
                 result=result,
+                candidate=decision.candidate,
             )
             # Phase 2 MVP: one order per tick. Break after the first
             # successful submit; next tick handles subsequent strategies.
@@ -1314,6 +1349,7 @@ class Engine:
         trade_id: str,
         tif: str,
         result: TickResult,
+        candidate: CandidateOrder | None = None,
     ) -> None:
         self.state = EngineState.SUBMITTING
 
@@ -1372,15 +1408,48 @@ class Engine:
             result.orders_rejected += 1
             return
 
+        # Round-6 (2026-05-08): preserve the candidate's true wire
+        # intent. ``order.limit_price`` may be a reference-price
+        # resolved from market marks for MKT orders (used for
+        # validator math); the broker must not see that as an
+        # authoritative limit. Use ``candidate.limit_price`` (which is
+        # None for true MKT, Decimal for LMT) and pass order_type
+        # explicitly so the connector layer branches correctly.
+        wire_limit_price = (
+            candidate.limit_price
+            if candidate is not None
+            else order.limit_price
+        )
+        wire_order_type = (
+            candidate.order_type
+            if candidate is not None
+            else order.order_type
+        )
+        # Round-6 R2 (2026-05-08): defensive wire-safety override per
+        # Codex Checkpoint-2 R2 HIGH #2. When the resolved wire intent
+        # is MKT, FORCE limit_price=None on the broker call regardless
+        # of how it was sourced. Resumed orders rebuilt from journal
+        # via _safe_decimal_or_zero carry Decimal('0') as a sentinel
+        # for "no real limit"; without this override, _submit fallback
+        # paths (candidate=None for resume-driven re-submits) would
+        # send a 0-priced limit-shaped value to the broker on a market
+        # order. The IBKR submit_order branch ignores limit_price for
+        # MKT, but a future MOO/MOC variant or a different broker
+        # connector might consume the field as a max-slippage cap. Map
+        # to None at this seam so the wire never carries a synthetic
+        # number for MKT.
+        if (wire_order_type or "").strip().upper() == "MKT":
+            wire_limit_price = None
         try:
             ack = await self.connector.submit_order(
                 ticker=order.ticker,
                 side=order.side,
                 qty=order.qty,
-                limit_price=order.limit_price,
+                limit_price=wire_limit_price,
                 stop_loss=order.stop_loss,
                 time_in_force=tif,
                 client_tag=f"k2bi:{snap.name}:{trade_id}",
+                order_type=wire_order_type,
             )
         except AuthRequiredError as exc:
             # Codex round-10 P1: transport failures are NOT proof that
@@ -1422,9 +1491,20 @@ class Engine:
             result.orders_rejected += 1
             return
 
+        # Round-6 (2026-05-08): journal the WIRE-level fields, not
+        # the validator reference. For MKT, wire_limit_price is None;
+        # the validator reference (order.limit_price, resolved from
+        # market mark) is intentionally not on the audit trail because
+        # recovery replay must reconstruct the order with the same
+        # shape the broker received. Compounds with the order_type
+        # field so post-restart recovery rebuilds order_type=MKT,
+        # limit_price=None faithfully.
         submitted_payload: dict[str, Any] = {
             "status": ack.status,
-            "limit_price": str(order.limit_price),
+            "order_type": wire_order_type,
+            "limit_price": (
+                str(wire_limit_price) if wire_limit_price is not None else None
+            ),
             "stop_loss": str(order.stop_loss) if order.stop_loss else None,
             "time_in_force": tif,
         }
@@ -2038,16 +2118,63 @@ class Engine:
 # ---------- module-level helpers ----------
 
 
-def _to_validator_order(cand: CandidateOrder, now: datetime) -> Order:
+def _to_validator_order(
+    cand: CandidateOrder,
+    now: datetime,
+    marks: dict[str, Decimal] | None = None,
+) -> Order:
+    """Bridge a CandidateOrder into a validator Order.
+
+    For LMT orders, ``cand.limit_price`` is the authoritative limit and
+    is used directly. For MKT orders the candidate may carry
+    ``limit_price=None`` (the only semantically valid shape for a true
+    market order); the engine resolves a reference price from
+    ``marks[ticker]`` so the validator's notional / per_share_risk math
+    has a Decimal anchor. If marks are missing or non-positive for the
+    ticker, raises ``ValueError``; the caller is expected to journal a
+    validator-rejection ("no safe reference price for MKT order") and
+    skip submission rather than letting the engine tick crash.
+
+    A non-null ``cand.limit_price`` on a MKT order is treated as a
+    reference-price hint ONLY at the validator boundary; the connector
+    layer still submits a MarketOrder per ``cand.order_type``, ignoring
+    the hint on the wire.
+    """
+    order_type = (cand.order_type or "LMT").strip().upper()
+    if order_type == "LMT":
+        if cand.limit_price is None:
+            raise ValueError(
+                f"_to_validator_order: LMT candidate for {cand.ticker} has "
+                f"limit_price=None; loader should have rejected this"
+            )
+        validator_limit_price = cand.limit_price
+    elif order_type == "MKT":
+        if cand.limit_price is not None:
+            # Reference-price hint -- use it for validator math.
+            validator_limit_price = cand.limit_price
+        else:
+            mark = (marks or {}).get(cand.ticker)
+            if mark is None or mark <= 0:
+                raise ValueError(
+                    f"_to_validator_order: MKT candidate for {cand.ticker} "
+                    f"has no usable mark in MarketSnapshot; cannot compute "
+                    f"validator notional / risk"
+                )
+            validator_limit_price = mark
+    else:
+        raise ValueError(
+            f"_to_validator_order: unknown order_type {cand.order_type!r}"
+        )
     return Order(
         ticker=cand.ticker,
         side=cand.side,
         qty=cand.qty,
-        limit_price=cand.limit_price,
+        limit_price=validator_limit_price,
         stop_loss=cand.stop_loss,
         strategy=cand.strategy,
         submitted_at=now,
         extended_hours=False,
+        order_type=order_type,
     )
 
 
@@ -2387,6 +2514,27 @@ def _validate_journal_view(journal_view: dict[str, Any]) -> dict[str, Any] | Non
         else:
             submitted_at = submitted_at.astimezone(timezone.utc)
 
+    # Round-6: order_type carried through resume. Default LMT for
+    # backward compat with pre-Round-6 journals that don't carry the
+    # field (preserves the original engine behaviour for those).
+    order_type_raw = journal_view.get("order_type")
+    if order_type_raw is None:
+        order_type = "LMT"
+    elif not isinstance(order_type_raw, str) or not order_type_raw.strip():
+        LOG.error(
+            "resume: invalid order_type (%r); refusing resume",
+            order_type_raw,
+        )
+        return None
+    else:
+        order_type = order_type_raw.strip().upper()
+        if order_type not in ("MKT", "LMT"):
+            LOG.error(
+                "resume: unknown order_type (%r); refusing resume",
+                order_type_raw,
+            )
+            return None
+
     return {
         "ticker": ticker.strip(),
         "side": side,
@@ -2394,6 +2542,7 @@ def _validate_journal_view(journal_view: dict[str, Any]) -> dict[str, Any] | Non
         "limit_price": limit_price,
         "stop_loss": stop_loss,
         "submitted_at": submitted_at,
+        "order_type": order_type,
     }
 
 
@@ -2449,6 +2598,7 @@ def _pick_resumable_awaiting(
         strategy=event.strategy or "",
         submitted_at=submitted_at,
         extended_hours=False,
+        order_type=validated["order_type"],
     )
     trade_id = event.trade_id or new_ulid()
 

@@ -206,6 +206,220 @@ class LoadDocumentTests(unittest.TestCase):
                 loader.load_document(path)
 
 
+def _write_strategy_with_raw_order(
+    dir: Path,
+    name: str,
+    *,
+    order_yaml: str,
+    status: str = STATUS_APPROVED,
+    approved_at: str | None = "2026-05-01T10:00:00Z",
+    approved_commit_sha: str | None = "abc1234",
+) -> Path:
+    """Write a strategy file with the order block expressed as raw YAML.
+
+    Lets matrix tests emit YAML literals like `limit_price: null` that
+    `_write_strategy`'s f-string-based dict serialiser cannot produce
+    (Python None renders as the string "None" inside an f-string).
+    """
+    lines = [
+        "---",
+        f"name: {name}",
+        f"status: {status}",
+        f"strategy_type: {STRATEGY_TYPE_HAND_CRAFTED}",
+        "risk_envelope_pct: 0.01",
+    ]
+    if approved_at is not None:
+        lines.append(f"approved_at: {approved_at}")
+    if approved_commit_sha is not None:
+        lines.append(f"approved_commit_sha: {approved_commit_sha}")
+    lines.append("order:")
+    for line in order_yaml.strip("\n").splitlines():
+        lines.append(f"  {line}")
+    lines.append("---")
+    lines.append("")
+    lines.append("## How This Works")
+    lines.append("")
+    lines.append("Plain-English explanation.")
+    path = dir / f"{name}.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+class OrderTypeLimitPriceMatrixTests(unittest.TestCase):
+    """Round 5 (2026-05-08): order_type x limit_price matrix.
+
+    Pre-fix loader required `limit_price` as a Decimal regardless of
+    order_type, so a `MKT` order with `limit_price: null` (the only
+    semantically valid shape for a market order) failed to load.
+    Matrix coverage:
+
+      | order_type | limit_price | expected               |
+      |------------|-------------|------------------------|
+      | MKT        | null        | pass, limit_price=None |
+      | MKT        | non-null    | pass (reference hint)  |
+      | LMT        | null        | reject                 |
+      | LMT        | non-null    | pass (pre-fix path)    |
+      | absent     | non-null    | pass, defaults to LMT  |
+      | absent     | null        | reject (LMT default)   |
+      | UNKNOWN    | any         | reject                 |
+    """
+
+    def test_mkt_with_null_limit_price_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "g-paper",
+                order_yaml=(
+                    "ticker: G\n"
+                    "side: buy\n"
+                    "qty: 71\n"
+                    "order_type: MKT\n"
+                    "limit_price: null\n"
+                    "time_in_force: DAY\n"
+                    "stop_loss: 30.00"
+                ),
+            )
+            doc = loader.load_document(path)
+            self.assertIsNotNone(doc.order_spec)
+            self.assertEqual(doc.order_spec.order_type, "MKT")
+            self.assertIsNone(doc.order_spec.limit_price)
+            self.assertEqual(doc.order_spec.qty, 71)
+            self.assertEqual(doc.order_spec.stop_loss, Decimal("30.00"))
+
+    def test_mkt_with_non_null_limit_price_passes_as_reference_hint(self):
+        # MKT + non-null limit_price is accepted: the value is stored as
+        # a reference-price hint that downstream consumers may ignore
+        # (a market order has no authoritative limit). The "pass" branch
+        # of Keith's "pass-or-warn-pick-one" spec.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "mkt-with-hint",
+                order_yaml=(
+                    "ticker: G\n"
+                    "side: buy\n"
+                    "qty: 71\n"
+                    "order_type: MKT\n"
+                    "limit_price: 34.50\n"
+                ),
+            )
+            doc = loader.load_document(path)
+            self.assertEqual(doc.order_spec.order_type, "MKT")
+            self.assertEqual(doc.order_spec.limit_price, Decimal("34.50"))
+
+    def test_lmt_with_null_limit_price_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "lmt-without-price",
+                order_yaml=(
+                    "ticker: SPY\n"
+                    "side: buy\n"
+                    "qty: 10\n"
+                    "order_type: LMT\n"
+                    "limit_price: null\n"
+                ),
+            )
+            with self.assertRaises(StrategyLoaderError) as ctx:
+                loader.load_document(path)
+            self.assertIn("limit_price", str(ctx.exception))
+
+    def test_lmt_with_non_null_limit_price_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "lmt-classic",
+                order_yaml=(
+                    "ticker: SPY\n"
+                    "side: buy\n"
+                    "qty: 10\n"
+                    "order_type: LMT\n"
+                    "limit_price: 500.00\n"
+                ),
+            )
+            doc = loader.load_document(path)
+            self.assertEqual(doc.order_spec.order_type, "LMT")
+            self.assertEqual(doc.order_spec.limit_price, Decimal("500.00"))
+
+    def test_absent_order_type_defaults_to_lmt_with_decimal_limit_price(self):
+        # Backward-compat: pre-2026-05-08 strategies omit `order_type`
+        # entirely and the loader required `limit_price` as Decimal.
+        # Default must remain LMT semantics so existing approved
+        # strategies (e.g. spy-first-paper-smoke) keep loading.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "legacy-no-order-type",
+                order_yaml=(
+                    "ticker: SPY\n"
+                    "side: buy\n"
+                    "qty: 2\n"
+                    "limit_price: 715.00\n"
+                ),
+            )
+            doc = loader.load_document(path)
+            self.assertEqual(doc.order_spec.order_type, "LMT")
+            self.assertEqual(doc.order_spec.limit_price, Decimal("715.00"))
+
+    def test_absent_order_type_with_null_limit_price_rejects(self):
+        # Conservative default: when order_type is absent, behave like
+        # LMT (require Decimal). A null limit_price under the default
+        # must fail rather than silently coerce to MKT.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "legacy-but-null",
+                order_yaml=(
+                    "ticker: SPY\n"
+                    "side: buy\n"
+                    "qty: 2\n"
+                    "limit_price: null\n"
+                ),
+            )
+            with self.assertRaises(StrategyLoaderError):
+                loader.load_document(path)
+
+    def test_unknown_order_type_rejects_with_clear_error(self):
+        # Per Keith's spec: every order_type must be explicitly handled
+        # or rejected; no silent-accept paths.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "unknown-order-type",
+                order_yaml=(
+                    "ticker: SPY\n"
+                    "side: buy\n"
+                    "qty: 10\n"
+                    "order_type: STP\n"
+                    "limit_price: 500.00\n"
+                ),
+            )
+            with self.assertRaises(StrategyLoaderError) as ctx:
+                loader.load_document(path)
+            msg = str(ctx.exception)
+            self.assertIn("order_type", msg)
+            self.assertIn("STP", msg)
+
+    def test_order_type_case_insensitive(self):
+        # Tolerate lowercase/mixed-case order_type strings; the loader
+        # uppercases before validation.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy_with_raw_order(
+                Path(tmp),
+                "lowercase-mkt",
+                order_yaml=(
+                    "ticker: G\n"
+                    "side: buy\n"
+                    "qty: 71\n"
+                    "order_type: mkt\n"
+                    "limit_price: null\n"
+                ),
+            )
+            doc = loader.load_document(path)
+            self.assertEqual(doc.order_spec.order_type, "MKT")
+            self.assertIsNone(doc.order_spec.limit_price)
+
+
 class LoadApprovedTests(unittest.TestCase):
     def test_approved_snapshot_has_mtime_and_sha(self):
         with tempfile.TemporaryDirectory() as tmp:

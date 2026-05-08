@@ -50,6 +50,15 @@ ALLOWED_STATUSES = frozenset(
 STRATEGY_TYPE_HAND_CRAFTED = "hand_crafted"
 ALLOWED_STRATEGY_TYPES = frozenset({STRATEGY_TYPE_HAND_CRAFTED})
 
+# Order types the loader accepts. LMT requires a Decimal limit_price;
+# MKT allows limit_price=None (or a non-null reference-price hint that
+# downstream consumers may ignore). Adding a new order type is an
+# explicit-handling change in `loader._parse_order_spec`; the loader
+# refuses unknown order_type values rather than silently coercing.
+ORDER_TYPE_LMT = "LMT"
+ORDER_TYPE_MKT = "MKT"
+ALLOWED_ORDER_TYPES = frozenset({ORDER_TYPE_LMT, ORDER_TYPE_MKT})
+
 
 @dataclass(frozen=True)
 class StrategyOrderSpec:
@@ -57,12 +66,21 @@ class StrategyOrderSpec:
 
     For a rule_based strategy (Phase 3+), this field is absent and the
     runner instead evaluates a rule tree to build an order on demand.
+
+    `order_type` defaults to LMT for backward compatibility -- pre-MKT
+    strategies authored before 2026-05-08 omitted the field and the
+    loader required `limit_price` as a Decimal, which is LMT semantics.
+    `limit_price` is None when `order_type == MKT` and the YAML carried
+    null; downstream validators that need a price anchor for MKT
+    orders should consult last-tick / reference-price elsewhere
+    (engine-side; not the loader's concern).
     """
 
     ticker: str
     side: str              # "buy" or "sell"
     qty: int
-    limit_price: Decimal
+    limit_price: Decimal | None
+    order_type: str = ORDER_TYPE_LMT
     stop_loss: Decimal | None = None
     time_in_force: str = "DAY"
 
@@ -143,10 +161,11 @@ class CandidateOrder:
     ticker: str
     side: str
     qty: int
-    limit_price: Decimal
+    limit_price: Decimal | None
     stop_loss: Decimal | None
     time_in_force: str
     reason: str
+    order_type: str = ORDER_TYPE_LMT
     trade_id: str | None = None
 
 
@@ -175,11 +194,14 @@ class StrategyFileModifiedError(StrategyLoaderError):
 
 
 __all__ = [
+    "ALLOWED_ORDER_TYPES",
     "ALLOWED_STATUSES",
     "ALLOWED_STRATEGY_TYPES",
     "ApprovedStrategySnapshot",
     "CandidateOrder",
     "MarketSnapshot",
+    "ORDER_TYPE_LMT",
+    "ORDER_TYPE_MKT",
     "STATUS_APPROVED",
     "STATUS_PROPOSED",
     "STATUS_REJECTED",

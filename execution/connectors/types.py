@@ -242,10 +242,11 @@ class IBKRConnectorProtocol(Protocol):
         ticker: str,
         side: str,
         qty: int,
-        limit_price: Decimal,
+        limit_price: Decimal | None,
         stop_loss: Decimal | None,
         time_in_force: str = "DAY",
         client_tag: str | None = None,
+        order_type: str = "LMT",
     ) -> BrokerOrderAck: ...
 
     async def cancel_order(self, broker_order_id: str) -> None: ...

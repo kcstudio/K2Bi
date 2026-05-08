@@ -155,6 +155,7 @@ def evaluate(
         stop_loss=spec.stop_loss,
         time_in_force=spec.time_in_force,
         reason=EMIT_HAND_CRAFTED,
+        order_type=spec.order_type,
     )
     return EvaluationDecision(
         candidate=candidate,
@@ -180,16 +181,38 @@ def _to_validator_order(
     snapshot: ApprovedStrategySnapshot,
     market: MarketSnapshot,
 ) -> ValidatorOrder:
+    """Build a transient ValidatorOrder for the runner's pre-emit
+    cash-only fast path (sell-side only).
+
+    For LMT orders, ``spec.limit_price`` is the authoritative reference.
+    For MKT orders ``spec.limit_price`` may be None; we resolve a
+    reference price from ``market.marks[ticker]`` so the validator's
+    ``notional`` / ``per_share_risk`` math has a Decimal anchor.
+
+    If a MKT order has no mark in this snapshot, the runner cannot
+    evaluate the cash-only fast path safely. We return a synthetic
+    Order with ``limit_price=Decimal('0')`` -- the cash-only check
+    treats zero-notional sells as not-approved (notional > cash for
+    the symbol), which fail-closes consistently with the engine-side
+    behaviour at main._to_validator_order. The engine's authoritative
+    pass downstream re-runs the full cascade with a re-pulled mark
+    snapshot and journals the rejection cleanly.
+    """
     spec = snapshot.order_spec
+    limit_price = spec.limit_price
+    if limit_price is None:
+        # MKT/null path: try mark, else fail-closed sentinel (Decimal 0).
+        limit_price = market.marks.get(spec.ticker, Decimal("0"))
     return ValidatorOrder(
         ticker=spec.ticker,
         side=spec.side,
         qty=spec.qty,
-        limit_price=spec.limit_price,
+        limit_price=limit_price,
         stop_loss=spec.stop_loss,
         strategy=snapshot.name,
         submitted_at=market.ts,
         extended_hours=False,
+        order_type=spec.order_type,
     )
 
 
