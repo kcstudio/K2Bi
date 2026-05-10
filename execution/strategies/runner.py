@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from ..journal.schema import JournalReplayMalformedJsonError
 from ..risk import cash_only
 from ..validators.types import Order as ValidatorOrder
 from ..validators.types import Position as ValidatorPosition
@@ -196,32 +197,62 @@ def pending_order_map_from_journal(
             payload = record.get("payload")
             if isinstance(payload, dict):
                 broker_order_id = payload.get("broker_order_id")
-        if not broker_order_id:
-            continue
-        order_id = str(broker_order_id)
 
         if event_type == "order_submitted":
+            if not broker_order_id:
+                raise JournalReplayMalformedJsonError(
+                    "order_submitted missing broker_order_id"
+                )
             strategy_id = record.get("strategy")
             symbol = str(record.get("ticker") or "").upper()
             if not isinstance(strategy_id, str) or not strategy_id or not symbol:
-                continue
+                raise JournalReplayMalformedJsonError(
+                    "order_submitted missing strategy or ticker"
+                )
+            order_id = str(broker_order_id)
             key = (strategy_id, symbol)
             pending.setdefault(key, set()).add(order_id)
             order_keys[order_id] = key
             continue
 
         if event_type == "order_terminal":
+            if not broker_order_id:
+                raise JournalReplayMalformedJsonError(
+                    "order_terminal missing broker_order_id"
+                )
             payload = record.get("payload")
             terminal_status = (
                 payload.get("terminal_status") if isinstance(payload, dict) else None
             )
-            if terminal_status in TERMINAL_JOURNAL_STATUSES:
-                key = order_keys.pop(order_id, None)
-                if key is not None:
-                    pending.get(key, set()).discard(order_id)
+            if terminal_status not in TERMINAL_JOURNAL_STATUSES:
+                raise JournalReplayMalformedJsonError(
+                    f"order_terminal unknown terminal_status: {terminal_status!r}"
+                )
+            order_id = str(broker_order_id)
+            key = order_keys.pop(order_id, None)
+            if key is not None:
+                pending.get(key, set()).discard(order_id)
             continue
 
         if event_type in {"order_rejected", "order_timeout"}:
+            if not broker_order_id:
+                continue
+            order_id = str(broker_order_id)
+            key = order_keys.pop(order_id, None)
+            if key is not None:
+                pending.get(key, set()).discard(order_id)
+            continue
+
+        if event_type == "order_filled":
+            if not broker_order_id:
+                continue
+            payload = record.get("payload")
+            remaining_qty = (
+                payload.get("remaining_qty") if isinstance(payload, dict) else None
+            )
+            if remaining_qty not in (0, "0"):
+                continue
+            order_id = str(broker_order_id)
             key = order_keys.pop(order_id, None)
             if key is not None:
                 pending.get(key, set()).discard(order_id)

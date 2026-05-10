@@ -1189,6 +1189,7 @@ class Engine:
             current_marks=marks,
         )
         market = MarketSnapshot(ts=now, marks=marks, account_value=account.net_liquidation)
+        self._refresh_pending_orders_from_journal()
 
         for snap in self._strategies:
             # R2-minimax P2: retirement sentinel check runs BEFORE the
@@ -1381,7 +1382,6 @@ class Engine:
         self._pending_orders = strategy_runner.pending_order_map_from_journal(records)
 
     def _pending_orders_for_strategy(self, strategy_id: str, symbol: str) -> list[str]:
-        self._refresh_pending_orders_from_journal()
         return sorted(
             self._pending_orders.get((strategy_id, symbol.upper()), set())
         )
@@ -1694,6 +1694,33 @@ class Engine:
         self.state = EngineState.AWAITING_FILL
         result.orders_submitted += 1
 
+    def _journal_order_terminal(
+        self,
+        pending: AwaitingOrderState,
+        *,
+        terminal_status: str,
+    ) -> None:
+        self.journal.append(
+            "order_terminal",
+            payload={
+                "broker_order_id": pending.broker_order_id,
+                "terminal_status": terminal_status,
+            },
+            strategy=pending.strategy,
+            trade_id=pending.trade_id,
+            ticker=pending.order.ticker,
+            side=pending.order.side,
+            qty=pending.order.qty,
+            broker_order_id=pending.broker_order_id,
+            broker_perm_id=pending.broker_perm_id,
+        )
+        key = (pending.strategy, pending.order.ticker.upper())
+        order_ids = self._pending_orders.get(key)
+        if order_ids is not None:
+            order_ids.discard(pending.broker_order_id)
+            if not order_ids:
+                self._pending_orders.pop(key, None)
+
     # ---------- awaiting-fill polling ----------
 
     async def _poll_awaiting(self, result: TickResult) -> None:
@@ -1797,6 +1824,7 @@ class Engine:
                 auth=isinstance(exc, AuthRequiredError),
             )
             return
+        self._journal_order_terminal(pending, terminal_status="Filled")
         self._pending_order = None
         self.state = EngineState.CONNECTED_IDLE
 
@@ -1861,6 +1889,7 @@ class Engine:
                     broker_perm_id=pending.broker_perm_id,
                 )
                 result.orders_rejected += 1
+                self._journal_order_terminal(pending, terminal_status="Rejected")
             elif terminal.status == "Filled" and terminal.filled_qty > 0:
                 # Codex round-11 P2: broker confirms the order filled
                 # (get_executions_since may have missed the exec rows
@@ -1900,6 +1929,7 @@ class Engine:
                     broker_perm_id=pending.broker_perm_id,
                 )
                 result.orders_filled += 1
+                self._journal_order_terminal(pending, terminal_status="Filled")
             else:
                 self.journal.append(
                     "order_timeout",
@@ -1918,6 +1948,11 @@ class Engine:
                     broker_perm_id=pending.broker_perm_id,
                 )
                 result.orders_timed_out += 1
+                if terminal.status in TERMINAL_ORDER_STATUSES:
+                    self._journal_order_terminal(
+                        pending,
+                        terminal_status=terminal.status,
+                    )
 
         # Codex round-1 P1: a terminal cancel/rejection after a partial
         # fill would otherwise leave _positions stale (the partial share

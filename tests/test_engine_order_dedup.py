@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from execution.connectors.types import BrokerExecution, BrokerPosition
 from execution.connectors.mock import MockIBKRConnector
 from execution.engine.main import DEFAULT_TICK_SECONDS, Engine, EngineConfig
 from execution.journal.schema import (
@@ -73,21 +75,24 @@ def _raw_record(
     schema_version: int = 2,
     strategy: str | None = "spy-rotational",
     broker_order_id: str | None = "42",
+    ticker: str | None = "SPY",
+    payload: dict | None = None,
 ) -> str:
-    return (
-        "{"
-        '"ts":"2026-05-10T12:00:00.000000+00:00",'
-        f'"schema_version":{schema_version},'
-        f'"event_type":"{event_type}",'
-        '"trade_id":"T-raw",'
-        '"journal_entry_id":"J-raw",'
-        f'"strategy":{strategy!r},'
-        '"git_sha":"test",'
-        '"payload":{},'
-        '"ticker":"SPY",'
-        f'"broker_order_id":{broker_order_id!r}'
-        "}"
-    ).replace("'", '"')
+    record = {
+        "ts": "2026-05-10T12:00:00.000000+00:00",
+        "schema_version": schema_version,
+        "event_type": event_type,
+        "trade_id": "T-raw",
+        "journal_entry_id": "J-raw",
+        "strategy": strategy,
+        "git_sha": "test",
+        "payload": payload or {},
+    }
+    if ticker is not None:
+        record["ticker"] = ticker
+    if broker_order_id is not None:
+        record["broker_order_id"] = broker_order_id
+    return json.dumps(record)
 
 
 class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
@@ -235,6 +240,41 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.connector.submitted_orders), 1)
         self.assertEqual(self._events("cycle_skipped_pending_prior_submission"), [])
 
+    async def test_d2b_full_fill_emits_order_terminal_and_clears_pending_map(
+        self,
+    ) -> None:
+        await self._init_engine()
+        submit_tick = await self.engine.tick_once()
+        self.assertEqual(submit_tick.orders_submitted, 1)
+        pending = self.engine._pending_order
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.connector.executions_history.append(
+            BrokerExecution(
+                exec_id="E-fill",
+                broker_order_id=pending.broker_order_id,
+                broker_perm_id=pending.broker_perm_id,
+                ticker="SPY",
+                side="buy",
+                qty=10,
+                price=Decimal("500.00"),
+                filled_at=_mid_session_utc() + timedelta(seconds=1),
+            )
+        )
+        self.connector.positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500.00"))
+        ]
+
+        poll_tick = await self.engine.tick_once()
+
+        self.assertEqual(poll_tick.orders_filled, 1)
+        terminals = self._events("order_terminal")
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(terminals[0]["payload"]["terminal_status"], "Filled")
+        self.assertEqual(terminals[0]["broker_order_id"], pending.broker_order_id)
+        self.engine._refresh_pending_orders_from_journal()
+        self.assertEqual(self.engine._pending_orders, {})
+
     async def test_d3_terminal_rejected_order_does_not_block_submit(self) -> None:
         await self._init_engine()
         self._append_prior_submission()
@@ -298,6 +338,38 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(JournalReplaySchemaVersionError):
             await self.engine.tick_once()
 
+    async def test_d4e_order_submitted_missing_ticker_fails_closed_on_replay(
+        self,
+    ) -> None:
+        await self._patch_now(_mid_session_utc())
+        self.journal.path_for_today().write_text(
+            _raw_record(event_type="order_submitted", ticker=None) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(JournalReplayMalformedJsonError):
+            await self.engine.tick_once()
+
+    async def test_d4f_order_terminal_unknown_status_fails_closed_on_replay(
+        self,
+    ) -> None:
+        await self._patch_now(_mid_session_utc())
+        self.journal.path_for_today().write_text(
+            _raw_record(event_type="order_submitted") + "\n"
+            + _raw_record(
+                event_type="order_terminal",
+                payload={
+                    "broker_order_id": "42",
+                    "terminal_status": "MysteryStatus",
+                },
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(JournalReplayMalformedJsonError):
+            await self.engine.tick_once()
+
     async def test_d5_cross_strategy_pending_order_does_not_block_submit(self) -> None:
         _write_strategy(self.strategies_dir, name="spy-secondary")
         await self._init_engine()
@@ -309,3 +381,21 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.connector.submitted_orders), 1)
         self.assertIn(":spy-secondary:", self.connector.submitted_orders[0].client_tag)
         self.assertEqual(len(self._events("cycle_skipped_pending_prior_submission")), 1)
+
+    async def test_d6_pending_replay_refreshes_once_per_tick(self) -> None:
+        _write_strategy(self.strategies_dir, name="spy-secondary")
+        await self._init_engine()
+        self._append_prior_submission(strategy="spy-rotational")
+        calls = []
+        original = self.journal.read_all_strict
+
+        def counting_read_all_strict(when=None):
+            calls.append(when)
+            return original(when)
+
+        self.journal.read_all_strict = counting_read_all_strict
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 1)
+        self.assertEqual(len(calls), 3)
