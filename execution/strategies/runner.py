@@ -20,6 +20,7 @@ gate.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -177,6 +178,68 @@ def _any_pending_order_for_strategy(name: str, ctx: RiskContext) -> bool:
     return any(o.strategy == name for o in ctx.pending_orders)
 
 
+TERMINAL_JOURNAL_STATUSES = frozenset(
+    {"Filled", "Cancelled", "ApiCancelled", "Rejected", "Inactive"}
+)
+
+
+def pending_order_map_from_journal(
+    journal_records: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], set[str]]:
+    """Build pending broker order ids keyed by strategy and symbol."""
+    pending: dict[tuple[str, str], set[str]] = {}
+    order_keys: dict[str, tuple[str, str]] = {}
+    for record in journal_records:
+        event_type = record.get("event_type")
+        broker_order_id = record.get("broker_order_id")
+        if not broker_order_id:
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                broker_order_id = payload.get("broker_order_id")
+        if not broker_order_id:
+            continue
+        order_id = str(broker_order_id)
+
+        if event_type == "order_submitted":
+            strategy_id = record.get("strategy")
+            symbol = str(record.get("ticker") or "").upper()
+            if not isinstance(strategy_id, str) or not strategy_id or not symbol:
+                continue
+            key = (strategy_id, symbol)
+            pending.setdefault(key, set()).add(order_id)
+            order_keys[order_id] = key
+            continue
+
+        if event_type == "order_terminal":
+            payload = record.get("payload")
+            terminal_status = (
+                payload.get("terminal_status") if isinstance(payload, dict) else None
+            )
+            if terminal_status in TERMINAL_JOURNAL_STATUSES:
+                key = order_keys.pop(order_id, None)
+                if key is not None:
+                    pending.get(key, set()).discard(order_id)
+            continue
+
+        if event_type in {"order_rejected", "order_timeout"}:
+            key = order_keys.pop(order_id, None)
+            if key is not None:
+                pending.get(key, set()).discard(order_id)
+
+    return {key: ids for key, ids in pending.items() if ids}
+
+
+def _pending_orders_for_strategy(
+    strategy_id: str,
+    symbol: str,
+    journal_records: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Return non-terminal broker order ids for one strategy/symbol."""
+    target_symbol = symbol.upper()
+    pending = pending_order_map_from_journal(journal_records)
+    return sorted(pending.get((strategy_id, target_symbol), set()))
+
+
 def _to_validator_order(
     snapshot: ApprovedStrategySnapshot,
     market: MarketSnapshot,
@@ -225,4 +288,6 @@ __all__ = [
     "SKIP_REGIME_MISMATCH",
     "SKIP_UNKNOWN_STRATEGY_TYPE",
     "evaluate",
+    "pending_order_map_from_journal",
+    "_pending_orders_for_strategy",
 ]

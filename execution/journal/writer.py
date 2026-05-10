@@ -27,8 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from .schema import (
+    CURRENT_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    EVENT_TYPES,
     JournalSchemaError,
+    JournalReplayMalformedJsonError,
+    JournalReplaySchemaVersionError,
+    JournalReplayTruncatedLineError,
+    JournalReplayUnknownEventTypeError,
+    KNOWN_SCHEMA_VERSIONS,
     reject_non_finite_json_constant,
     validate,
 )
@@ -206,6 +213,76 @@ class JournalWriter:
                     # event); see the DEVLOG follow-up block of the
                     # m2.23 cycle for the full trigger + ship shape.
                     out.append(json.loads(line))
+            return out
+        finally:
+            self._release_lock(lock_fd)
+
+    def read_all_strict(self, when: datetime | None = None) -> list[dict[str, Any]]:
+        """Read a daily journal file with Spec B replay validation.
+
+        This deliberately does not replace read_all(). Older engine
+        recovery paths depend on read_all() staying lenient so a single
+        bad historical line cannot mask kill-state and broker-state
+        reconciliation. Spec B order dedup replay is a stricter safety
+        path: corrupt replay input means the engine must fail closed.
+        """
+        ref = when or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            raise ValueError("journal read `when` must be timezone-aware")
+        target = self._path_for(ref.astimezone(timezone.utc))
+        if not target.exists():
+            return []
+
+        lock_fd = self._acquire_shared_lock(target)
+        try:
+            data = target.read_bytes()
+            if data and not data.endswith(b"\n"):
+                raise JournalReplayTruncatedLineError(
+                    f"journal replay found truncated final line: {target}"
+                )
+            out: list[dict[str, Any]] = []
+            for line_no, raw_line in enumerate(data.splitlines(), start=1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    record = json.loads(
+                        raw_line.decode("utf-8"),
+                        parse_constant=reject_non_finite_json_constant,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    raise JournalReplayMalformedJsonError(
+                        f"journal replay JSON parse failed at {target}:{line_no}: {exc}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise JournalReplayMalformedJsonError(
+                        f"journal replay expected object at {target}:{line_no}"
+                    )
+
+                schema_version = record.get("schema_version")
+                if (
+                    not isinstance(schema_version, int)
+                    or isinstance(schema_version, bool)
+                    or schema_version not in KNOWN_SCHEMA_VERSIONS
+                    or schema_version > CURRENT_SCHEMA_VERSION
+                ):
+                    raise JournalReplaySchemaVersionError(
+                        f"journal replay schema_version unusable at "
+                        f"{target}:{line_no}: {schema_version!r}"
+                    )
+                event_type = record.get("event_type")
+                if event_type not in EVENT_TYPES:
+                    raise JournalReplayUnknownEventTypeError(
+                        f"journal replay unknown event_type at "
+                        f"{target}:{line_no}: {event_type!r}"
+                    )
+                try:
+                    validate(record)
+                except JournalSchemaError as exc:
+                    raise JournalReplayMalformedJsonError(
+                        f"journal replay schema validation failed at "
+                        f"{target}:{line_no}: {exc}"
+                    ) from exc
+                out.append(record)
             return out
         finally:
             self._release_lock(lock_fd)

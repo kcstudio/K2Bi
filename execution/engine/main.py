@@ -279,6 +279,7 @@ class Engine:
     _strategy_drift_warned: set[str] = field(default_factory=set)
     _positions: list[BrokerPosition] = field(default_factory=list)
     _pending_order: AwaitingOrderState | None = None
+    _pending_orders: dict[tuple[str, str], set[str]] = field(default_factory=dict)
 
     # connection tracking
     _reconnect_attempts: int = 0
@@ -670,6 +671,7 @@ class Engine:
             narrow_since=narrow_lookback_start,
         )
         journal_tail = extended_checkpoints + narrow_journal_tail
+        self._refresh_pending_orders_from_journal()
 
         # Codex round-3 P2: the EngineConfig-configurable override env
         # name must actually be consulted by reconcile(); otherwise a
@@ -1254,6 +1256,25 @@ class Engine:
                 abort_phase="decision",
             ):
                 continue
+            pending_order_ids = self._pending_orders_for_strategy(
+                snap.name, decision.candidate.ticker
+            )
+            if pending_order_ids:
+                self.journal.append(
+                    "cycle_skipped_pending_prior_submission",
+                    payload={
+                        "strategy_id": snap.name,
+                        "symbol": decision.candidate.ticker.upper(),
+                        "pending_order_id": pending_order_ids[0],
+                        "cycle_id": trade_id,
+                    },
+                    strategy=snap.name,
+                    trade_id=trade_id,
+                    ticker=decision.candidate.ticker.upper(),
+                    side=decision.candidate.side,
+                    qty=decision.candidate.qty,
+                )
+                continue
             try:
                 order = _to_validator_order(
                     decision.candidate, now, marks=market.marks
@@ -1349,6 +1370,21 @@ class Engine:
             # successful submit; next tick handles subsequent strategies.
             if self._pending_order is not None:
                 break
+
+    def _refresh_pending_orders_from_journal(self) -> None:
+        records: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
+        for day_offset in (2, 1, 0):
+            records.extend(
+                self.journal.read_all_strict(now - timedelta(days=day_offset))
+            )
+        self._pending_orders = strategy_runner.pending_order_map_from_journal(records)
+
+    def _pending_orders_for_strategy(self, strategy_id: str, symbol: str) -> list[str]:
+        self._refresh_pending_orders_from_journal()
+        return sorted(
+            self._pending_orders.get((strategy_id, symbol.upper()), set())
+        )
 
     async def _skip_buy_for_existing_position(
         self,
@@ -1616,6 +1652,9 @@ class Engine:
             broker_order_id=ack.broker_order_id,
             broker_perm_id=ack.broker_perm_id,
         )
+        self._pending_orders.setdefault(
+            (snap.name, order.ticker.upper()), set()
+        ).add(ack.broker_order_id)
         if ack.warnings:
             # Write .killed so no further orders go out until a human
             # reviews + re-protects the position.

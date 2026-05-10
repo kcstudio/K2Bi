@@ -53,6 +53,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = SCHEMA_VERSION
 
 # Event types present since v1. Kept as a separate frozenset so the
 # journal-schema.md doc + tests can reference "what v1 shipped with"
@@ -124,11 +125,19 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1 = frozenset(
     }
 )
 
+EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_2 = frozenset(
+    {
+        "cycle_skipped_pending_prior_submission",
+        "order_terminal",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
     | EVENT_TYPES_V2_ADDITIVE_Q42
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1
+    | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_2
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
@@ -172,6 +181,26 @@ OPTIONAL_TOP_LEVEL = (
 
 class JournalSchemaError(ValueError):
     pass
+
+
+class JournalReplayError(ValueError):
+    """Base class for fail-closed journal replay validation errors."""
+
+
+class JournalReplayMalformedJsonError(JournalReplayError):
+    """Raised when strict replay encounters malformed JSON."""
+
+
+class JournalReplayUnknownEventTypeError(JournalReplayError):
+    """Raised when strict replay encounters an unknown event type."""
+
+
+class JournalReplayTruncatedLineError(JournalReplayError):
+    """Raised when strict replay encounters a non-newline-terminated tail."""
+
+
+class JournalReplaySchemaVersionError(JournalReplayError):
+    """Raised when strict replay encounters an unusable schema version."""
 
 
 def reject_non_finite_json_constant(raw: str) -> Any:
