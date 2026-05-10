@@ -1364,6 +1364,7 @@ class Engine:
         if side.lower() != "buy":
             return False
 
+        symbol_for_journal = symbol.upper()
         try:
             broker_positions = await self.connector.get_positions()
         except ConnectorError as exc:
@@ -1371,7 +1372,7 @@ class Engine:
                 "cycle_skipped_position_query_failed",
                 payload={
                     "strategy_id": snap.name,
-                    "symbol": symbol,
+                    "symbol": symbol_for_journal,
                     "target_qty": target_qty,
                     "cycle_id": trade_id,
                     "abort_phase": abort_phase,
@@ -1380,7 +1381,7 @@ class Engine:
                 },
                 strategy=snap.name,
                 trade_id=trade_id,
-                ticker=symbol,
+                ticker=symbol_for_journal,
                 side=side,
                 qty=target_qty,
             )
@@ -1389,7 +1390,7 @@ class Engine:
         current_qty = sum(
             position.qty
             for position in broker_positions
-            if position.ticker.upper() == symbol.upper()
+            if position.ticker.upper() == symbol_for_journal
         )
         if current_qty == 0:
             return False
@@ -1403,7 +1404,7 @@ class Engine:
             "cycle_skipped_existing_position",
             payload={
                 "strategy_id": snap.name,
-                "symbol": symbol,
+                "symbol": symbol_for_journal,
                 "current_qty": current_qty,
                 "target_qty": target_qty,
                 "position_state": position_state,
@@ -1411,7 +1412,7 @@ class Engine:
             },
             strategy=snap.name,
             trade_id=trade_id,
-            ticker=symbol,
+            ticker=symbol_for_journal,
             side=side,
             qty=target_qty,
         )

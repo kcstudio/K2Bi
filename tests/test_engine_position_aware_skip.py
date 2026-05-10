@@ -38,7 +38,7 @@ def _mid_session_utc() -> datetime:
     return datetime(2026, 4, 21, 10, 30, tzinfo=ET).astimezone(timezone.utc)
 
 
-def _write_strategy(dir: Path) -> Path:
+def _write_strategy(dir: Path, *, ticker: str = "SPY") -> Path:
     text = (
         "---\n"
         "name: spy-rotational\n"
@@ -48,7 +48,7 @@ def _write_strategy(dir: Path) -> Path:
         "approved_at: 2026-05-01T10:00:00Z\n"
         "approved_commit_sha: abc1234\n"
         "order:\n"
-        "  ticker: SPY\n"
+        f"  ticker: {ticker}\n"
         "  side: buy\n"
         "  qty: 10\n"
         "  limit_price: 500.00\n"
@@ -187,8 +187,13 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
 
         tick = await self.engine.tick_once()
 
+        self.assertEqual(tick.state_after, EngineState.DISCONNECTED)
+        self.assertEqual(self.engine.state, EngineState.DISCONNECTED)
         self.assertEqual(tick.orders_submitted, 0)
         self.assertEqual(len(self.connector.submitted_orders), 0)
+        self.assertIsNone(self.engine._pending_order)
+        self.assertEqual(self._events("order_proposed"), [])
+        self.assertEqual(self._events("order_submitted"), [])
         failures = self._events("cycle_skipped_position_query_failed")
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["strategy"], "spy-rotational")
@@ -231,6 +236,24 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.tick_once()
 
         self.assertEqual(self.engine._positions, [])
+
+    async def test_existing_position_skip_journals_normalized_symbol(self) -> None:
+        await self._unpatch_now()
+        self.strategies_dir.joinpath("spy-rotational.md").unlink()
+        _write_strategy(self.strategies_dir, ticker="spy")
+        await self._init_engine()
+        self.connector.positions = [
+            BrokerPosition(ticker="SPY", qty=10, avg_price=Decimal("500"))
+        ]
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 0)
+        self.assertEqual(len(self.connector.submitted_orders), 0)
+        skips = self._events("cycle_skipped_existing_position")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
+        self.assertEqual(skips[0]["ticker"], "SPY")
 
     async def test_g4b_pre_submit_position_query_fails_closed(self) -> None:
         await self._init_engine()

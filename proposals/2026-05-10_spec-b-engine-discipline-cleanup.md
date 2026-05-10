@@ -80,7 +80,7 @@ The engine cycle does not check "do I already have a position at or above the st
 
 ### Fix
 
-Before submitting any BUY for a strategy, query `ib.positions()` for the symbol. If existing qty is non-zero, do NOT submit and journal a `cycle_skipped_existing_position` event with `{strategy_id, symbol, current_qty, target_qty, position_state, cycle_id}`. `position_state` is `at_target` when `current_qty >= target_qty` and `partial` when `0 < current_qty < target_qty`.
+Before submitting any BUY for a strategy, query `ib.positions()` for the symbol. If existing qty is non-zero, do NOT submit and journal a `cycle_skipped_existing_position` event with `{strategy_id, symbol, current_qty, target_qty, position_state, cycle_id}`. `symbol` is normalized to uppercase for journal consumers. `position_state` is `at_target` when `current_qty >= target_qty` and `partial` when `0 < current_qty < target_qty`.
 
 ### Implementation
 
