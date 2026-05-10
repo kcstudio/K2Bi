@@ -11,11 +11,11 @@ import os
 import subprocess
 import tempfile
 import unittest
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_JOURNAL_DATE = date.today().isoformat()
+_JOURNAL_DATE = datetime.now(timezone.utc).date().isoformat()
 
 
 # ---------------------------------------------------------------------------
