@@ -1,3 +1,86 @@
+## 2026-05-09 -- ENGINE STOPPED + DISABLED; G strategy in 11x oversize state pending Monday revert
+
+**Status:** Operational incident response. No commit yet (this entry documents the action; the dedup-bug fix + the revert audit-trail capture are separate future commits).
+
+**What happened (yesterday HKT, 2026-05-08):** The K2Bi engine fired 11 consecutive BUY MKT orders for 71 shares of G each in 25 seconds (22:55:59-22:56:24 HKT / 14:55:59-14:56:24 UTC), the same day G was approved (spec `wiki/strategies/strategy_g-2026-05_2nd-wave-paper-trade.md`, approved_commit_sha `8e9c6ed`, single 71-share entry intended). All 11 filled (10 at $32.82, 1 at $32.77; total 781 shares at avg cost $32.8295). Zero protective stops attached on any of the 11 orders. The `$30.00` STP that was the approved-spec exit trigger 1 was never placed.
+
+Confirmed live via `gateway-query.sh` clientId=95 query at 2026-05-08T17:25 UTC: position G qty=781.0 avg_cost=32.82954205, openTrades() == [].
+
+**Action taken NOW (2026-05-08T17:25:24 UTC = 2026-05-09T01:25:24 HKT):**
+
+1. `sudo systemctl stop k2bi-engine && sudo systemctl disable k2bi-engine` on VPS (`hostinger`).
+   - Service was Active running for 2h35m before stop; clean exit (status 0/SUCCESS).
+   - Disabled so it does not auto-restart on reboot. Kept OFF until position-aware dedup ships.
+2. Strategy file `K2Bi-Vault/wiki/strategies/strategy_g-2026-05_2nd-wave-paper-trade.md` frontmatter appended with `engine_bug_recovery_note:` block capturing the 25-second window, fills, missing stops, planned manual revert, and audit-trail requirements.
+3. /error entry `E-2026-05-09-001` filed in self_improve_errors.md.
+
+**Why "stop + disable" not "kill switch":** Per CLAUDE.md execution-layer-isolation contract, the operator-only `.killed` lock file is the kill-switch path. This stop is a cleaner systemd action under the same intent (no broker connection, no order flow) and survives reboot via `disable`. The `.killed` flag and the systemd disable are independent rails; both pointing the same direction here is intentional defense-in-depth.
+
+**Why "engine OFF until dedup ships" not "engine ON with manual exclusion":** The engine reads strategy files with `status: approved` and acts on their `order:` block. The G spec is still `status: approved` because it WAS approved, just one-time. The dedup mechanism that should prevent re-firing on an already-filled approved trade is the bug. A position-aware dedup ("if a position is already open at >= the spec's intended qty, skip") is the missing rail. Until that ships, ANY approved-status spec on disk + a running engine is structurally unsafe.
+
+**Why disable in addition to stop:** A reboot of the VPS (planned or unplanned) would re-enter the same unsafe state. Disable is required for reboot survivability.
+
+**Manual revert -- EXECUTED SAME DAY (NYSE was still open):**
+
+Operator revised the original Monday-2026-05-11 plan to execute same session because NYSE was still open (Friday 2026-05-08 13:44 EDT / 17:44 UTC, ~2h before the 16:00 EDT close). Same-day revert leaves only 71 spec-quantity shares carrying weekend gap-risk; Monday revert would have left all 781 shares carrying that risk. Engine systemd unit was already `inactive` + `disabled` per the earlier action in this entry, so no risk of engine BUY firing during revert.
+
+Revert window: `2026-05-08T17:44:00Z to 2026-05-08T17:46:30Z` (`2026-05-09T01:44 to 01:46:30 HKT`). Execution path: `scripts/gateway-query.sh` clientId=98 (operator ad-hoc range 90-99 per CLAUDE.md convention).
+
+1. **SELL 710 G @ MKT DAY -- Filled.** permId `1981941470`, orderId 4. Avg fill price `$31.90`. 8 venue-split fills, all simultaneous at `2026-05-08T17:44:00.177Z`: NYSENAT 100, BYX 100, BEX 100, CHX 100, NYSE 10, NASDAQ 100, T24X 100, ARCA 100; single price across all venues. Realized P&L: `($31.90 - $32.8295) * 710 = -$659.95 USD ~= -HKD 5,148 ~= -0.0514% NAV`. This is bug-recovery cost, NOT thesis-driven loss; should be booked under `engine_bug_recovery_note` for accounting clarity, separate from the strategy's intended at-risk budget.
+2. **SELL STP 71 G @ $30.00 GTC -- PreSubmitted.** permId `1981941503`, orderId 8. TIF=GTC chosen for resting protective stop persistence across sessions (including the upcoming weekend gap); the original spec frontmatter did not specify TIF for the STP, GTC is conventional. Status `PreSubmitted` is the normal resting state for a stop well below current market price.
+3. **Post-revert verification (`gateway-query.sh` clientId=98 positions + openTrades, `2026-05-08T17:46:30Z`):** G qty=71 (cost basis $32.8295 per IBKR's partial-close convention; broker keeps original cost basis on remaining shares); SPY qty=2 (pre-existing); 1 open order: SELL STP 71 G @ $30.00 GTC permId 1981941503 PreSubmitted. Verification PASSED.
+4. **Audit capture into strategy frontmatter:** `engine_bug_recovery_note.manual_revert_completed.{step_1,step_2,post_revert_verification}` blocks updated with all permIds, fill prices, exec IDs, timestamps, and verification snapshot.
+
+**Sequencing constraint resolution:** The revert SELL 710 is technically a partial-exit against the approved strategy. Cycle-4 / cycle-5 hooks were NOT invoked because `gateway-query.sh` executes broker actions directly against the IB Gateway, outside the engine pipeline; no `/invest-ship` gate fires on these orders. The override-pattern compliance is satisfied via the structured `engine_bug_recovery_note.manual_revert_completed.sequencing_constraint_handling` block (L-2026-04-30-001 option (a) -- structured + logged + surfaced). Engine staying OFF until position-aware dedup ships ensures the engine cannot subsequently re-encounter the post-revert state and re-fire the BUY.
+
+**Orphan STP cascade discovery + cleanup (post-revert sanity check, 2026-05-09 09:53-10:19 HKT):**
+
+A post-revert sanity check via `scripts/gateway-query.sh` clientId=99 with `reqAllOpenOrders()` (cross-client view, not per-client `openTrades()`) surfaced **11 engine-orphan STP SELL 71 G @ $30 GTC orders** still PreSubmitted on the books — invisible to the earlier per-client clientId=98 verification because they were bound to clientId=1 (the engine). The findings invalidated the original /error E-2026-05-09-001 claim "no protective stops attached on any of the 11 fills":
+
+- Engine actually fired **11 STP orders alongside the 11 BUY orders** during the same 22:55:59-22:56:24 HKT cascade window, in pairs.
+- The defect was NOT "stop-not-attached" but **"stop-stacked-not-child-attached"** — each cycle fired both a BUY and a STP, but the STP was a fresh standalone GTC order, not a child of the parent BUY. Cumulative result: 11 BUYs (filled into 781 shares) + 11 standalone STPs (each for 71 shares targeting $30) all on the books simultaneously.
+- Combined with the operator-placed STP (permId 1981941503, clientId=98) from the same-day revert, total G STPs at discovery = 12.
+- **Cascade-short risk if G triggered $30:** first STP closes the 71-share position; remaining 11 STPs SELL into flat = SHORT 781 shares G (~$23,400 USD ~= HKD 183K notional short). Real-money equivalent would have been a major audit-trail invalidation. Even on paper, must be cleaned.
+
+**Cleanup attempts in order:**
+
+1. **clientId=99 cancelOrder (2026-05-09 09:55 HKT):** all 11 cancel calls accepted by ib_async locally but broker returned **IBKR Error 10147 "OrderId X that needs to be cancelled is not found"** for all. Cross-client cancel without `MasterClientId` configured on the gateway is rejected — the connecting client may SEE orders via `reqAllOpenOrders` but cannot modify them unless either it is the originating client OR the gateway has `MasterClientId` set to that client's id. Neither held.
+2. **Operator manual Client Portal cancel (~09:30 HKT, while away from CLI):** re-query at 10:16 HKT (~22 min later) showed all 11 orphans still PreSubmitted. Cause undetermined; surfaced possibilities to operator (Portal/Gateway desync for API-placed GTC orders; account-targeting mismatch; un-confirmed Portal dialog). Important observability gap to track.
+3. **clientId=1 cancelOrder, ONE-TIME OPERATOR-AUTHORIZED EXCEPTION (2026-05-09 10:18 HKT):**
+   - Operator explicitly authorized one-time clientId=1 use for this orphan cleanup with rationale: engine systemd unit `k2bi-engine.service` is `inactive` + `disabled` per the earlier engine-stop action in this incident; the collision-with-engine hazard that motivates the CLAUDE.md "Never pick `1` from a session" rule cannot occur in current state; Q42 orphan-adoption logic doesn't apply because we cancel (not leave); operation is bounded to 11 specific permIds.
+   - **Authorization scope: ONE-TIME ONLY.** Not a precedent for routine clientId=1 use. Future cleanup ops should use `MasterClientId` gateway config (see follow-up) so operator clientId=99 can cancel cross-client API orders without the clientId=1 escape hatch.
+   - Result: clientId=1 (the originating client) saw all 11 target permIds as cancellable; 11 `cancelOrder` calls submitted; broker returned **IBKR Error 202 "Order Canceled - reason"** (the standard cancel-acknowledged code, NOT a failure) for all 11; post-cancel state via clientId=1: all 11 status → `Cancelled`.
+
+**Independent verification (clientId=99 reqAllOpenOrders, 2026-05-09T02:18:59Z = 10:19 HKT):**
+
+- G position qty=71, avg_cost $32.8295 (unchanged) ✓
+- Active G STPs: **exactly 1**, permId 1981941503, clientId=98, qty 71, stop $30.00, GTC, PreSubmitted ✓
+- 11 orphans: all `Cancelled` ✓
+- Cascade-short risk: **ELIMINATED** (single STP for 71 shares against a 71-share position cannot oversell into short)
+- SPY pre-existing STP unchanged
+
+**Follow-up to file (architect spec):** Configure `MasterClientId` on IB Gateway so operator clientId=99 (or any clientId in the 90-99 ad-hoc range) can cancel cross-client API orders without requiring the clientId=1 escape hatch. Reference this incident as the surface. Belongs in discipline-cleanup tracker / Spec B (when drafted) OR in `feature_engine-vault-snapshots.md` scope (since cross-client visibility is also relevant to the engine snapshot pipeline). Today's one-time clientId=1 use is the temporary workaround; the structural fix is gateway config + restart.
+
+**/error E-2026-05-09-001 amended:** defect (c) added capturing the stop-stacked-not-child-attached finding alongside the original (a) dedup-absent and (b) rapid-fire / no-circuit-breaker defects. Original "zero protective stops attached" framing corrected.
+
+**Cross-links:**
+- /error entry: `E-2026-05-09-001` in `self_improve_errors.md`.
+- Strategy frontmatter `engine_bug_recovery_note:` block on `strategy_g-2026-05_2nd-wave-paper-trade.md`.
+- Sibling incident: `L-2026-05-08-001` (read-side broker isolation discipline; this incident is the write-side counterpart).
+
+**Engine MUST stay OFF until ALL of:**
+- Position-aware dedup ships (spec the bug, write a test that reproduces the 11x BUY cascade in <1 minute, fix, full suite green).
+- The Monday revert lands and is reflected in `engine_bug_recovery_note.audit_capture_required` (so resuming engine cannot re-encounter a 781-share G position).
+- Operator explicit re-enable (`sudo systemctl enable --now k2bi-engine`) AFTER the above two are confirmed.
+
+**Follow-ups (separate sessions, separate commits):**
+- Reproduction test for the dedup-absent BUY cascade (synthetic 25-second window producing N>1 fills against a single approved spec; failing red before the fix).
+- Position-aware dedup design + ship.
+- Investigate why the approved-spec stop_loss `$30.00` was not converted into a STP child order at first BUY fill — separate from the dedup bug, this is a "stop never attached" path.
+- `gateway-query.sh` operator-forensics-only enforcement: today the convention is documented but not code-enforced; consider a pre-flight skill-runtime check that refuses to call it from skill bodies (only from operator-prefixed Bash).
+
+---
+
 ## 2026-05-08 -- invest-coach <-> cycle-5 helper schema reconciliation shipped
 
 **Commit:** `0a96b9d` feat(invest-coach): canonical frontmatter builders + cycle-5 schema reconciliation
