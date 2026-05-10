@@ -143,6 +143,9 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
         self.assertEqual(skips[0]["payload"]["current_qty"], 10)
         self.assertEqual(skips[0]["payload"]["target_qty"], 10)
+        self.assertEqual(
+            skips[0]["payload"]["position_state"], "at_or_above_target"
+        )
 
     async def test_g2_zero_position_permits_buy(self) -> None:
         await self._init_engine()
@@ -170,6 +173,9 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
         self.assertEqual(skips[0]["payload"]["current_qty"], 3)
         self.assertEqual(skips[0]["payload"]["target_qty"], 10)
+        self.assertEqual(
+            skips[0]["payload"]["position_state"], "partial_position"
+        )
 
     async def test_g4_position_query_failure_fails_closed(self) -> None:
         await self._init_engine()

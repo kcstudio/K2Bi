@@ -1388,6 +1388,11 @@ class Engine:
         if current_qty == 0:
             return False
 
+        position_state = (
+            "at_or_above_target"
+            if current_qty >= candidate.qty
+            else "partial_position"
+        )
         self.journal.append(
             "cycle_skipped_position_at_target",
             payload={
@@ -1395,6 +1400,7 @@ class Engine:
                 "symbol": symbol,
                 "current_qty": current_qty,
                 "target_qty": candidate.qty,
+                "position_state": position_state,
                 "cycle_id": trade_id,
             },
             strategy=snap.name,
