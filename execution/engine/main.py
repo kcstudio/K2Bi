@@ -1245,6 +1245,12 @@ class Engine:
             if decision.candidate is None:
                 continue
             trade_id = new_ulid()
+            if await self._skip_buy_for_existing_position(
+                snap=snap,
+                candidate=decision.candidate,
+                trade_id=trade_id,
+            ):
+                continue
             try:
                 order = _to_validator_order(
                     decision.candidate, now, marks=market.marks
@@ -1340,6 +1346,64 @@ class Engine:
             # successful submit; next tick handles subsequent strategies.
             if self._pending_order is not None:
                 break
+
+    async def _skip_buy_for_existing_position(
+        self,
+        *,
+        snap: ApprovedStrategySnapshot,
+        candidate: CandidateOrder,
+        trade_id: str,
+    ) -> bool:
+        if candidate.side.lower() != "buy":
+            return False
+
+        symbol = candidate.ticker
+        try:
+            broker_positions = await self.connector.get_positions()
+        except ConnectorError as exc:
+            self.journal.append(
+                "cycle_skipped_position_query_failed",
+                payload={
+                    "strategy_id": snap.name,
+                    "symbol": symbol,
+                    "target_qty": candidate.qty,
+                    "cycle_id": trade_id,
+                    "error": str(exc),
+                    "error_class": type(exc).__name__,
+                },
+                strategy=snap.name,
+                trade_id=trade_id,
+                ticker=symbol,
+                side=candidate.side,
+                qty=candidate.qty,
+            )
+            raise
+
+        current_qty = sum(
+            position.qty
+            for position in broker_positions
+            if position.ticker.upper() == symbol.upper()
+        )
+        self._positions = broker_positions
+        if current_qty == 0:
+            return False
+
+        self.journal.append(
+            "cycle_skipped_position_at_target",
+            payload={
+                "strategy_id": snap.name,
+                "symbol": symbol,
+                "current_qty": current_qty,
+                "target_qty": candidate.qty,
+                "cycle_id": trade_id,
+            },
+            strategy=snap.name,
+            trade_id=trade_id,
+            ticker=symbol,
+            side=candidate.side,
+            qty=candidate.qty,
+        )
+        return True
 
     async def _submit(
         self,

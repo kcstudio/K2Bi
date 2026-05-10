@@ -117,10 +117,18 @@ EVENT_TYPES_V2_ADDITIONS = frozenset(
 # types). Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
 EVENT_TYPES_V2_ADDITIVE_Q42 = frozenset({"orphan_stop_adopted"})
 
+EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1 = frozenset(
+    {
+        "cycle_skipped_position_at_target",
+        "cycle_skipped_position_query_failed",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
     | EVENT_TYPES_V2_ADDITIVE_Q42
+    | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
