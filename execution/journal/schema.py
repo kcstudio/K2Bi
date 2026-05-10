@@ -119,7 +119,7 @@ EVENT_TYPES_V2_ADDITIVE_Q42 = frozenset({"orphan_stop_adopted"})
 
 EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1 = frozenset(
     {
-        "cycle_skipped_position_at_target",
+        "cycle_skipped_existing_position",
         "cycle_skipped_position_query_failed",
     }
 )

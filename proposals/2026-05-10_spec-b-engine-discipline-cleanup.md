@@ -80,24 +80,29 @@ The engine cycle does not check "do I already have a position at or above the st
 
 ### Fix
 
-Before submitting any BUY for a strategy, query `ib.positions()` for the symbol. If existing qty >= strategy spec qty, do NOT submit and journal a `cycle_skipped_position_at_target` event with `{strategy_id, symbol, current_qty, target_qty, cycle_id}`.
+Before submitting any BUY for a strategy, query `ib.positions()` for the symbol. If existing qty is non-zero, do NOT submit and journal a `cycle_skipped_existing_position` event with `{strategy_id, symbol, current_qty, target_qty, position_state, cycle_id}`. `position_state` is `at_target` when `current_qty >= target_qty` and `partial` when `0 < current_qty < target_qty`.
 
 ### Implementation
 
 - Add `_check_position_at_target(strategy, ib_connector) -> bool` helper in `execution/strategies/runner.py` (or wherever `submit_order_for_strategy` lives).
-- Call helper in cycle at the top of the BUY-fire path, immediately after validators have approved but before `ib.placeOrder()`.
-- Journal a new event type `cycle_skipped_position_at_target` (append to `journal/schema.py` + `journal/writer.py` allowed-events list).
+- Call helper in cycle at the top of the BUY-fire path and again immediately before `ib.placeOrder()`.
+- Journal a new event type `cycle_skipped_existing_position` (append to `journal/schema.py` + `journal/writer.py` allowed-events list).
 - Position query uses the same connector already wired for validators -- no new connection.
-- If `ib.positions()` returns an error, fail-closed: skip the submission, journal `cycle_skipped_position_query_failed`, and surface to alert pipeline.
+- If `ib.positions()` returns an error, fail-closed: skip the submission, journal `cycle_skipped_position_query_failed` with `abort_phase` set to `decision` or `pre_submit_recheck`, and surface to alert pipeline.
+
+### Known §1 limitations
+
+Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `placeOrder()`) is qualitatively different from the 5/8 incident root cause. The 5/8 incident was the ABSENCE of any position check, not a race condition. §1 closes the absence. The residual window is closed by Spec B's defense-in-depth: §2 (journaled order_id dedup) + §3 (rapid-fire circuit breaker). Hardening the residual window inside §1 alone (e.g. via client_order_id idempotency token) would either duplicate §2's dedup mechanism or force ib_async-side broker-API features that are out of §1 scope. §1 ship discipline: close the named bug, leave defense-in-depth to layered defenses. Architect override of Kimi finding 2; reviewer was technically correct but scope-bounded to §1, finding belongs to §2.
 
 ### Tests
 
 `tests/test_engine_position_aware_skip.py`:
 
-1. **G1 red-then-green: existing position blocks BUY.** Mock `ib.positions()` returns `[Position(symbol='G', qty=71)]`; strategy target qty=71. Assert `submit_order_for_strategy` returns without calling `ib.placeOrder()`. Assert journal contains `cycle_skipped_position_at_target` event with correct fields. Pre-fix this test must FAIL (the current path fires regardless of position).
+1. **G1 red-then-green: existing position blocks BUY.** Mock `ib.positions()` returns `[Position(symbol='G', qty=71)]`; strategy target qty=71. Assert `submit_order_for_strategy` returns without calling `ib.placeOrder()`. Assert journal contains `cycle_skipped_existing_position` event with `position_state=at_target`. Pre-fix this test must FAIL (the current path fires regardless of position).
 2. **G2: zero position permits BUY.** Mock `ib.positions()` returns `[]`; assert `ib.placeOrder()` is called.
-3. **G3: partial position still skips (STRICT semantics, locked).** Skip-at-or-above-target, NOT top-up-to-target. Locked because top-up creates a silent-recovery path: a partial fill + cancel becomes an invisible re-fire under the same approval. STRICT forces partial fills to surface as state requiring operator review. Defense-in-depth (§1+§2+§3+§4) prevents the 11x cascade either way, so STRICT loses nothing on safety and gains explicit lifecycle. Top-up is a separate future feature behind its own approval gate. Assert: `ib.positions()` returns `[Position(symbol='G', qty=30)]`, target=71 → no submit, journal `cycle_skipped_position_at_target` with `current_qty=30, target_qty=71`. Note in test docstring: STRICT semantics, not top-up.
-4. **G4: position query failure fails closed.** Mock `ib.positions()` raises; assert no `ib.placeOrder()` call, journal contains `cycle_skipped_position_query_failed`.
+3. **G3: partial position still skips (STRICT semantics, locked).** Skip-at-or-above-target, NOT top-up-to-target. Locked because top-up creates a silent-recovery path: a partial fill + cancel becomes an invisible re-fire under the same approval. STRICT forces partial fills to surface as state requiring operator review. Defense-in-depth (§1+§2+§3+§4) prevents the 11x cascade either way, so STRICT loses nothing on safety and gains explicit lifecycle. Top-up is a separate future feature behind its own approval gate. Assert: `ib.positions()` returns `[Position(symbol='G', qty=30)]`, target=71 -> no submit, journal `cycle_skipped_existing_position` with `current_qty=30, target_qty=71, position_state=partial`. Note in test docstring: STRICT semantics, not top-up.
+4. **G4: position query failure fails closed.** Mock `ib.positions()` raises during the decision-phase check; assert no `ib.placeOrder()` call, journal contains `cycle_skipped_position_query_failed` with `abort_phase=decision`.
+5. **G4b: pre-submit position query failure fails closed.** Mock `ib.positions()` to return `[]` during the decision-phase check and raise during the pre-submit recheck; assert no `ib.placeOrder()` call, journal contains `cycle_skipped_position_query_failed` with `abort_phase=pre_submit_recheck` and the same trade_id as the proposal, and engine state is not poisoned.
 
 ---
 

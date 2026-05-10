@@ -24,10 +24,10 @@ Adversarial review at `.code-reviews/2026-05-08T04-22-34Z_d294dc.log` (Kimi-back
 | F1 | CRITICAL | clientId 90-99 has no allocator -- collision can kick engine off gateway | Defer | gateway-discipline pass (with F6) |
 | F2 | HIGH | T10 `share_count: pending` defers NAV without divergence validation | Defer | `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md` build session (with F5) |
 | F3 | HIGH | Skipped Codex on architectural commits (`c61b55a`, `4830e34`) abused the doc-only exception | Defer | discipline-cleanup pass; retroactive flag satisfied by this Kimi review |
-| F4 | HIGH | `review/` gitignore vs cycle-4 Check C structural conflict; `K2BI_ALLOW_CONFIG_EDIT=1` override now normalized | Defer | needs operator judgment; not a hot-state decision |
+| F4 | HIGH | `review/` gitignore vs cycle-4 Check C structural conflict; `K2BI_ALLOW_CONFIG_EDIT=1` override now normalized | Defer | decision locked 2026-05-10: option A, drop `review/` from `.gitignore` |
 | F5 | MEDIUM | Dependency inversion -- invest-coach references engine snapshot schema not yet locked | Defer | feature_engine-vault-snapshots build session (with F2) |
 | F6 | MEDIUM | gateway-query.sh has no runtime caller-context guard -- skill-misuse boundary purely documentary | Defer | gateway-discipline pass (with F1) |
-| F7 | MEDIUM | L-2026-05-08-002 'operator-driven liveness' undefined for non-broker migrations | Defer | discipline-cleanup pass; augment with concrete examples or demote to hypothesis |
+| F7 | MEDIUM | L-2026-05-08-002 'operator-driven liveness' undefined for non-broker migrations | Defer | decision locked 2026-05-10: augment with IBKR + Syncthing examples |
 
 ## Per-finding context
 
@@ -53,7 +53,7 @@ The `invest-ship SKILL.md` Checkpoint 2 exception clause says Codex review can b
 
 Commit `d2ab03f` added `review/` to `.gitignore` to clear the deploy-coverage preflight on the `8b94436` ship. Cycle-4 pre-commit Check C (`scripts/lib/invest_ship_strategy.py approve-limits` workflow + `.git/hooks/pre-commit:152-216`) requires the limits-proposal to be staged in the same commit as `config.yaml`. Gitignored files cannot be staged, so Check C is structurally unsatisfiable. The concurrent `/ship --approve-limits` flow at `c73ccbf` had to set `K2BI_ALLOW_CONFIG_EDIT=1` to land. The override is now in the audit trail.
 
-**Why deferred:** decision needs operator judgment. Two viable paths: (a) drop `review/` from .gitignore + stage proposals normally (matches K2B's pattern); (b) modify Check C to read proposals from Syncthing-mirrored disk path + verify trailers (preserves K2Bi's "approved files move into git-tracked wiki/ paths" convention). Both have real trade-offs. Not a hot-state decision; pick during discipline-cleanup.
+**Decision locked 2026-05-10:** use option A. Drop `review/` from `.gitignore` and stage proposals normally. This keeps Check C's same-commit audit path intact instead of adding a second source of truth through a Syncthing-mirrored disk read. Ship as its own small commit during the discipline-cleanup pass.
 
 ### F5 -- Dependency inversion: consumer ships before producer contract (MEDIUM)
 
@@ -71,7 +71,11 @@ CLAUDE.md states "skill bodies and skill-driven workflows MUST NOT call `scripts
 
 The new learning ("infra-migration ship gates must include at least one operator-driven liveness criterion") + matching policy-ledger guard (`* / infra_migration_ship_gate`) are well-formed for the broker-migration scenario that motivated them, but the rule's concrete meaning for non-broker migrations (alert vendor swap, Syncthing migration, deploy-script retarget) is not specified. A low-confidence theoretical guard becomes ledger noise the next operator learns to ignore.
 
-**Why deferred:** the rule is correct in spirit; it just needs operationalization. Two concrete examples will land it (alert-vendor migration: operator sends a test alert and confirms it lands in the new channel; Syncthing migration: operator writes a test file MacBook-side and confirms engine reads it within 10s on the VPS). Or: demote to `status: hypothesis` in `self_improve_learnings.md` and pull the policy-ledger entry until validated against a real second migration. Discipline-cleanup pass decides.
+**Decision locked 2026-05-10:** augment, do not demote. Add two concrete examples to L-2026-05-08-002: (1) IBKR migration liveness: operator performs a cross-client open-order visibility/cancel test from MasterClientID 99 before re-enabling the engine; (2) Syncthing liveness: operator writes a sentinel file on the MacBook and confirms the VPS-side engine read path sees it within the accepted window. Ship as the F7 rule-operationalization commit.
+
+## Known §1 limitations
+
+Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `placeOrder()`) is qualitatively different from the 5/8 incident root cause. The 5/8 incident was the ABSENCE of any position check, not a race condition. §1 closes the absence. The residual window is closed by Spec B's defense-in-depth: §2 (journaled order_id dedup) + §3 (rapid-fire circuit breaker). Hardening the residual window inside §1 alone (e.g. via client_order_id idempotency token) would either duplicate §2's dedup mechanism or force ib_async-side broker-API features that are out of §1 scope. §1 ship discipline: close the named bug, leave defense-in-depth to layered defenses. Architect override of Kimi finding 2; reviewer was technically correct but scope-bounded to §1, finding belongs to §2.
 
 ## Cross-references
 

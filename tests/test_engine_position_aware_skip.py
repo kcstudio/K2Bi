@@ -137,14 +137,14 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tick.orders_submitted, 0)
         self.assertEqual(tick.state_after, EngineState.CONNECTED_IDLE)
         self.assertEqual(len(self.connector.submitted_orders), 0)
-        skips = self._events("cycle_skipped_position_at_target")
+        skips = self._events("cycle_skipped_existing_position")
         self.assertEqual(len(skips), 1)
         self.assertEqual(skips[0]["strategy"], "spy-rotational")
         self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
         self.assertEqual(skips[0]["payload"]["current_qty"], 10)
         self.assertEqual(skips[0]["payload"]["target_qty"], 10)
         self.assertEqual(
-            skips[0]["payload"]["position_state"], "at_or_above_target"
+            skips[0]["payload"]["position_state"], "at_target"
         )
 
     async def test_g2_zero_position_permits_buy(self) -> None:
@@ -157,8 +157,8 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.connector.submitted_orders), 1)
         self.assertEqual(self.connector.submitted_orders[0].ticker, "SPY")
 
-    async def test_g3_partial_position_skips_without_top_up(self) -> None:
-        """STRICT semantics: partial holdings are operator-review state."""
+    async def test_g3_partial_holdings_skips_without_top_up(self) -> None:
+        """STRICT semantics: partial holdings emit cycle_skipped_existing_position."""
         await self._init_engine()
         self.connector.positions = [
             BrokerPosition(ticker="SPY", qty=3, avg_price=Decimal("500"))
@@ -168,13 +168,13 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tick.orders_submitted, 0)
         self.assertEqual(len(self.connector.submitted_orders), 0)
-        skips = self._events("cycle_skipped_position_at_target")
+        skips = self._events("cycle_skipped_existing_position")
         self.assertEqual(len(skips), 1)
         self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
         self.assertEqual(skips[0]["payload"]["current_qty"], 3)
         self.assertEqual(skips[0]["payload"]["target_qty"], 10)
         self.assertEqual(
-            skips[0]["payload"]["position_state"], "partial_position"
+            skips[0]["payload"]["position_state"], "partial"
         )
 
     async def test_g4_position_query_failure_fails_closed(self) -> None:
@@ -193,6 +193,7 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["strategy"], "spy-rotational")
         self.assertEqual(failures[0]["payload"]["symbol"], "SPY")
+        self.assertEqual(failures[0]["payload"]["abort_phase"], "decision")
         self.assertIn("position query unavailable", failures[0]["payload"]["error"])
 
     async def test_position_change_between_check_and_submit_blocks_buy(self) -> None:
@@ -213,11 +214,11 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tick.orders_submitted, 0)
         self.assertEqual(len(self.connector.submitted_orders), 0)
-        skips = self._events("cycle_skipped_position_at_target")
+        skips = self._events("cycle_skipped_existing_position")
         self.assertEqual(len(skips), 1)
         self.assertEqual(skips[0]["payload"]["current_qty"], 10)
         self.assertEqual(
-            skips[0]["payload"]["position_state"], "at_or_above_target"
+            skips[0]["payload"]["position_state"], "at_target"
         )
 
     async def test_position_skip_does_not_mutate_engine_position_cache(self) -> None:
@@ -230,3 +231,40 @@ class PositionAwareSkipTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.tick_once()
 
         self.assertEqual(self.engine._positions, [])
+
+    async def test_g4b_pre_submit_position_query_fails_closed(self) -> None:
+        await self._init_engine()
+        position_snapshots: list[list[BrokerPosition] | Exception] = [
+            [],
+            ConnectorError("pre-submit position query unavailable"),
+        ]
+
+        async def sequence_positions() -> list[BrokerPosition]:
+            next_snapshot = position_snapshots.pop(0)
+            if isinstance(next_snapshot, Exception):
+                raise next_snapshot
+            return next_snapshot
+
+        self.connector.get_positions = sequence_positions  # type: ignore[method-assign]
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.state_after, EngineState.CONNECTED_IDLE)
+        self.assertEqual(tick.orders_submitted, 0)
+        self.assertEqual(len(self.connector.submitted_orders), 0)
+        self.assertIsNone(self.engine._pending_order)
+        proposals = self._events("order_proposed")
+        failures = self._events("cycle_skipped_position_query_failed")
+        submissions = self._events("order_submitted")
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(len(submissions), 0)
+        self.assertEqual(failures[0]["trade_id"], proposals[0]["trade_id"])
+        self.assertEqual(
+            failures[0]["payload"]["abort_phase"], "pre_submit_recheck"
+        )
+        self.assertEqual(failures[0]["payload"]["symbol"], "SPY")
+        self.assertIn(
+            "pre-submit position query unavailable",
+            failures[0]["payload"]["error"],
+        )

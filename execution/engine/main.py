@@ -1251,6 +1251,7 @@ class Engine:
                 side=decision.candidate.side,
                 target_qty=decision.candidate.qty,
                 trade_id=trade_id,
+                abort_phase="decision",
             ):
                 continue
             try:
@@ -1357,7 +1358,9 @@ class Engine:
         side: str,
         target_qty: int,
         trade_id: str,
+        abort_phase: str,
     ) -> bool:
+        """Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `placeOrder()`) is qualitatively different from the 5/8 incident root cause. The 5/8 incident was the ABSENCE of any position check, not a race condition. §1 closes the absence. The residual window is closed by Spec B's defense-in-depth: §2 (journaled order_id dedup) + §3 (rapid-fire circuit breaker). Hardening the residual window inside §1 alone (e.g. via client_order_id idempotency token) would either duplicate §2's dedup mechanism or force ib_async-side broker-API features that are out of §1 scope. §1 ship discipline: close the named bug, leave defense-in-depth to layered defenses. Architect override of Kimi finding 2; reviewer was technically correct but scope-bounded to §1, finding belongs to §2."""
         if side.lower() != "buy":
             return False
 
@@ -1371,6 +1374,7 @@ class Engine:
                     "symbol": symbol,
                     "target_qty": target_qty,
                     "cycle_id": trade_id,
+                    "abort_phase": abort_phase,
                     "error": str(exc),
                     "error_class": type(exc).__name__,
                 },
@@ -1391,12 +1395,12 @@ class Engine:
             return False
 
         position_state = (
-            "at_or_above_target"
+            "at_target"
             if current_qty >= target_qty
-            else "partial_position"
+            else "partial"
         )
         self.journal.append(
-            "cycle_skipped_position_at_target",
+            "cycle_skipped_existing_position",
             payload={
                 "strategy_id": snap.name,
                 "symbol": symbol,
@@ -1512,13 +1516,18 @@ class Engine:
         # number for MKT.
         if (wire_order_type or "").strip().upper() == "MKT":
             wire_limit_price = None
-        if await self._skip_buy_for_existing_position(
-            snap=snap,
-            symbol=order.ticker,
-            side=order.side,
-            target_qty=order.qty,
-            trade_id=trade_id,
-        ):
+        try:
+            if await self._skip_buy_for_existing_position(
+                snap=snap,
+                symbol=order.ticker,
+                side=order.side,
+                target_qty=order.qty,
+                trade_id=trade_id,
+                abort_phase="pre_submit_recheck",
+            ):
+                self.state = EngineState.CONNECTED_IDLE
+                return
+        except ConnectorError:
             self.state = EngineState.CONNECTED_IDLE
             return
         try:
