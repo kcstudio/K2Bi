@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..journal.schema import JournalReplayMalformedJsonError
@@ -190,6 +190,7 @@ def pending_order_map_from_journal(
     """Build pending broker order ids keyed by strategy and symbol."""
     pending: dict[tuple[str, str], set[str]] = {}
     order_keys: dict[str, tuple[str, str]] = {}
+    order_qty: dict[str, int] = {}
     for record in journal_records:
         event_type = record.get("event_type")
         broker_order_id = record.get("broker_order_id")
@@ -213,6 +214,9 @@ def pending_order_map_from_journal(
             key = (strategy_id, symbol)
             pending.setdefault(key, set()).add(order_id)
             order_keys[order_id] = key
+            qty = record.get("qty")
+            if isinstance(qty, int) and not isinstance(qty, bool):
+                order_qty[order_id] = qty
             continue
 
         if event_type == "order_terminal":
@@ -230,6 +234,7 @@ def pending_order_map_from_journal(
                 )
             order_id = str(broker_order_id)
             key = order_keys.pop(order_id, None)
+            order_qty.pop(order_id, None)
             if key is not None:
                 pending.get(key, set()).discard(order_id)
             continue
@@ -239,6 +244,7 @@ def pending_order_map_from_journal(
                 continue
             order_id = str(broker_order_id)
             key = order_keys.pop(order_id, None)
+            order_qty.pop(order_id, None)
             if key is not None:
                 pending.get(key, set()).discard(order_id)
             continue
@@ -250,14 +256,47 @@ def pending_order_map_from_journal(
             remaining_qty = (
                 payload.get("remaining_qty") if isinstance(payload, dict) else None
             )
-            if remaining_qty not in (0, "0"):
+            cumulative_filled_qty = (
+                payload.get("cumulative_filled_qty")
+                if isinstance(payload, dict)
+                else None
+            )
+            if not (
+                _quantity_is_zero(remaining_qty)
+                or (
+                    remaining_qty is None
+                    and _quantity_at_least(
+                        cumulative_filled_qty,
+                        order_qty.get(str(broker_order_id)),
+                    )
+                )
+            ):
                 continue
             order_id = str(broker_order_id)
             key = order_keys.pop(order_id, None)
+            order_qty.pop(order_id, None)
             if key is not None:
                 pending.get(key, set()).discard(order_id)
 
     return {key: ids for key, ids in pending.items() if ids}
+
+
+def _quantity_is_zero(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value).strip()) == 0
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _quantity_at_least(value: Any, target: int | None) -> bool:
+    if target is None or value is None or isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value).strip()) >= Decimal(target)
+    except (InvalidOperation, ValueError):
+        return False
 
 
 def _pending_orders_for_strategy(

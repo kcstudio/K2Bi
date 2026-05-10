@@ -286,6 +286,55 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.connector.submitted_orders), 1)
         self.assertEqual(self._events("cycle_skipped_pending_prior_submission"), [])
 
+    async def test_d3b_legacy_filled_zero_float_string_does_not_block_submit(
+        self,
+    ) -> None:
+        await self._init_engine()
+        self._append_prior_submission()
+        self.journal.append(
+            "order_filled",
+            payload={
+                "fill_qty": 10,
+                "remaining_qty": "0.0",
+                "cumulative_filled_qty": 10,
+            },
+            strategy="spy-rotational",
+            trade_id="T-fill-42",
+            ticker="SPY",
+            side="buy",
+            qty=10,
+            broker_order_id="42",
+        )
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 1)
+        self.assertEqual(self._events("cycle_skipped_pending_prior_submission"), [])
+
+    async def test_d3c_legacy_filled_missing_remaining_uses_cumulative_qty(
+        self,
+    ) -> None:
+        await self._init_engine()
+        self._append_prior_submission()
+        self.journal.append(
+            "order_filled",
+            payload={
+                "fill_qty": 10,
+                "cumulative_filled_qty": 10,
+            },
+            strategy="spy-rotational",
+            trade_id="T-fill-42",
+            ticker="SPY",
+            side="buy",
+            qty=10,
+            broker_order_id="42",
+        )
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 1)
+        self.assertEqual(self._events("cycle_skipped_pending_prior_submission"), [])
+
     async def test_d4_pending_map_rebuilds_on_engine_startup(self) -> None:
         await self._patch_now(_mid_session_utc())
         self._append_prior_submission(broker_order_id="41")
