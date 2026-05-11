@@ -290,7 +290,7 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         refused = self._events("protective_stop_attach_refused_drift")
         self.assertEqual(len(refused), 1)
         self.assertEqual(refused[0]["payload"]["expected_qty"], 71)
-        self.assertEqual(refused[0]["payload"]["actual_qty"], 70)
+        self.assertEqual(refused[0]["payload"]["actual_qty"], "70")
 
     async def test_c3_multiple_symbol_positions_are_drift_even_if_sum_matches(
         self,
@@ -316,6 +316,32 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector.stop_orders, [])
         refused = self._events("protective_stop_attach_refused_drift")
         self.assertEqual(refused[0]["payload"]["matching_position_count"], 2)
+
+    async def test_c3_fractional_position_qty_is_drift_not_truncated(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[
+                BrokerPosition(
+                    ticker="G",
+                    qty=Decimal("70.9"),
+                    avg_price=Decimal("32.00"),
+                )
+            ]
+        )
+
+        with self.assertRaises(strategy_runner.PositionDriftError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=70,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_drift")
+        self.assertEqual(refused[0]["payload"]["actual_qty"], "70.9")
 
     async def test_c4_explicit_verb_succeeds_on_exact_position_match(self) -> None:
         connector = _AttachmentConnector(

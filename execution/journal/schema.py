@@ -374,7 +374,9 @@ def _require_non_empty_str(payload: dict[str, Any], event_type: str, field: str)
 
 def _require_int(payload: dict[str, Any], event_type: str, field: str) -> int:
     value = payload.get(field)
-    if isinstance(value, bool) or not isinstance(value, int):
+    # Use exact type, not isinstance: bool is an int subclass, and
+    # third-party integer scalars can break strict JSON serialization.
+    if type(value) is not int:
         raise JournalSchemaError(
             f"{event_type} {field} must be int, got {value!r}"
         )
@@ -397,6 +399,20 @@ def _require_positive_decimal_str(
         )
 
 
+def _require_decimal_str(payload: dict[str, Any], event_type: str, field: str) -> None:
+    raw = payload.get(field)
+    try:
+        parsed = Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        raise JournalSchemaError(
+            f"{event_type} {field} not parseable as Decimal: {raw!r}"
+        )
+    if not parsed.is_finite():
+        raise JournalSchemaError(
+            f"{event_type} {field} must be finite Decimal, got {raw!r}"
+        )
+
+
 def validate_protective_stop_attached_payload(payload: dict[str, Any]) -> None:
     event_type = "protective_stop_attached_to_existing_position"
     _require_non_empty_str(payload, event_type, "strategy_id")
@@ -416,10 +432,15 @@ def validate_protective_stop_attach_refused_drift_payload(
     _require_non_empty_str(payload, event_type, "strategy_id")
     _require_non_empty_str(payload, event_type, "symbol")
     expected = _require_int(payload, event_type, "expected_qty")
-    _require_int(payload, event_type, "actual_qty")
+    _require_decimal_str(payload, event_type, "actual_qty")
+    count = _require_int(payload, event_type, "matching_position_count")
     if expected <= 0:
         raise JournalSchemaError(
             f"{event_type} expected_qty must be positive, got {expected!r}"
+        )
+    if count < 0:
+        raise JournalSchemaError(
+            f"{event_type} matching_position_count must be non-negative, got {count!r}"
         )
     _require_positive_decimal_str(payload, event_type, "stop_price")
 

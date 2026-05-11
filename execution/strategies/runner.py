@@ -372,19 +372,21 @@ async def attach_protective_stop_to_existing_position(
         )
 
     positions = await connector.get_positions()
-    matching_positions = [
-        position
+    matching_position_qtys = [
+        Decimal(str(position.qty))
         for position in positions
-        if str(position.ticker).upper() == symbol_norm and int(position.qty) != 0
+        if str(position.ticker).upper() == symbol_norm
+        and Decimal(str(position.qty)) != 0
     ]
-    actual_qty = sum(int(position.qty) for position in matching_positions)
-    if len(matching_positions) != 1 or actual_qty != qty:
+    actual_qty = sum(matching_position_qtys, Decimal("0"))
+    expected_qty = Decimal(qty)
+    if len(matching_position_qtys) != 1 or actual_qty != expected_qty:
         payload = {
             "strategy_id": strategy_id,
             "symbol": symbol_norm,
             "expected_qty": qty,
-            "actual_qty": actual_qty,
-            "matching_position_count": len(matching_positions),
+            "actual_qty": format(actual_qty, "f"),
+            "matching_position_count": len(matching_position_qtys),
             "stop_price": str(stop_price),
         }
         validate_protective_stop_attach_refused_drift_payload(payload)
@@ -398,7 +400,7 @@ async def attach_protective_stop_to_existing_position(
         )
         raise PositionDriftError(
             f"broker position drift for {symbol_norm}: expected one position "
-            f"with qty {qty}, got {len(matching_positions)} matching positions "
+            f"with qty {qty}, got {len(matching_position_qtys)} matching positions "
             f"totaling {actual_qty}"
         )
 
