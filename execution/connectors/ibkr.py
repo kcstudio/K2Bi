@@ -930,6 +930,72 @@ class IBKRConnector:
             warnings=tuple(warnings),
         )
 
+    async def submit_standalone_stop_order(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        qty: int,
+        stop_price: Decimal,
+        time_in_force: str = "GTC",
+        client_tag: str | None = None,
+    ) -> BrokerOrderAck:
+        """Submit a recovery-only standalone STP for an existing position.
+
+        Normal entry submits must use submit_order() so the STP is a
+        parent-bound child. This method exists only for recovery repair
+        when the position already exists and needs a fresh protective
+        stop attached by operator/recovery context.
+        """
+
+        self._require_connected()
+        import ib_async  # type: ignore[import-not-found]
+
+        contract = ib_async.Stock(ticker, "SMART", "USD")
+        action = "SELL" if side.lower() == "sell" else "BUY"
+        stop = ib_async.StopOrder(
+            action,
+            int(qty),
+            float(stop_price),
+            tif=time_in_force,
+        )
+        stop.parentId = 0
+        stop.transmit = True
+        if client_tag is not None:
+            stop.orderRef = client_tag
+
+        try:
+            trade = self._ib.placeOrder(contract, stop)
+            for _ in range(50):
+                if getattr(trade.order, "orderId", 0):
+                    break
+                await asyncio.sleep(0.1)
+            if not getattr(trade.order, "orderId", 0):
+                raise BrokerRejectionError(
+                    "IB Gateway did not assign orderId within 5s of standalone stop",
+                    broker_reason="standalone_stop_orderid_timeout",
+                )
+            for _ in range(50):
+                if getattr(trade.order, "permId", 0):
+                    break
+                await asyncio.sleep(0.1)
+            if not getattr(trade.order, "permId", 0):
+                raise BrokerRejectionError(
+                    "IB Gateway did not assign permId within 5s of standalone stop",
+                    broker_reason="standalone_stop_permid_timeout",
+                    broker_order_id=str(trade.order.orderId),
+                )
+        except Exception as exc:
+            self._classify_and_raise(exc, phase="submit_standalone_stop")
+
+        status = getattr(trade.orderStatus, "status", "")
+        return BrokerOrderAck(
+            broker_order_id=str(trade.order.orderId),
+            broker_perm_id=str(trade.order.permId),
+            submitted_at=datetime.now(timezone.utc),
+            status=status,
+        )
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._require_connected()
         try:

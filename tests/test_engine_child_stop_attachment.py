@@ -2,15 +2,103 @@
 
 from __future__ import annotations
 
+import inspect
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
+from execution.connectors.ibkr import IBKRConnector
 from execution.connectors.types import BrokerOrderAck, BrokerPosition
+from execution.engine import recovery as recovery_mod
+from execution.engine.main import Engine
 from execution.journal.writer import JournalWriter
 from execution.strategies import runner as strategy_runner
+
+
+class _FakeStock:
+    def __init__(self, symbol: str, exchange: str, currency: str) -> None:
+        self.symbol = symbol
+        self.exchange = exchange
+        self.currency = currency
+
+
+class _FakeBaseOrder:
+    def __init__(self, action: str, qty: int, *, tif: str) -> None:
+        self.action = action
+        self.totalQuantity = qty
+        self.tif = tif
+        self.transmit = True
+        self.parentId = 0
+        self.orderRef = ""
+        self.orderId = 0
+        self.permId = 0
+        self.lmtPrice = 0.0
+        self.auxPrice = 0.0
+
+
+class _FakeLimitOrder(_FakeBaseOrder):
+    def __init__(self, action: str, qty: int, limit_price: float, *, tif: str) -> None:
+        super().__init__(action, qty, tif=tif)
+        self.orderType = "LMT"
+        self.lmtPrice = limit_price
+
+
+class _FakeMarketOrder(_FakeBaseOrder):
+    def __init__(self, action: str, qty: int, *, tif: str) -> None:
+        super().__init__(action, qty, tif=tif)
+        self.orderType = "MKT"
+
+
+class _FakeStopOrder(_FakeBaseOrder):
+    def __init__(self, action: str, qty: int, stop_price: float, *, tif: str) -> None:
+        super().__init__(action, qty, tif=tif)
+        self.orderType = "STP"
+        self.auxPrice = stop_price
+
+
+class _FakeOrderStatus:
+    def __init__(self, status: str = "Submitted") -> None:
+        self.status = status
+        self.whyHeld = ""
+
+
+class _FakeTrade:
+    def __init__(self, order: _FakeBaseOrder) -> None:
+        self.order = order
+        self.orderStatus = _FakeOrderStatus()
+
+
+class _FakeIB:
+    def __init__(self) -> None:
+        self.placed_orders: list[_FakeBaseOrder] = []
+        self.cancelled_orders: list[_FakeBaseOrder] = []
+        self._next_order_id = 100
+        self._next_perm_id = 9000
+
+    def placeOrder(self, contract: _FakeStock, order: _FakeBaseOrder) -> _FakeTrade:
+        order.orderId = self._next_order_id
+        order.permId = self._next_perm_id
+        self._next_order_id += 1
+        self._next_perm_id += 1
+        self.placed_orders.append(order)
+        return _FakeTrade(order)
+
+    def cancelOrder(self, order: _FakeBaseOrder) -> None:
+        self.cancelled_orders.append(order)
+
+
+def _fake_ib_async_module() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        Stock=_FakeStock,
+        LimitOrder=_FakeLimitOrder,
+        MarketOrder=_FakeMarketOrder,
+        StopOrder=_FakeStopOrder,
+    )
 
 
 class _AttachmentConnector:
@@ -39,6 +127,8 @@ class _AttachmentConnector:
                 "stop_price": stop_price,
                 "time_in_force": time_in_force,
                 "client_tag": client_tag,
+                "parent_id": 0,
+                "transmit": True,
             }
         )
         return BrokerOrderAck(
@@ -47,6 +137,51 @@ class _AttachmentConnector:
             submitted_at=datetime.now(timezone.utc),
             status="Submitted",
         )
+
+
+class ConnectorBracketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_c1_buy_with_stop_creates_parent_child_bracket(self) -> None:
+        fake_ib = _FakeIB()
+        connector = IBKRConnector(
+            account_id=None,
+            host="127.0.0.1",
+            port=4002,
+            client_id=1,
+        )
+        connector._ib = fake_ib
+        connector._connected = True
+
+        with patch.dict(sys.modules, {"ib_async": _fake_ib_async_module()}):
+            await connector.submit_order(
+                ticker="G",
+                side="buy",
+                qty=71,
+                limit_price=None,
+                stop_loss=Decimal("30.00"),
+                time_in_force="DAY",
+                client_tag="k2bi:g-2026-05:T-parent",
+                order_type="MKT",
+            )
+
+        self.assertEqual(len(fake_ib.placed_orders), 2)
+        parent, child = fake_ib.placed_orders
+        self.assertEqual(parent.orderType, "MKT")
+        self.assertEqual(parent.action, "BUY")
+        self.assertFalse(parent.transmit)
+        self.assertEqual(child.orderType, "STP")
+        self.assertEqual(child.action, "SELL")
+        self.assertEqual(child.parentId, parent.orderId)
+        self.assertTrue(child.transmit)
+        self.assertEqual(child.tif, "GTC")
+
+    def test_c2_parent_cancel_relies_on_broker_child_auto_cancel(self) -> None:
+        """IBKR bracket semantics auto-cancel the child when parent cancels."""
+
+        source = inspect.getsource(IBKRConnector.submit_order)
+        self.assertIn("child.parentId = parent_trade.order.orderId", source)
+        self.assertIn("child.transmit = True", source)
+        self.assertNotIn("cancelOrder(child", source)
+        self.assertNotIn("cancelOrder(child_trade", source)
 
 
 class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +221,79 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(refused), 1)
         self.assertEqual(refused[0]["payload"]["strategy_id"], "g-2026-05")
         self.assertEqual(refused[0]["payload"]["symbol"], "G")
+
+    async def test_c3_explicit_verb_refuses_on_position_drift(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[BrokerPosition(ticker="G", qty=70, avg_price=Decimal("32.00"))]
+        )
+
+        with self.assertRaises(strategy_runner.PositionDriftError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=71,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_drift")
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["payload"]["expected_qty"], 71)
+        self.assertEqual(refused[0]["payload"]["actual_qty"], 70)
+
+    async def test_c4_explicit_verb_succeeds_on_exact_position_match(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[BrokerPosition(ticker="G", qty=71, avg_price=Decimal("32.00"))]
+        )
+
+        ack = await strategy_runner.attach_protective_stop_to_existing_position(
+            connector=connector,
+            journal=self.journal,
+            symbol="G",
+            qty=71,
+            stop_price=Decimal("30.00"),
+            strategy_id="g-2026-05",
+            recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+        )
+
+        self.assertEqual(ack.broker_order_id, "7001")
+        self.assertEqual(connector.stop_orders[0]["side"], "sell")
+        self.assertEqual(connector.stop_orders[0]["time_in_force"], "GTC")
+        self.assertEqual(connector.stop_orders[0]["parent_id"], 0)
+        self.assertTrue(connector.stop_orders[0]["transmit"])
+        attached = self._events("protective_stop_attached_to_existing_position")
+        self.assertEqual(len(attached), 1)
+        self.assertEqual(attached[0]["payload"]["broker_order_id"], "7001")
+
+    def test_c5_normal_cycle_does_not_call_recovery_only_verb(self) -> None:
+        for method in (Engine._process_strategies, Engine._submit):
+            self.assertNotIn(
+                "attach_protective_stop_to_existing_position",
+                inspect.getsource(method),
+            )
+
+    async def test_c6_forged_recovery_context_refuses_without_broker_call(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[BrokerPosition(ticker="G", qty=71, avg_price=Decimal("32.00"))]
+        )
+
+        with self.assertRaises(strategy_runner.RecoveryContextError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=71,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=object(),
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_no_recovery_context")
+        self.assertEqual(len(refused), 1)
 
 
 if __name__ == "__main__":

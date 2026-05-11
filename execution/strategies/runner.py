@@ -1,8 +1,10 @@
 """Pure strategy evaluation.
 
 Takes ApprovedStrategySnapshot + MarketSnapshot + engine context,
-returns a CandidateOrder or None. Contains NO I/O, NO connector calls,
-NO validator invocation -- the engine's tick owns those.
+returns a CandidateOrder or None. The normal evaluation path contains
+NO I/O, NO connector calls, NO validator invocation -- the engine's tick
+owns those. The recovery-only protective-stop repair verb at the bottom
+is an explicit Spec B §4 exception guarded by a private recovery token.
 
 Why this lives separately from the engine (architect Q1-refined):
     - Bundle 4's invest-backtest reuses `evaluate()` against historical
@@ -25,7 +27,9 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ..engine.recovery_context import is_recovery_context_token
 from ..journal.schema import JournalReplayMalformedJsonError
+from ..journal.writer import JournalWriter
 from ..risk import cash_only
 from ..validators.types import Order as ValidatorOrder
 from ..validators.types import Position as ValidatorPosition
@@ -58,6 +62,14 @@ SKIP_REGIME_MISMATCH = "regime_filter_mismatch"
 SKIP_NAKED_SHORT = "would_open_naked_short"
 SKIP_UNKNOWN_STRATEGY_TYPE = "unknown_strategy_type"
 EMIT_HAND_CRAFTED = "hand_crafted_order_emitted"
+
+
+class RecoveryContextError(PermissionError):
+    """Raised when recovery-only broker repair is called without authority."""
+
+
+class PositionDriftError(RuntimeError):
+    """Raised when broker position qty differs from the requested stop qty."""
 
 
 def evaluate(
@@ -315,6 +327,96 @@ def _pending_orders_for_strategy(
     return sorted(pending.get((strategy_id, target_symbol), set()))
 
 
+async def attach_protective_stop_to_existing_position(
+    *,
+    connector: Any,
+    journal: JournalWriter,
+    symbol: str,
+    qty: int,
+    stop_price: Decimal,
+    strategy_id: str,
+    recovery_context: object,
+) -> Any:
+    """Attach a standalone recovery STP to an already-held position.
+
+    Normal strategy evaluation must never call this. The private recovery
+    token makes the recovery/operator path explicit and prevents boolean
+    flag drift from opening a standalone-stop path in the normal cycle.
+    """
+
+    symbol_norm = symbol.upper()
+    if not is_recovery_context_token(recovery_context):
+        journal.append(
+            "protective_stop_attach_refused_no_recovery_context",
+            payload={
+                "strategy_id": strategy_id,
+                "symbol": symbol_norm,
+                "qty": qty,
+                "stop_price": str(stop_price),
+                "reason": "missing_or_invalid_recovery_context",
+            },
+            strategy=strategy_id,
+            ticker=symbol_norm,
+            side="sell",
+            qty=qty,
+        )
+        raise RecoveryContextError(
+            "attach_protective_stop_to_existing_position requires recovery context"
+        )
+
+    positions = await connector.get_positions()
+    actual_qty = sum(
+        int(position.qty)
+        for position in positions
+        if str(position.ticker).upper() == symbol_norm
+    )
+    if actual_qty != qty:
+        journal.append(
+            "protective_stop_attach_refused_drift",
+            payload={
+                "strategy_id": strategy_id,
+                "symbol": symbol_norm,
+                "expected_qty": qty,
+                "actual_qty": actual_qty,
+                "stop_price": str(stop_price),
+            },
+            strategy=strategy_id,
+            ticker=symbol_norm,
+            side="sell",
+            qty=qty,
+        )
+        raise PositionDriftError(
+            f"broker position drift for {symbol_norm}: expected {qty}, got {actual_qty}"
+        )
+
+    ack = await connector.submit_standalone_stop_order(
+        ticker=symbol_norm,
+        side="sell",
+        qty=qty,
+        stop_price=stop_price,
+        time_in_force="GTC",
+        client_tag=f"k2bi:{strategy_id}:recovery-stop-{symbol_norm}:stop",
+    )
+    journal.append(
+        "protective_stop_attached_to_existing_position",
+        payload={
+            "strategy_id": strategy_id,
+            "symbol": symbol_norm,
+            "qty": qty,
+            "stop_price": str(stop_price),
+            "broker_order_id": ack.broker_order_id,
+            "broker_perm_id": ack.broker_perm_id,
+        },
+        strategy=strategy_id,
+        ticker=symbol_norm,
+        side="sell",
+        qty=qty,
+        broker_order_id=ack.broker_order_id,
+        broker_perm_id=ack.broker_perm_id,
+    )
+    return ack
+
+
 def _to_validator_order(
     snapshot: ApprovedStrategySnapshot,
     market: MarketSnapshot,
@@ -357,11 +459,14 @@ def _to_validator_order(
 __all__ = [
     "EMIT_HAND_CRAFTED",
     "EvaluationDecision",
+    "PositionDriftError",
+    "RecoveryContextError",
     "SKIP_NAKED_SHORT",
     "SKIP_PENDING_ORDER",
     "SKIP_POSITION_HELD",
     "SKIP_REGIME_MISMATCH",
     "SKIP_UNKNOWN_STRATEGY_TYPE",
+    "attach_protective_stop_to_existing_position",
     "evaluate",
     "pending_order_map_from_journal",
     "_pending_orders_for_strategy",

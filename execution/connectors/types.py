@@ -249,6 +249,17 @@ class IBKRConnectorProtocol(Protocol):
         order_type: str = "LMT",
     ) -> BrokerOrderAck: ...
 
+    async def submit_standalone_stop_order(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        qty: int,
+        stop_price: Decimal,
+        time_in_force: str = "GTC",
+        client_tag: str | None = None,
+    ) -> BrokerOrderAck: ...
+
     async def cancel_order(self, broker_order_id: str) -> None: ...
 
     async def get_executions_since(

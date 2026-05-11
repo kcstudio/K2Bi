@@ -35,6 +35,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Iterable
 
+from .recovery_context import _RECOVERY_CONTEXT_TOKEN
+
 
 LOG = logging.getLogger("k2bi.engine.recovery")
 

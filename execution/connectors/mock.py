@@ -49,6 +49,22 @@ class SubmittedOrderRecord:
 
 
 @dataclass
+class StandaloneStopOrderRecord:
+    """Recovery-only standalone protective stop sent through the mock."""
+
+    ticker: str
+    side: str
+    qty: int
+    stop_price: Decimal
+    time_in_force: str
+    client_tag: str | None
+    broker_order_id: str
+    broker_perm_id: str
+    parent_id: int = 0
+    transmit: bool = True
+
+
+@dataclass
 class MockIBKRConnector:
     """Protocol-compatible mock.
 
@@ -76,6 +92,9 @@ class MockIBKRConnector:
     order_status_history: list[BrokerOrderStatusEvent] = field(default_factory=list)
 
     submitted_orders: list[SubmittedOrderRecord] = field(default_factory=list)
+    standalone_stop_orders: list[StandaloneStopOrderRecord] = field(
+        default_factory=list
+    )
     cancelled_order_ids: list[str] = field(default_factory=list)
 
     # connection state
@@ -207,6 +226,40 @@ class MockIBKRConnector:
             status="Submitted",
         )
 
+    async def submit_standalone_stop_order(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        qty: int,
+        stop_price: Decimal,
+        time_in_force: str = "GTC",
+        client_tag: str | None = None,
+    ) -> BrokerOrderAck:
+        self._require_connected()
+        broker_order_id = str(self._next_order_id)
+        broker_perm_id = str(self._next_perm_id)
+        self._next_order_id += 1
+        self._next_perm_id += 1
+        self.standalone_stop_orders.append(
+            StandaloneStopOrderRecord(
+                ticker=ticker,
+                side=side,
+                qty=qty,
+                stop_price=stop_price,
+                time_in_force=time_in_force,
+                client_tag=client_tag,
+                broker_order_id=broker_order_id,
+                broker_perm_id=broker_perm_id,
+            )
+        )
+        return BrokerOrderAck(
+            broker_order_id=broker_order_id,
+            broker_perm_id=broker_perm_id,
+            submitted_at=datetime.now(timezone.utc),
+            status="Submitted",
+        )
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._require_connected()
         self.cancelled_order_ids.append(broker_order_id)
@@ -237,6 +290,7 @@ class MockIBKRConnector:
 
 __all__ = [
     "MockIBKRConnector",
+    "StandaloneStopOrderRecord",
     "SubmittedOrderRecord",
     "BrokerRejectionError",
 ]

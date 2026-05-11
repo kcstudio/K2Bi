@@ -43,6 +43,10 @@ v2 additive (2026-04-26, Q42 orphan-STOP adoption):
       validate_orphan_stop_adopted_payload() (kept separate from
       validate() to preserve its cheap-checks-only contract).
       Additive-only; SCHEMA_VERSION unchanged per the evolution rule.
+
+v2 additive (2026-05-11, Spec B §4):
+    - Added protective-stop repair events for the recovery-only existing-
+      position stop attachment verb. Additive-only; SCHEMA_VERSION unchanged.
 """
 
 from __future__ import annotations
@@ -143,6 +147,14 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_3 = frozenset(
     }
 )
 
+EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_4 = frozenset(
+    {
+        "protective_stop_attached_to_existing_position",
+        "protective_stop_attach_refused_drift",
+        "protective_stop_attach_refused_no_recovery_context",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
@@ -150,6 +162,7 @@ EVENT_TYPES = (
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_2
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_3
+    | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_4
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
