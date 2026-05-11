@@ -371,6 +371,28 @@ async def attach_protective_stop_to_existing_position(
             "attach_protective_stop_to_existing_position requires recovery context"
         )
 
+    if qty <= 0:
+        payload = {
+            "strategy_id": strategy_id,
+            "symbol": symbol_norm,
+            "expected_qty": qty,
+            "actual_qty": "0",
+            "matching_position_count": 0,
+            "stop_price": str(stop_price),
+        }
+        validate_protective_stop_attach_refused_drift_payload(payload)
+        journal.append(
+            "protective_stop_attach_refused_drift",
+            payload=payload,
+            strategy=strategy_id,
+            ticker=symbol_norm,
+            side="sell",
+            qty=qty,
+        )
+        raise PositionDriftError(
+            f"recovery stop qty for {symbol_norm} must be positive, got {qty}"
+        )
+
     positions = await connector.get_positions()
     matching_position_qtys = [
         Decimal(str(position.qty))
@@ -380,7 +402,7 @@ async def attach_protective_stop_to_existing_position(
     ]
     actual_qty = sum(matching_position_qtys, Decimal("0"))
     expected_qty = Decimal(qty)
-    if len(matching_position_qtys) != 1 or actual_qty != expected_qty:
+    if len(matching_position_qtys) != 1 or actual_qty != expected_qty or actual_qty <= 0:
         payload = {
             "strategy_id": strategy_id,
             "symbol": symbol_norm,

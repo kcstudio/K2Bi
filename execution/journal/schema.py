@@ -434,9 +434,9 @@ def validate_protective_stop_attach_refused_drift_payload(
     expected = _require_int(payload, event_type, "expected_qty")
     _require_decimal_str(payload, event_type, "actual_qty")
     count = _require_int(payload, event_type, "matching_position_count")
-    if expected <= 0:
+    if expected == 0:
         raise JournalSchemaError(
-            f"{event_type} expected_qty must be positive, got {expected!r}"
+            f"{event_type} expected_qty must be non-zero, got {expected!r}"
         )
     if count < 0:
         raise JournalSchemaError(

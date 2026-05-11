@@ -343,6 +343,46 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         refused = self._events("protective_stop_attach_refused_drift")
         self.assertEqual(refused[0]["payload"]["actual_qty"], "70.9")
 
+    async def test_c3_short_position_is_refused_before_sell_stop(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[BrokerPosition(ticker="G", qty=-71, avg_price=Decimal("32.00"))]
+        )
+
+        with self.assertRaises(strategy_runner.PositionDriftError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=71,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_drift")
+        self.assertEqual(refused[0]["payload"]["actual_qty"], "-71")
+
+    async def test_c3_negative_requested_qty_is_refused(self) -> None:
+        connector = _AttachmentConnector(
+            positions=[BrokerPosition(ticker="G", qty=-71, avg_price=Decimal("32.00"))]
+        )
+
+        with self.assertRaises(strategy_runner.PositionDriftError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=-71,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_drift")
+        self.assertEqual(refused[0]["payload"]["expected_qty"], -71)
+
     async def test_c4_explicit_verb_succeeds_on_exact_position_match(self) -> None:
         connector = _AttachmentConnector(
             positions=[BrokerPosition(ticker="G", qty=71, avg_price=Decimal("32.00"))]
