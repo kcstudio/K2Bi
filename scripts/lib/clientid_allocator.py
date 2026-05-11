@@ -16,6 +16,7 @@ from typing import Iterator
 
 
 DEFAULT_CLIENT_IDS = tuple(range(90, 100))
+DEFAULT_LEASE_TTL_SECONDS = 300
 
 
 class ClientIdUnavailable(RuntimeError):
@@ -48,6 +49,36 @@ def _lease_path(lease_dir: Path, client_id: int) -> Path:
     return lease_dir / f"clientId-{client_id}.json"
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lease_is_stale(path: Path, *, now: float, ttl_seconds: int) -> bool:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    try:
+        created_at = float(payload.get("created_at", path.stat().st_mtime))
+    except (TypeError, ValueError, OSError):
+        created_at = path.stat().st_mtime
+    try:
+        owner_pid = int(payload.get("owner_pid", payload.get("pid", 0)))
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if _pid_is_alive(owner_pid):
+        return False
+    return now - created_at > ttl_seconds
+
+
 def _candidate_ids(
     preferred: int | None,
     client_ids: tuple[int, ...],
@@ -67,22 +98,34 @@ def allocate_client_id(
     lease_dir: Path,
     preferred: int | None = None,
     owner: str = "",
+    owner_pid: int | None = None,
     client_ids: tuple[int, ...] = DEFAULT_CLIENT_IDS,
+    lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
 ) -> ClientIdLease:
     """Acquire one operator clientId lease under an exclusive filesystem lock."""
     token = secrets.token_hex(16)
     lease_dir = Path(lease_dir)
     candidates = _candidate_ids(preferred, client_ids)
+    lease_owner_pid = owner_pid if owner_pid is not None else os.getpid()
 
     with _locked_lease_dir(lease_dir):
+        now = time.time()
         for client_id in candidates:
             path = _lease_path(lease_dir, client_id)
             if path.exists():
-                continue
+                if _lease_is_stale(
+                    path,
+                    now=now,
+                    ttl_seconds=lease_ttl_seconds,
+                ):
+                    path.unlink()
+                else:
+                    continue
             payload = {
                 "client_id": client_id,
-                "created_at": time.time(),
+                "created_at": now,
                 "owner": owner,
+                "owner_pid": lease_owner_pid,
                 "pid": os.getpid(),
                 "token": token,
             }
@@ -153,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     acquire.add_argument("--lease-dir", required=True)
     acquire.add_argument("--preferred", type=int)
     acquire.add_argument("--owner", default="")
+    acquire.add_argument("--owner-pid", type=int)
+    acquire.add_argument("--lease-ttl-seconds", type=int, default=DEFAULT_LEASE_TTL_SECONDS)
     acquire.add_argument("--format", choices=("json", "shell"), default="json")
 
     release = subparsers.add_parser("release")
@@ -166,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
                 lease_dir=Path(args.lease_dir),
                 preferred=args.preferred,
                 owner=args.owner,
+                owner_pid=args.owner_pid,
+                lease_ttl_seconds=args.lease_ttl_seconds,
             )
             if args.format == "shell":
                 _print_shell(lease)

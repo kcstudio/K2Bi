@@ -104,7 +104,7 @@ if [[ -n "${PREFERRED_CLIENT_ID:-}" ]]; then
     fi
 fi
 
-ALLOCATOR_ARGS=(acquire --lease-dir "$CLIENTID_LEASE_DIR" --owner "gateway-query:${USER:-unknown}:$$" --format shell)
+ALLOCATOR_ARGS=(acquire --lease-dir "$CLIENTID_LEASE_DIR" --owner "gateway-query:${USER:-unknown}:$$" --owner-pid "$$" --format shell)
 if [[ -n "${PREFERRED_CLIENT_ID:-}" ]]; then
     ALLOCATOR_ARGS+=(--preferred "$PREFERRED_CLIENT_ID")
 fi
