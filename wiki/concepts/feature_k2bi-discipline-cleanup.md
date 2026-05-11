@@ -73,6 +73,8 @@ The new learning ("infra-migration ship gates must include at least one operator
 
 **Decision locked 2026-05-10:** augment, do not demote. Add two concrete examples to L-2026-05-08-002: (1) IBKR migration liveness: operator performs a cross-client open-order visibility/cancel test from MasterClientID 99 before re-enabling the engine; (2) Syncthing liveness: operator writes a sentinel file on the MacBook and confirms the VPS-side engine read path sees it within the accepted window. Ship as the F7 rule-operationalization commit.
 
+**Spec B §6 applied 2026-05-11:** L-2026-05-08-002 now names both "IBKR migration liveness" and "Syncthing liveness" as concrete operator-driven examples. The IBKR example uses MasterClientID=99 for operator-facing Gateway terminology and `OverrideTwsMasterClientID=99` for the IBC config key, with cleanup still routed through the placing clientId path per the Known §5 limitation.
+
 ## Known §1 limitations
 
 Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `placeOrder()`) is qualitatively different from the 5/8 incident root cause. The 5/8 incident was the ABSENCE of any position check, not a race condition. §1 closes the absence. The residual window is closed by Spec B's defense-in-depth: §2 (journaled order_id dedup) + §3 (rapid-fire circuit breaker). Hardening the residual window inside §1 alone (e.g. via client_order_id idempotency token) would either duplicate §2's dedup mechanism or force ib_async-side broker-API features that are out of §1 scope. §1 ship discipline: close the named bug, leave defense-in-depth to layered defenses. Architect override of Kimi finding 2; reviewer was technically correct but scope-bounded to §1, finding belongs to §2.
