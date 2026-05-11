@@ -77,11 +77,18 @@ The new learning ("infra-migration ship gates must include at least one operator
 
 Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `placeOrder()`) is qualitatively different from the 5/8 incident root cause. The 5/8 incident was the ABSENCE of any position check, not a race condition. §1 closes the absence. The residual window is closed by Spec B's defense-in-depth: §2 (journaled order_id dedup) + §3 (rapid-fire circuit breaker). Hardening the residual window inside §1 alone (e.g. via client_order_id idempotency token) would either duplicate §2's dedup mechanism or force ib_async-side broker-API features that are out of §1 scope. §1 ship discipline: close the named bug, leave defense-in-depth to layered defenses. Architect override of Kimi finding 2; reviewer was technically correct but scope-bounded to §1, finding belongs to §2.
 
+## Known §5 limitations
+
+MasterClientID=99 visibility does NOT extend to cancellation. Operators detecting an orphan must identify the placing clientId from `reqAllOpenOrders()` and spawn a temporary connection on that clientId to cancel.
+
+The 5/8 incident's "11 orphan STPs cancelled via bounded clientId=1 exception" pattern remains the canonical cleanup path until the post-Spec-B orphan-cleanup tool ships.
+
 ## Cross-references
 
 - `.code-reviews/2026-05-08T04-22-34Z_d294dc.log` -- the review log itself.
 - `.minimax-reviews/2026-05-08T04-24-59Z_plan.json` -- archived JSON response.
 - `wiki/concepts/feature_invest-coach.md` -- Known follow-ups section overlaps with F2/F5; this tracker note supersedes those entries for closure-tracking purposes.
+- `wiki/concepts/feature_orphan-order-cleanup-tool.md` -- backlog follow-up for surgical orphan cancellation after Spec B.
 - `K2Bi-Vault/wiki/planning/feature_engine-vault-snapshots.md` -- F2 and F5 land in that build session.
 - `wiki/concepts/feature_invest-coach-cycle5-helper-schema-reconciliation.md` -- separate feature, parallel-session scope, also captures infrastructure drift surfaced 2026-05-08; cross-reference both notes during the discipline-cleanup pass to avoid double-fix or scope leakage. (Forward reference: this note may not yet exist; the parallel session is creating it.)
 
