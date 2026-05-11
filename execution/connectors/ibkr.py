@@ -425,6 +425,13 @@ class IBKRConnector:
         cancel another account's DAY order if it happens to share a
         `k2bi:` prefix. Engine enforcement hangs on isolating this
         account's own activity.
+
+        Spec B §5: a clientId=99 MasterClientID session can use
+        `reqAllOpenOrders()` for cross-client visibility, but IBKR still
+        binds `cancelOrder()` to the original placing clientId. Surgical
+        orphan cleanup must reconnect on that placing clientId; only
+        `reqGlobalCancel()` can cancel across clients, and that is too
+        broad for per-order cleanup.
         """
         self._require_connected()
         try:

@@ -214,29 +214,46 @@ For the engine-recovery path (where a pre-existing position needs a protective s
 
 ---
 
-## 5. MasterClientId Follow-Up (gateway-side config)
+## 5. P0 Defense 5 - MasterClientID=99 for Cross-Client Visibility (docs + config only)
 
-### Defect
+### Original spec assumption (FALSIFIED 2026-05-11 by live paper test)
 
-During the orphan-STP cleanup on 2026-05-09, operator (clientId=99) could not cancel orders bound to clientId=1 without using a one-time clientId=1 escape hatch. This is operationally fragile.
+The original §5 assumed MasterClientID=99 grants clientId=99 cross-client `cancelOrder()` authority. Live paper test on 2026-05-11 disproved the cancel half: clientId 88 placed a non-marketable order; clientId 99 saw it via `reqAllOpenOrders()` ✓ but `cancelOrder()` from clientId 99 failed with IBKR error 10147. Cleanup via the original placing clientId 88 succeeded. IBKR API docs confirm: `cancelOrder` is bound to the placing clientId; `reqGlobalCancel` cancels all open orders (too blunt for per-order use). Sources: https://interactivebrokers.github.io/tws-api/cancel_order.html + https://interactivebrokers.github.io/tws-api/open_orders.html + https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/.
+
+### Corrected scope (what §5 actually ships)
+
+MasterClientID=99 is a **visibility-only** facility, not a cleanup facility. It gives a privileged read connection that sees orders placed by ALL clientIds - which is what's needed to detect the 5/8-style orphan condition (11 standalone STPs bound to clientId=1 that were invisible to per-client `openTrades()` queries). Cancellation of detected orphans MUST be done via the original placing clientId, via a temporary `ib_async` connection on that clientId.
 
 ### Fix
 
-Configure `MasterClientID=99` on IB Gateway so operator clientId=99 has read+cancel privileges across all client IDs without impersonating clientId=1.
+1. Set `MasterClientID=99` on VPS IB Gateway: edit `/home/ibgateway/ibc/config.ini`, restart `ib-gateway.service`. On the current IBC-managed VPS install, the config key that sets the Gateway Master Client ID is `OverrideTwsMasterClientID=99`.
+2. Document the visibility-only behavior + per-clientId-cancel reality in this spec section + in `wiki/concepts/feature_k2bi-discipline-cleanup.md` "Known §5 limitations" section.
+3. Engine code change: NONE. §5 is config + docs only.
+4. Cleanup tooling for detected orphans: DEFERRED to post-Spec-B follow-up (`wiki/concepts/feature_orphan-order-cleanup-tool.md`, status: backlog). The follow-up tool will accept an orphan's placing clientId from `reqAllOpenOrders()` output, spawn a temporary connection on that clientId, cancel surgically, disconnect.
 
-**Value locked: 99.** Rationale: `scripts/gateway-query.sh` already defaults to 99 and operator muscle memory uses 99 for cross-client cancellation work. Switching to 90 would force a config edit + script default change + CLAUDE.md taxonomy update + operator retraining for zero safety benefit. The convention "0 reserved, 1 = engine, 90-98 = ad-hoc, 99 = master" reads cleanly with the highest client ID in the operator range serving as master.
+### Operator-side cleanup procedure (interim, until follow-up tool ships)
 
-### Implementation
+If an orphan order is detected via `reqAllOpenOrders()`:
 
-- Edit `/home/ibgateway/ibc/config.ini` on Hostinger VPS: add `MasterClientID=99`.
-- Document restart procedure in `wiki/context/context_ibkr-secondary-user-vps.md`.
-- Verify `scripts/gateway-query.sh` default clientId is 99 (already is); no script change needed.
-- Update CLAUDE.md File Conventions section: "clientId 1 = engine reserved; clientId 90-98 = ad-hoc / backtest; clientId 99 = MasterClientID (configured on IB Gateway) = operator read+cancel privileges across all clients."
+```python
+from ib_async import IB
+cleanup_ib = IB()
+cleanup_ib.connect("127.0.0.1", 4002, clientId=<orphan_placing_clientId>)
+for trade in cleanup_ib.openTrades():
+    if <match condition>:
+        cleanup_ib.cancelOrder(trade.order)
+cleanup_ib.disconnect()
+```
 
 ### Tests
 
-- Manual operator test: with engine OFF, place a test order under simulated clientId=88; connect from clientId=99 (MasterClientID); assert `reqAllOpenOrders()` lists the order AND `cancelOrder(test_order.orderId)` succeeds. Document in `wiki/context/context_ibkr-secondary-user-vps.md`.
-- No automated test (config-side change, not code).
+`tests/test_engine_master_client_id.py`:
+
+M1 (config-presence, operator-verified): verified by §7 engine-re-enable-checklist via `ssh hostinger 'grep MasterClientID /home/ibgateway/ibc/config.ini'`. No CI pytest assertion (config lives on VPS, not in repo).
+
+M2 (visibility-confirmation contract): inline comment in `execution/connectors/ibkr.py` documents that clientId 99 connections see all orders via `reqAllOpenOrders()` but can only cancel their own orders. Behavior contract documented in code, not test-enforced.
+
+DROP the cross-client cancel red test from commit `da63664` - it tested a falsified assumption.
 
 ---
 
@@ -265,7 +282,7 @@ Address all seven findings tracked in `wiki/concepts/feature_k2bi-discipline-cle
 3. §2 order dedup (red-then-green tests; Codex review).
 4. §3 rapid-fire circuit breaker (red-then-green tests; Codex review).
 5. §4 child-stop attachment (red-then-green tests; Codex review).
-6. §5 MasterClientId config (operator + manual test; doc commit).
+6. §5 MasterClientID=99 visibility config (operator-verified config + docs; no cross-client cancel test).
 7. §6 deferred findings F1, F3, F4, F6, F7 (each its own commit; F2 + F5 are pointers; F4 path is locked to option A).
 8. Engine re-enable: `sudo systemctl enable --now k2bi-engine` on Hostinger VPS, with ~/Projects/K2Bi-Vault/System/.killed verified absent and `wiki/log.md` line written.
 
@@ -280,7 +297,8 @@ Address all seven findings tracked in `wiki/concepts/feature_k2bi-discipline-cle
 
 - [ ] All §1-§4 red-then-green tests pass in CI.
 - [ ] Full pytest suite green (`pytest tests/`).
-- [ ] §5 MasterClientId verified via manual operator test.
+- [ ] §5 MasterClientID=99 visibility config verified via `ssh hostinger 'grep MasterClientID /home/ibgateway/ibc/config.ini'` (expected active IBC key: `OverrideTwsMasterClientID=99`) and `systemctl status ib-gateway.service` active with uptime since the config edit.
+- [ ] `wiki/concepts/feature_k2bi-discipline-cleanup.md` has an accurate "Known §5 limitations" section.
 - [ ] §0 pre-open re-verify state has not drifted (re-run `gateway-query.sh` clientId=99 on the day of re-enable).
 - [ ] `wiki/log.md` line written via `scripts/wiki-log-append.sh`.
 - [ ] DEVLOG.md entry appended.
