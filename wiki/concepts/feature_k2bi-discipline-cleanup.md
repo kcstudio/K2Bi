@@ -79,7 +79,7 @@ Residual TOCTOU window (~50-100ms between second `get_positions()` and broker `p
 
 ## Known §5 limitations
 
-MasterClientID=99 visibility does NOT extend to cancellation. Operators detecting an orphan must identify the placing clientId from `reqAllOpenOrders()` and spawn a temporary connection on that clientId to cancel.
+MasterClientID=99 visibility does NOT extend to cancellation. On the current IBC-managed VPS install, the config key is `OverrideTwsMasterClientID=99`; the operator-facing Gateway setting is MasterClientID=99. Operators detecting an orphan must identify the placing clientId from `reqAllOpenOrders()` and spawn a temporary connection on that clientId to cancel.
 
 The 5/8 incident's "11 orphan STPs cancelled via bounded clientId=1 exception" pattern remains the canonical cleanup path until the post-Spec-B orphan-cleanup tool ships.
 

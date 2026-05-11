@@ -25,6 +25,32 @@ Spec B §5 live testing on 2026-05-11 falsified the assumption that MasterClient
 
 Given a detected orphan order's placing clientId from `reqAllOpenOrders()`, the tool opens a temporary `ib_async` connection on that clientId, matches the exact orphan order, cancels it, and disconnects.
 
+## Interface Contract
+
+Planned CLI:
+
+```bash
+scripts/orphan-order-cleanup.py --client-id 88 --perm-id 123456789 --confirm
+```
+
+Required arguments:
+
+- `--client-id`: original placing clientId reported by `reqAllOpenOrders()`.
+- `--perm-id`: broker permId for the exact orphan order to cancel. If permId is unavailable, use `--order-id` plus `--order-ref`.
+- `--confirm`: required for live cancellation. Without it, the tool runs dry-run only.
+
+Input source:
+
+- The operator supplies values from a `reqAllOpenOrders()` visibility query.
+- Minimum required fields: symbol, action, orderType, totalQuantity, auxPrice or lmtPrice, tif, permId, orderId, orderRef, clientId, status.
+
+Exit codes:
+
+- `0`: exact order matched, cancel submitted, terminal cancelled state observed or order absent on follow-up.
+- `1`: exact order not found, no cancellation submitted.
+- `2`: ambiguous match, no cancellation submitted.
+- `3`: broker/API failure after cancellation attempt; operator must re-query before retry.
+
 Binary MVP test:
 
 1. Simulate an orphan on clientId 88.

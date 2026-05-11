@@ -235,15 +235,11 @@ MasterClientID=99 is a **visibility-only** facility, not a cleanup facility. It 
 
 If an orphan order is detected via `reqAllOpenOrders()`:
 
-```python
-from ib_async import IB
-cleanup_ib = IB()
-cleanup_ib.connect("127.0.0.1", 4002, clientId=<orphan_placing_clientId>)
-for trade in cleanup_ib.openTrades():
-    if <match condition>:
-        cleanup_ib.cancelOrder(trade.order)
-cleanup_ib.disconnect()
-```
+1. Do not use `reqGlobalCancel()` for normal cleanup.
+2. Do not use clientId 99 for targeted cancellation.
+3. Record the orphan's symbol, action, order type, quantity, stop or limit price, permId, orderId, orderRef, and placing clientId from `reqAllOpenOrders()`.
+4. Use the deferred cleanup tool once it ships. Until then, cleanup is an operator-run incident procedure that must include exact permId or orderId confirmation, dry-run review, `try/finally` disconnect handling, and a `wiki/log.md` audit line.
+5. If the cleanup cannot be performed surgically, stop and keep the engine disabled.
 
 ### Tests
 
@@ -297,6 +293,7 @@ Address all seven findings tracked in `wiki/concepts/feature_k2bi-discipline-cle
 
 - [ ] All §1-§4 red-then-green tests pass in CI.
 - [ ] Full pytest suite green (`pytest tests/`).
+- [ ] Before any `ib-gateway.service` restart for §5 config maintenance: verify `k2bi-engine.service` is inactive AND disabled, and verify `~/Projects/K2Bi-Vault/System/.killed` is absent.
 - [ ] §5 MasterClientID=99 visibility config verified via `ssh hostinger 'grep MasterClientID /home/ibgateway/ibc/config.ini'` (expected active IBC key: `OverrideTwsMasterClientID=99`) and `systemctl status ib-gateway.service` active with uptime since the config edit.
 - [ ] `wiki/concepts/feature_k2bi-discipline-cleanup.md` has an accurate "Known §5 limitations" section.
 - [ ] §0 pre-open re-verify state has not drifted (re-run `gateway-query.sh` clientId=99 on the day of re-enable).
