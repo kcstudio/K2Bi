@@ -1,3 +1,27 @@
+## 2026-05-11 -- Spec B engine-discipline cleanup shipped through operator re-enable runbook
+
+**Scope:** Landed Spec B sections 1 through 7 without re-enabling the engine. This final pass closed Section 6 deferred findings F1, F3, F4, F6, and F7, then added the Section 7 operator-only engine re-enable checklist.
+
+**Key shipped changes:**
+- `scripts/gateway-query.sh` now blocks `clientId=1`, leases operator clientIds 90-99 through `scripts/lib/clientid_allocator.py`, blocks accidental skill invocations via `CLAUDE_CODE_SKILL_INVOCATION`, and documents that the host/override guard is an accidental-misuse rail, not an authentication boundary.
+- `scripts/lib/clientid_allocator.py` uses a flocked lease directory, tracks owner PIDs, immediately reclaims dead-owner leases, reclaims malformed lease files, and surfaces release failures.
+- `.claude/skills/invest-ship/SKILL.md` no longer lets new architectural principles, conventions, or invariants use the review-skip exception.
+- `review/` is no longer gitignored, and the existing approved G whitelist proposal is tracked so Check C can see proposal artifacts.
+- L-2026-05-08-002 now has concrete IBKR migration liveness and Syncthing liveness examples in the vault memory and policy ledger.
+- `wiki/runbooks/spec-b-engine-reenable-checklist.md` is the operator-only runbook. It keeps both names visible: `OverrideTwsMasterClientID=99` is the IBC config key, and MasterClientID=99 is the operator-facing Gateway setting.
+
+**Review loop:** Kimi approved Section 5. For Section 6, Kimi reached the 3-round iteration cap. Codex self-judged remaining tactical findings per operator authorization, accepted concrete allocator/release fixes, and documented rejected scope expansions in:
+- `.code-reviews/spec-b-section6-round1-response.md`
+- `.code-reviews/spec-b-section6-round2-response.md`
+- `.code-reviews/spec-b-section6-round3-response.md`
+
+**Verification:**
+- Section 6 closure: `pytest tests/ -q` returned `1577 passed, 1 skipped, 2 warnings, 33 subtests passed`.
+- Fresh Section 0 broker recheck after Section 6 closure commit `4566b69`: G qty 71, avgCost 32.7840873, exactly one G open STP SELL qty 71 @30, no Spec B test orders, `k2bi-engine` inactive and disabled, `.killed` absent.
+- Section 7 red test `0021b37` failed before the runbook existed; runbook implementation `96f68aa` made `tests/test_engine_reenable_runbook.py` pass.
+
+**Operational status:** Engine remains OFF. Codex did not run `sudo systemctl enable --now k2bi-engine`; the final command is operator-only per `wiki/runbooks/spec-b-engine-reenable-checklist.md`.
+
 ## 2026-05-09 -- ENGINE STOPPED + DISABLED; G strategy in 11x oversize state pending Monday revert
 
 **Status:** Operational incident response. No commit yet (this entry documents the action; the dedup-bug fix + the revert audit-trail capture are separate future commits).
