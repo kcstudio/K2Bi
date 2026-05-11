@@ -254,7 +254,9 @@ def pending_order_map_from_journal(
 
         if event_type == "order_filled":
             if not broker_order_id:
-                continue
+                raise JournalReplayMalformedJsonError(
+                    "order_filled missing broker_order_id"
+                )
             payload = record.get("payload")
             remaining_qty = (
                 payload.get("remaining_qty") if isinstance(payload, dict) else None

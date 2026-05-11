@@ -481,6 +481,27 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured, [startup_now])
 
+    async def test_d4i_order_filled_missing_broker_order_id_fails_closed(
+        self,
+    ) -> None:
+        await self._patch_now(_mid_session_utc())
+        self.journal.path_for_today().write_text(
+            _raw_record(event_type="order_submitted") + "\n"
+            + _raw_record(
+                event_type="order_filled",
+                broker_order_id=None,
+                payload={
+                    "remaining_qty": "0",
+                    "cumulative_filled_qty": 10,
+                },
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(JournalReplayMalformedJsonError):
+            await self.engine.tick_once()
+
     async def test_d5_cross_strategy_pending_order_does_not_block_submit(self) -> None:
         _write_strategy(self.strategies_dir, name="spy-secondary")
         await self._init_engine()
