@@ -42,6 +42,7 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -111,6 +112,10 @@ DEFAULT_REGIME_FILE = (
     Path.home() / "Projects" / "K2Bi-Vault" / "wiki" / "regimes" / "current.md"
 )
 
+DEFAULT_RAPID_FIRE_CLEAR_PATH = (
+    Path.home() / "Projects" / "K2Bi-Vault" / "System" / ".rapid-fire-cleared.json"
+)
+
 
 class EngineState(str, Enum):
     INIT = "init"
@@ -175,6 +180,7 @@ class EngineConfig:
     # startup with sys.exit(78). See execution.engine.recovery for
     # the parser + adoption logic.
     adopt_orphan_stop_env: str = recovery_mod.ADOPT_ORPHAN_STOP_ENV
+    rapid_fire_clear_path: Path | None = None
     # Q33 (2026-04-21): wall-clock window `run_once()` waits for
     # broker terminal status after the submit body leaves the engine
     # in AWAITING_FILL. Covers the Session F fill-callback race where
@@ -280,6 +286,14 @@ class Engine:
     _positions: list[BrokerPosition] = field(default_factory=list)
     _pending_order: AwaitingOrderState | None = None
     _pending_orders: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    _rapid_fire_window: dict[tuple[str, str], deque[datetime]] = field(
+        default_factory=dict
+    )
+    _rapid_fire_halted: dict[tuple[str, str], int] = field(default_factory=dict)
+    _rapid_fire_trip_counters: dict[tuple[str, str], int] = field(
+        default_factory=dict
+    )
+    _rapid_fire_consumed_clears: set[tuple[int, str]] = field(default_factory=set)
 
     # connection tracking
     _reconnect_attempts: int = 0
@@ -668,6 +682,7 @@ class Engine:
         )
         journal_tail = extended_checkpoints + narrow_journal_tail
         self._refresh_pending_orders_from_journal(now=startup_now)
+        self._refresh_rapid_fire_state_from_journal(now=startup_now)
 
         # Codex round-3 P2: the EngineConfig-configurable override env
         # name must actually be consulted by reconcile(); otherwise a
@@ -1095,6 +1110,8 @@ class Engine:
         if self.state == EngineState.DISCONNECTED:
             return
 
+        self._process_rapid_fire_clear_sentinel()
+
         # EOD boundary (once per UTC day).
         if self._eod_due():
             await self._run_eod(result)
@@ -1185,7 +1202,9 @@ class Engine:
             current_marks=marks,
         )
         market = MarketSnapshot(ts=now, marks=marks, account_value=account.net_liquidation)
-        self._refresh_pending_orders_from_journal(now=now)
+        journal_records = self._read_recent_strict_journal(now)
+        self._refresh_pending_orders_from_journal(now=now, records=journal_records)
+        self._refresh_rapid_fire_state_from_journal(now=now, records=journal_records)
 
         for snap in self._strategies:
             # R2-minimax P2: retirement sentinel check runs BEFORE the
@@ -1265,6 +1284,25 @@ class Engine:
                         "pending_order_id": pending_order_ids[0],
                         "pending_order_ids": pending_order_ids,
                         "pending_order_count": len(pending_order_ids),
+                        "cycle_id": trade_id,
+                    },
+                    strategy=snap.name,
+                    trade_id=trade_id,
+                    ticker=decision.candidate.ticker.upper(),
+                    side=decision.candidate.side,
+                    qty=decision.candidate.qty,
+                )
+                continue
+            rapid_trip_id = self._rapid_fire_halt_trip_id(
+                snap.name, decision.candidate.ticker
+            )
+            if rapid_trip_id is not None:
+                self.journal.append(
+                    "cycle_skipped_rapid_fire_halt",
+                    payload={
+                        "strategy_id": snap.name,
+                        "symbol": decision.candidate.ticker.upper(),
+                        "trip_id": rapid_trip_id,
                         "cycle_id": trade_id,
                     },
                     strategy=snap.name,
@@ -1370,23 +1408,288 @@ class Engine:
             if self._pending_order is not None:
                 break
 
-    def _refresh_pending_orders_from_journal(self, now: datetime | None = None) -> None:
+    def _read_recent_strict_journal(self, now: datetime) -> list[dict[str, Any]]:
+        if now.tzinfo is None:
+            raise ValueError("journal replay clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
         records: list[dict[str, Any]] = []
+        for day_offset in (2, 1, 0):
+            records.extend(
+                self.journal.read_all_strict(now - timedelta(days=day_offset))
+            )
+        return records
+
+    def _refresh_pending_orders_from_journal(
+        self,
+        now: datetime | None = None,
+        *,
+        records: list[dict[str, Any]] | None = None,
+    ) -> None:
         if now is None:
             now = datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("pending-order replay clock must be timezone-aware")
         now = now.astimezone(timezone.utc)
-        for day_offset in (2, 1, 0):
-            records.extend(
-                self.journal.read_all_strict(now - timedelta(days=day_offset))
-            )
+        if records is None:
+            records = self._read_recent_strict_journal(now)
         self._pending_orders = strategy_runner.pending_order_map_from_journal(records)
 
     def _pending_orders_for_strategy(self, strategy_id: str, symbol: str) -> list[str]:
         return sorted(
             self._pending_orders.get((strategy_id, symbol.upper()), set())
         )
+
+    def _rapid_fire_limits(self) -> tuple[int, int]:
+        raw = self.validator_config.get("rapid_fire_circuit_breaker", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        max_orders = int(raw.get("max_orders_per_window", 3))
+        window_seconds = int(raw.get("window_seconds", 60))
+        if max_orders <= 0 or window_seconds <= 0:
+            raise ValueError("rapid_fire_circuit_breaker values must be positive")
+        return max_orders, window_seconds
+
+    def _rapid_fire_clear_path(self) -> Path:
+        if self.engine_config.rapid_fire_clear_path is not None:
+            return self.engine_config.rapid_fire_clear_path
+        if self.engine_config.kill_path is not None:
+            return Path(self.engine_config.kill_path).parent / ".rapid-fire-cleared.json"
+        return DEFAULT_RAPID_FIRE_CLEAR_PATH
+
+    def _rapid_fire_key(self, strategy_id: str, symbol: str) -> tuple[str, str]:
+        return (strategy_id, symbol.upper())
+
+    def _rapid_fire_halt_trip_id(self, strategy_id: str, symbol: str) -> int | None:
+        return self._rapid_fire_halted.get(self._rapid_fire_key(strategy_id, symbol))
+
+    def _refresh_rapid_fire_state_from_journal(
+        self,
+        now: datetime | None = None,
+        *,
+        records: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if now is None:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("rapid-fire replay clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        if records is None:
+            records = self._read_recent_strict_journal(now)
+
+        max_orders, window_seconds = self._rapid_fire_limits()
+        cutoff = now - timedelta(seconds=window_seconds)
+        windows: dict[tuple[str, str], deque[datetime]] = {}
+        halted: dict[tuple[str, str], int] = {}
+        counters: dict[tuple[str, str], int] = {}
+        consumed: set[tuple[int, str]] = set()
+
+        for record in records:
+            event_type = record.get("event_type")
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            key = self._rapid_fire_record_key(record, payload)
+            if event_type == "order_submitted" and key is not None:
+                ts = _parse_journal_ts(record.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+                bucket = windows.setdefault(key, deque())
+                bucket.append(ts)
+                while bucket and bucket[0] < cutoff:
+                    bucket.popleft()
+                if len(bucket) > max_orders and key not in halted:
+                    counters[key] = counters.get(key, 0) + 1
+                    halted[key] = counters[key]
+                continue
+
+            if event_type == "circuit_breaker_tripped_rapid_fire" and key is not None:
+                trip_id = _coerce_positive_int(payload.get("trip_id"))
+                if trip_id is None:
+                    continue
+                counters[key] = max(counters.get(key, 0), trip_id)
+                halted[key] = trip_id
+                continue
+
+            if event_type == "circuit_breaker_cleared":
+                trip_id = _coerce_positive_int(payload.get("trip_id"))
+                clear_nonce = payload.get("clear_nonce")
+                if trip_id is not None and isinstance(clear_nonce, str) and clear_nonce:
+                    consumed.add((trip_id, clear_nonce))
+                for clear_key in _rapid_fire_payload_keys(payload):
+                    if trip_id is not None and halted.get(clear_key) == trip_id:
+                        halted.pop(clear_key, None)
+
+        self._rapid_fire_window = windows
+        self._rapid_fire_halted = halted
+        self._rapid_fire_trip_counters = counters
+        self._rapid_fire_consumed_clears = consumed
+
+    def _rapid_fire_record_key(
+        self, record: dict[str, Any], payload: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        strategy_id = payload.get("strategy_id") or record.get("strategy")
+        symbol = payload.get("symbol") or record.get("ticker")
+        if not isinstance(strategy_id, str) or not strategy_id:
+            return None
+        if not isinstance(symbol, str) or not symbol:
+            return None
+        return self._rapid_fire_key(strategy_id, symbol)
+
+    def _record_rapid_fire_submission(
+        self,
+        *,
+        strategy_id: str,
+        symbol: str,
+        submitted_at: datetime,
+        cycle_id: str,
+    ) -> None:
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+        submitted_at = submitted_at.astimezone(timezone.utc)
+        max_orders, window_seconds = self._rapid_fire_limits()
+        key = self._rapid_fire_key(strategy_id, symbol)
+        window = self._rapid_fire_window.setdefault(key, deque())
+        window.append(submitted_at)
+        cutoff = submitted_at - timedelta(seconds=window_seconds)
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) <= max_orders or key in self._rapid_fire_halted:
+            return
+
+        trip_id = self._rapid_fire_trip_counters.get(key, 0) + 1
+        self._rapid_fire_trip_counters[key] = trip_id
+        self._rapid_fire_halted[key] = trip_id
+        self.journal.append(
+            "circuit_breaker_tripped_rapid_fire",
+            payload={
+                "strategy_id": strategy_id,
+                "symbol": symbol.upper(),
+                "trip_id": trip_id,
+                "cycle_id": cycle_id,
+                "submission_timestamps": [
+                    ts.isoformat(timespec="microseconds") for ts in window
+                ],
+                "max_orders_per_window": max_orders,
+                "window_seconds": window_seconds,
+            },
+            strategy=strategy_id,
+            trade_id=cycle_id,
+            ticker=symbol.upper(),
+        )
+
+    def _process_rapid_fire_clear_sentinel(self) -> None:
+        path = self._rapid_fire_clear_path()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_constant=reject_non_finite_json_constant,
+            )
+            if not isinstance(raw, dict):
+                raise ValueError("sentinel root must be object")
+            clear_nonce = raw.get("clear_nonce")
+            trip_id = _coerce_positive_int(raw.get("trip_id"))
+            operator_ts = raw.get("operator_ts") or raw.get("operator_timestamp")
+            keys = _rapid_fire_payload_keys(raw)
+            if not isinstance(clear_nonce, str) or not clear_nonce:
+                raise ValueError("clear_nonce must be non-empty string")
+            if trip_id is None:
+                raise ValueError("trip_id must be positive int")
+            if not isinstance(operator_ts, str) or not operator_ts:
+                raise ValueError("operator_ts must be non-empty string")
+            if not keys:
+                raise ValueError("keys must contain at least one target")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.journal.append(
+                "circuit_breaker_cleared_malformed_sentinel",
+                payload={
+                    "path": str(path),
+                    "error": str(exc),
+                    "telegram_alert_required": True,
+                },
+            )
+            return
+
+        if (trip_id, clear_nonce) in self._rapid_fire_consumed_clears:
+            newer_active = [
+                key
+                for key in keys
+                if self._rapid_fire_halted.get(key) not in (None, trip_id)
+            ]
+            if newer_active:
+                self.journal.append(
+                    "circuit_breaker_cleared_stale_sentinel_rejected",
+                    payload={
+                        "path": str(path),
+                        "trip_id": trip_id,
+                        "clear_nonce": clear_nonce,
+                        "keys": _rapid_fire_keys_payload(keys),
+                        "active_trip_ids": {
+                            f"{strategy_id}:{symbol}": self._rapid_fire_halted.get(
+                                (strategy_id, symbol)
+                            )
+                            for strategy_id, symbol in keys
+                        },
+                        "telegram_alert_required": True,
+                    },
+                )
+                self._delete_rapid_fire_clear_sentinel(path)
+                return
+            self.journal.append(
+                "circuit_breaker_cleared_stale_sentinel_ignored",
+                payload={
+                    "path": str(path),
+                    "trip_id": trip_id,
+                    "clear_nonce": clear_nonce,
+                    "keys": _rapid_fire_keys_payload(keys),
+                },
+            )
+            self._delete_rapid_fire_clear_sentinel(path)
+            return
+
+        mismatched = [
+            key for key in keys if self._rapid_fire_halted.get(key) != trip_id
+        ]
+        if mismatched:
+            self.journal.append(
+                "circuit_breaker_cleared_stale_sentinel_rejected",
+                payload={
+                    "path": str(path),
+                    "trip_id": trip_id,
+                    "clear_nonce": clear_nonce,
+                    "keys": _rapid_fire_keys_payload(keys),
+                    "active_trip_ids": {
+                        f"{strategy_id}:{symbol}": self._rapid_fire_halted.get(
+                            (strategy_id, symbol)
+                        )
+                        for strategy_id, symbol in keys
+                    },
+                    "telegram_alert_required": True,
+                },
+            )
+            self._delete_rapid_fire_clear_sentinel(path)
+            return
+
+        self.journal.append(
+            "circuit_breaker_cleared",
+            payload={
+                "trip_id": trip_id,
+                "clear_nonce": clear_nonce,
+                "operator_ts": operator_ts,
+                "keys": _rapid_fire_keys_payload(keys),
+            },
+        )
+        self._rapid_fire_consumed_clears.add((trip_id, clear_nonce))
+        for key in keys:
+            self._rapid_fire_halted.pop(key, None)
+        self._delete_rapid_fire_clear_sentinel(path)
+
+    def _delete_rapid_fire_clear_sentinel(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
 
     async def _skip_buy_for_existing_position(
         self,
@@ -1657,6 +1960,12 @@ class Engine:
         self._pending_orders.setdefault(
             (snap.name, order.ticker.upper()), set()
         ).add(ack.broker_order_id)
+        self._record_rapid_fire_submission(
+            strategy_id=snap.name,
+            symbol=order.ticker,
+            submitted_at=ack.submitted_at,
+            cycle_id=trade_id,
+        )
         if ack.warnings:
             # Write .killed so no further orders go out until a human
             # reviews + re-protects the position.
@@ -2411,6 +2720,7 @@ def _engine_config_from_dict(raw: dict[str, Any]) -> EngineConfig:
         return EngineConfig()
     strategies_dir = raw.get("strategies_dir")
     regime_file = raw.get("regime_file")
+    rapid_fire_clear_path = raw.get("rapid_fire_clear_path")
     # Codex round-7 P2: propagate the override env name through YAML
     # too. Prior implementation dropped `allow_recovery_mismatch_env`
     # and reverted to the default, making the config ineffective in
@@ -2438,6 +2748,9 @@ def _engine_config_from_dict(raw: dict[str, Any]) -> EngineConfig:
             Path(raw["retired_dir"]) if raw.get("retired_dir") else None
         ),
         allow_recovery_mismatch_env=str(override_env_name),
+        rapid_fire_clear_path=(
+            Path(rapid_fire_clear_path) if rapid_fire_clear_path else None
+        ),
         # Q33 (2026-04-21): deployments can tune the --once pre-exit
         # barrier via YAML. EngineConfig.__post_init__ clamps any
         # oversized value at ONCE_EXIT_WAIT_SECONDS_MAX so a typo in
@@ -2610,6 +2923,54 @@ def _read_extended_checkpoints(
             out.append(rec)
     out.sort(key=lambda r: str(r.get("ts", "")))
     return out
+
+
+def _parse_journal_ts(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _coerce_positive_int(raw: Any) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _rapid_fire_payload_keys(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    raw_keys = payload.get("keys")
+    out: list[tuple[str, str]] = []
+    if isinstance(raw_keys, list):
+        for item in raw_keys:
+            if not isinstance(item, dict):
+                continue
+            strategy_id = item.get("strategy_id")
+            symbol = item.get("symbol")
+            if isinstance(strategy_id, str) and strategy_id and isinstance(symbol, str) and symbol:
+                out.append((strategy_id, symbol.upper()))
+    else:
+        strategy_id = payload.get("strategy_id")
+        symbol = payload.get("symbol")
+        if isinstance(strategy_id, str) and strategy_id and isinstance(symbol, str) and symbol:
+            out.append((strategy_id, symbol.upper()))
+    return out
+
+
+def _rapid_fire_keys_payload(keys: list[tuple[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"strategy_id": strategy_id, "symbol": symbol.upper()}
+        for strategy_id, symbol in keys
+    ]
 
 
 def _validate_journal_view(journal_view: dict[str, Any]) -> dict[str, Any] | None:

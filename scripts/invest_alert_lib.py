@@ -44,6 +44,9 @@ STATE_FILE_NAME = "alert-state.json"
 # ---------------------------------------------------------------------------
 
 TIER_1_EVENTS = frozenset({
+    "circuit_breaker_cleared_malformed_sentinel",
+    "circuit_breaker_cleared_stale_sentinel_rejected",
+    "circuit_breaker_tripped_rapid_fire",
     "cycle_skipped_position_query_failed",
     "engine_stopped",
     "recovery_state_mismatch",
@@ -323,6 +326,31 @@ def _build_position_query_failed_alert(event: dict[str, Any]) -> Alert:
     )
 
 
+def _build_rapid_fire_alert(event: dict[str, Any]) -> Alert:
+    payload = event.get("payload") or {}
+    event_type = event.get("event_type", "")
+    symbol = payload.get("symbol", event.get("ticker", "?"))
+    strategy_id = payload.get("strategy_id", event.get("strategy", "?"))
+    trip_id = payload.get("trip_id", "?")
+    msg = (
+        f"🔴 T1: {event_type}\n"
+        f"{strategy_id} {symbol} trip_id={trip_id}\n"
+        f"Operator review required before re-arm."
+    )
+    return Alert(
+        tier=1,
+        event_type=event_type,
+        journal_entry_id=event["journal_entry_id"],
+        ts=event["ts"],
+        message=msg,
+        context={
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "trip_id": trip_id,
+        },
+    )
+
+
 def _build_order_filled_alert(event: dict[str, Any]) -> Alert:
     payload = event.get("payload") or {}
     ticker = payload.get("ticker", "?")
@@ -463,6 +491,12 @@ def classify_events(
                 alerts.append(_build_recovery_mismatch_alert(ev))
             elif event_type == "cycle_skipped_position_query_failed":
                 alerts.append(_build_position_query_failed_alert(ev))
+            elif event_type in {
+                "circuit_breaker_cleared_malformed_sentinel",
+                "circuit_breaker_cleared_stale_sentinel_rejected",
+                "circuit_breaker_tripped_rapid_fire",
+            }:
+                alerts.append(_build_rapid_fire_alert(ev))
             continue
 
         if event_type in TIER_2_EVENTS:

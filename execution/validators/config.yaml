@@ -38,3 +38,10 @@ instrument_whitelist:
   symbols:
     - SPY
     - G
+
+rapid_fire_circuit_breaker:
+  # Spec B §3: normal cadence is one submit about every 31 seconds per
+  # strategy. More than 3 same-key submits inside 60 seconds indicates a
+  # tight retry loop or queue drain and halts that strategy/symbol key.
+  max_orders_per_window: 3
+  window_seconds: 60

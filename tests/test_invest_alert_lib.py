@@ -142,6 +142,42 @@ class Tier1OtherTests(unittest.TestCase):
         self.assertIn("SPY", alerts[0].message)
         self.assertIn("pre_submit_recheck", alerts[0].message)
 
+    def test_rapid_fire_trip_fires_alert(self):
+        ev = _event(
+            "circuit_breaker_tripped_rapid_fire",
+            "id13",
+            payload={
+                "strategy_id": "g-2026-05",
+                "symbol": "G",
+                "trip_id": 1,
+            },
+        )
+        alerts, _ = ial.classify_events([ev], ial.ClassifierState(), threshold=300)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].tier, 1)
+        self.assertEqual(alerts[0].event_type, "circuit_breaker_tripped_rapid_fire")
+        self.assertIn("g-2026-05", alerts[0].message)
+        self.assertIn("trip_id=1", alerts[0].message)
+
+    def test_rapid_fire_stale_sentinel_rejected_fires_alert(self):
+        ev = _event(
+            "circuit_breaker_cleared_stale_sentinel_rejected",
+            "id14",
+            payload={
+                "strategy_id": "g-2026-05",
+                "symbol": "G",
+                "trip_id": 1,
+            },
+        )
+        alerts, _ = ial.classify_events([ev], ial.ClassifierState(), threshold=300)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].tier, 1)
+        self.assertEqual(
+            alerts[0].event_type,
+            "circuit_breaker_cleared_stale_sentinel_rejected",
+        )
+        self.assertIn("Operator review required", alerts[0].message)
+
 
 # ---------------------------------------------------------------------------
 # Tier 2 -- order / kill events

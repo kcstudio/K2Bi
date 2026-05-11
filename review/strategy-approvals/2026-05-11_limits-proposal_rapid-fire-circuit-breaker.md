@@ -3,11 +3,11 @@ tags: [review, strategy-approvals, limits-proposal]
 date: 2026-05-11
 type: limits-proposal
 origin: k2bi-generate
-status: proposed
+status: approved
 applies-to: execution/validators/config.yaml
 up: "[[index]]"
-approved_at:
-approved_commit_sha:
+approved_at: 2026-05-11T01:58:06Z
+approved_commit_sha: pending-this-commit
 ---
 
 # Limits Proposal: rapid-fire circuit breaker
@@ -58,4 +58,4 @@ rapid_fire_circuit_breaker:
 
 ## Approval
 
-Pending Keith's review. Apply with the Spec B §3 implementation commit so the proposal transitions from proposed to approved in the same commit as the `execution/validators/config.yaml` edit.
+Approved by operator-authorized Spec B §3 implementation flow. This proposal transitions from proposed to approved in the same commit as the `execution/validators/config.yaml` edit.

@@ -132,12 +132,24 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_2 = frozenset(
     }
 )
 
+EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_3 = frozenset(
+    {
+        "circuit_breaker_tripped_rapid_fire",
+        "cycle_skipped_rapid_fire_halt",
+        "circuit_breaker_cleared",
+        "circuit_breaker_cleared_malformed_sentinel",
+        "circuit_breaker_cleared_stale_sentinel_ignored",
+        "circuit_breaker_cleared_stale_sentinel_rejected",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
     | EVENT_TYPES_V2_ADDITIVE_Q42
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_1
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_2
+    | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_3
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
