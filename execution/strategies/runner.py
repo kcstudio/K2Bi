@@ -28,7 +28,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..engine.recovery_context import is_recovery_context_token
-from ..journal.schema import JournalReplayMalformedJsonError
+from ..journal.schema import (
+    JournalReplayMalformedJsonError,
+    validate_protective_stop_attached_payload,
+    validate_protective_stop_attach_refused_drift_payload,
+    validate_protective_stop_attach_refused_no_context_payload,
+)
 from ..journal.writer import JournalWriter
 from ..risk import cash_only
 from ..validators.types import Order as ValidatorOrder
@@ -346,15 +351,17 @@ async def attach_protective_stop_to_existing_position(
 
     symbol_norm = symbol.upper()
     if not is_recovery_context_token(recovery_context):
+        payload = {
+            "strategy_id": strategy_id,
+            "symbol": symbol_norm,
+            "qty": qty,
+            "stop_price": str(stop_price),
+            "reason": "missing_or_invalid_recovery_context",
+        }
+        validate_protective_stop_attach_refused_no_context_payload(payload)
         journal.append(
             "protective_stop_attach_refused_no_recovery_context",
-            payload={
-                "strategy_id": strategy_id,
-                "symbol": symbol_norm,
-                "qty": qty,
-                "stop_price": str(stop_price),
-                "reason": "missing_or_invalid_recovery_context",
-            },
+            payload=payload,
             strategy=strategy_id,
             ticker=symbol_norm,
             side="sell",
@@ -365,28 +372,34 @@ async def attach_protective_stop_to_existing_position(
         )
 
     positions = await connector.get_positions()
-    actual_qty = sum(
-        int(position.qty)
+    matching_positions = [
+        position
         for position in positions
-        if str(position.ticker).upper() == symbol_norm
-    )
-    if actual_qty != qty:
+        if str(position.ticker).upper() == symbol_norm and int(position.qty) != 0
+    ]
+    actual_qty = sum(int(position.qty) for position in matching_positions)
+    if len(matching_positions) != 1 or actual_qty != qty:
+        payload = {
+            "strategy_id": strategy_id,
+            "symbol": symbol_norm,
+            "expected_qty": qty,
+            "actual_qty": actual_qty,
+            "matching_position_count": len(matching_positions),
+            "stop_price": str(stop_price),
+        }
+        validate_protective_stop_attach_refused_drift_payload(payload)
         journal.append(
             "protective_stop_attach_refused_drift",
-            payload={
-                "strategy_id": strategy_id,
-                "symbol": symbol_norm,
-                "expected_qty": qty,
-                "actual_qty": actual_qty,
-                "stop_price": str(stop_price),
-            },
+            payload=payload,
             strategy=strategy_id,
             ticker=symbol_norm,
             side="sell",
             qty=qty,
         )
         raise PositionDriftError(
-            f"broker position drift for {symbol_norm}: expected {qty}, got {actual_qty}"
+            f"broker position drift for {symbol_norm}: expected one position "
+            f"with qty {qty}, got {len(matching_positions)} matching positions "
+            f"totaling {actual_qty}"
         )
 
     ack = await connector.submit_standalone_stop_order(
@@ -397,16 +410,18 @@ async def attach_protective_stop_to_existing_position(
         time_in_force="GTC",
         client_tag=f"k2bi:{strategy_id}:recovery-stop-{symbol_norm}:stop",
     )
+    payload = {
+        "strategy_id": strategy_id,
+        "symbol": symbol_norm,
+        "qty": qty,
+        "stop_price": str(stop_price),
+        "broker_order_id": ack.broker_order_id,
+        "broker_perm_id": ack.broker_perm_id,
+    }
+    validate_protective_stop_attached_payload(payload)
     journal.append(
         "protective_stop_attached_to_existing_position",
-        payload={
-            "strategy_id": strategy_id,
-            "symbol": symbol_norm,
-            "qty": qty,
-            "stop_price": str(stop_price),
-            "broker_order_id": ack.broker_order_id,
-            "broker_perm_id": ack.broker_perm_id,
-        },
+        payload=payload,
         strategy=strategy_id,
         ticker=symbol_norm,
         side="sell",

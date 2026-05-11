@@ -12,4 +12,4 @@ def is_recovery_context_token(candidate: object) -> bool:
     return candidate is _RECOVERY_CONTEXT_TOKEN
 
 
-__all__ = ["_RECOVERY_CONTEXT_TOKEN", "is_recovery_context_token"]
+__all__ = ["is_recovery_context_token"]

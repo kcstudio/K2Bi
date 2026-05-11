@@ -361,3 +361,77 @@ def validate_orphan_stop_adopted_payload(payload: dict[str, Any]) -> None:
         raise JournalSchemaError(
             "orphan_stop_adopted justification must be non-empty string"
         )
+
+
+def _require_non_empty_str(payload: dict[str, Any], event_type: str, field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise JournalSchemaError(
+            f"{event_type} {field} must be non-empty str, got {value!r}"
+        )
+    return value
+
+
+def _require_int(payload: dict[str, Any], event_type: str, field: str) -> int:
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JournalSchemaError(
+            f"{event_type} {field} must be int, got {value!r}"
+        )
+    return value
+
+
+def _require_positive_decimal_str(
+    payload: dict[str, Any], event_type: str, field: str
+) -> None:
+    raw = payload.get(field)
+    try:
+        parsed = Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        raise JournalSchemaError(
+            f"{event_type} {field} not parseable as Decimal: {raw!r}"
+        )
+    if not parsed.is_finite() or parsed <= 0:
+        raise JournalSchemaError(
+            f"{event_type} {field} must be finite > 0, got {raw!r}"
+        )
+
+
+def validate_protective_stop_attached_payload(payload: dict[str, Any]) -> None:
+    event_type = "protective_stop_attached_to_existing_position"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "symbol")
+    qty = _require_int(payload, event_type, "qty")
+    if qty <= 0:
+        raise JournalSchemaError(f"{event_type} qty must be positive, got {qty!r}")
+    _require_positive_decimal_str(payload, event_type, "stop_price")
+    _require_non_empty_str(payload, event_type, "broker_order_id")
+    _require_non_empty_str(payload, event_type, "broker_perm_id")
+
+
+def validate_protective_stop_attach_refused_drift_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "protective_stop_attach_refused_drift"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "symbol")
+    expected = _require_int(payload, event_type, "expected_qty")
+    _require_int(payload, event_type, "actual_qty")
+    if expected <= 0:
+        raise JournalSchemaError(
+            f"{event_type} expected_qty must be positive, got {expected!r}"
+        )
+    _require_positive_decimal_str(payload, event_type, "stop_price")
+
+
+def validate_protective_stop_attach_refused_no_context_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "protective_stop_attach_refused_no_recovery_context"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "symbol")
+    qty = _require_int(payload, event_type, "qty")
+    if qty <= 0:
+        raise JournalSchemaError(f"{event_type} qty must be positive, got {qty!r}")
+    _require_positive_decimal_str(payload, event_type, "stop_price")
+    _require_non_empty_str(payload, event_type, "reason")

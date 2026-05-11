@@ -971,6 +971,16 @@ class IBKRConnector:
                     break
                 await asyncio.sleep(0.1)
             if not getattr(trade.order, "orderId", 0):
+                try:
+                    self._ib.cancelOrder(trade.order)
+                except Exception as cancel_exc:  # pragma: no cover
+                    LOG.warning(
+                        "standalone stop cancel after orderId timeout raised: %s",
+                        cancel_exc,
+                    )
+                await self._await_parent_terminal(
+                    trade, reason="standalone_stop_orderid_timeout"
+                )
                 raise BrokerRejectionError(
                     "IB Gateway did not assign orderId within 5s of standalone stop",
                     broker_reason="standalone_stop_orderid_timeout",
@@ -980,6 +990,16 @@ class IBKRConnector:
                     break
                 await asyncio.sleep(0.1)
             if not getattr(trade.order, "permId", 0):
+                try:
+                    self._ib.cancelOrder(trade.order)
+                except Exception as cancel_exc:  # pragma: no cover
+                    LOG.warning(
+                        "standalone stop cancel after permId timeout raised: %s",
+                        cancel_exc,
+                    )
+                await self._await_parent_terminal(
+                    trade, reason="standalone_stop_permid_timeout"
+                )
                 raise BrokerRejectionError(
                     "IB Gateway did not assign permId within 5s of standalone stop",
                     broker_reason="standalone_stop_permid_timeout",

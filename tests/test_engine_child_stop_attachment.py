@@ -13,9 +13,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from execution.connectors.ibkr import IBKRConnector
-from execution.connectors.types import BrokerOrderAck, BrokerPosition
+from execution.connectors.types import BrokerOrderAck, BrokerPosition, BrokerRejectionError
 from execution.engine import recovery as recovery_mod
+from execution.engine import recovery_context as recovery_context_mod
 from execution.engine.main import Engine
+from execution.journal.schema import (
+    JournalSchemaError,
+    validate_protective_stop_attached_payload,
+)
 from execution.journal.writer import JournalWriter
 from execution.strategies import runner as strategy_runner
 
@@ -90,6 +95,17 @@ class _FakeIB:
 
     def cancelOrder(self, order: _FakeBaseOrder) -> None:
         self.cancelled_orders.append(order)
+
+
+class _FakeIBNoPerm(_FakeIB):
+    def placeOrder(self, contract: _FakeStock, order: _FakeBaseOrder) -> _FakeTrade:
+        trade = super().placeOrder(contract, order)
+        order.permId = 0
+        return trade
+
+
+async def _no_sleep(_: float) -> None:
+    return None
 
 
 def _fake_ib_async_module() -> types.SimpleNamespace:
@@ -175,13 +191,45 @@ class ConnectorBracketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(child.tif, "GTC")
 
     def test_c2_parent_cancel_relies_on_broker_child_auto_cancel(self) -> None:
-        """IBKR bracket semantics auto-cancel the child when parent cancels."""
+        """IBKR bracket orders auto-cancel the child when the parent cancels.
+
+        Assumption reference: Interactive Brokers TWS API bracket-order
+        pattern documents parent/child orders with parent.transmit=False,
+        child.parentId set, and final child.transmit=True:
+        https://interactivebrokers.github.io/tws-api/bracket_order.html
+        """
 
         source = inspect.getsource(IBKRConnector.submit_order)
         self.assertIn("child.parentId = parent_trade.order.orderId", source)
         self.assertIn("child.transmit = True", source)
         self.assertNotIn("cancelOrder(child", source)
         self.assertNotIn("cancelOrder(child_trade", source)
+
+    async def test_standalone_stop_permid_timeout_cancels_partial_order(self) -> None:
+        fake_ib = _FakeIBNoPerm()
+        connector = IBKRConnector(
+            account_id=None,
+            host="127.0.0.1",
+            port=4002,
+            client_id=1,
+        )
+        connector._ib = fake_ib
+        connector._connected = True
+
+        with patch.dict(sys.modules, {"ib_async": _fake_ib_async_module()}):
+            with patch("execution.connectors.ibkr.asyncio.sleep", _no_sleep):
+                with self.assertRaises(BrokerRejectionError):
+                    await connector.submit_standalone_stop_order(
+                        ticker="G",
+                        side="sell",
+                        qty=71,
+                        stop_price=Decimal("30.00"),
+                        time_in_force="GTC",
+                        client_tag="k2bi:g-2026-05:repair:stop",
+                    )
+
+        self.assertEqual(len(fake_ib.cancelled_orders), 1)
+        self.assertIs(fake_ib.cancelled_orders[0], fake_ib.placed_orders[0])
 
 
 class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
@@ -244,6 +292,31 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refused[0]["payload"]["expected_qty"], 71)
         self.assertEqual(refused[0]["payload"]["actual_qty"], 70)
 
+    async def test_c3_multiple_symbol_positions_are_drift_even_if_sum_matches(
+        self,
+    ) -> None:
+        connector = _AttachmentConnector(
+            positions=[
+                BrokerPosition(ticker="G", qty=50, avg_price=Decimal("32.00")),
+                BrokerPosition(ticker="G", qty=21, avg_price=Decimal("33.00")),
+            ]
+        )
+
+        with self.assertRaises(strategy_runner.PositionDriftError):
+            await strategy_runner.attach_protective_stop_to_existing_position(
+                connector=connector,
+                journal=self.journal,
+                symbol="G",
+                qty=71,
+                stop_price=Decimal("30.00"),
+                strategy_id="g-2026-05",
+                recovery_context=recovery_mod._RECOVERY_CONTEXT_TOKEN,
+            )
+
+        self.assertEqual(connector.stop_orders, [])
+        refused = self._events("protective_stop_attach_refused_drift")
+        self.assertEqual(refused[0]["payload"]["matching_position_count"], 2)
+
     async def test_c4_explicit_verb_succeeds_on_exact_position_match(self) -> None:
         connector = _AttachmentConnector(
             positions=[BrokerPosition(ticker="G", qty=71, avg_price=Decimal("32.00"))]
@@ -294,6 +367,29 @@ class ChildStopAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connector.stop_orders, [])
         refused = self._events("protective_stop_attach_refused_no_recovery_context")
         self.assertEqual(len(refused), 1)
+
+    def test_c6_recovery_context_token_is_not_public_api(self) -> None:
+        self.assertNotIn(
+            "_RECOVERY_CONTEXT_TOKEN",
+            getattr(recovery_context_mod, "__all__", ()),
+        )
+        self.assertNotIn(
+            "_RECOVERY_CONTEXT_TOKEN",
+            inspect.getsource(strategy_runner),
+        )
+
+    def test_c_schema_rejects_malformed_attached_payload(self) -> None:
+        with self.assertRaises(JournalSchemaError):
+            validate_protective_stop_attached_payload(
+                {
+                    "strategy_id": "g-2026-05",
+                    "symbol": "G",
+                    "qty": 71,
+                    "stop_price": "30.00",
+                    "broker_order_id": "",
+                    "broker_perm_id": "8001",
+                }
+            )
 
 
 if __name__ == "__main__":
