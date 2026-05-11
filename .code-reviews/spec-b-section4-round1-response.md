@@ -269,3 +269,7 @@ Latest focused verification remains the round-3 post-fix run: `pytest tests/test
 Latest full verification remains the round-3 post-fix run: `pytest tests/ -q` -> `1569 passed, 1 skipped, 2 warnings, 33 subtests passed`.
 
 Post-round-4 §0 state will be refreshed after the closure commit because this disposition document will land as a new commit.
+
+## K2B PM Checkpoint Draft
+
+§4 closed by Codex self-judge - red test `1afefa7`, initial impl `9a6939e`, fixes `7fcee67`/`3175590`/`574b881`, disposition doc `38ee8f2`. Pytest `1569 passed, 1 skipped, 33 subtests passed`. Codex self-judge rejected 2 findings, all rationale captured in `.code-reviews/spec-b-section4-round1-response.md`. Awaiting architect audit.
