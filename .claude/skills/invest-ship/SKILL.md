@@ -466,6 +466,10 @@ This checkpoint lives outside `/ship` -- it is the author's responsibility at pl
 - Config tweaks, typo fixes, one-line changes
 - Emergency hotfixes where the bug-fix speed matters more than review (review after the fact)
 
+Do not use these exceptions for new architectural principles, conventions, or invariants.
+Those changes require Checkpoint 2 even when the diff is markdown-only, config-only,
+or short.
+
 **Never skip both checkpoints.** If Checkpoint 1 was skipped because the feature was small enough that no plan was written, Checkpoint 2 becomes mandatory. Conversely, if Checkpoint 2 is skipped via `/ship --skip-codex <reason>`, Checkpoint 1 must have run earlier in the session -- otherwise the build has had no adversarial review at all, and `/ship` should refuse to proceed without Keith's explicit override.
 
 **Rules for presenting Codex findings to Keith:**
