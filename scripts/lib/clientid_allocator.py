@@ -64,8 +64,10 @@ def _pid_is_alive(pid: int) -> bool:
 def _lease_is_stale(path: Path, *, now: float, ttl_seconds: int) -> bool:
     try:
         payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except OSError:
         return False
+    except json.JSONDecodeError:
+        return True
     try:
         created_at = float(payload.get("created_at", path.stat().st_mtime))
     except (TypeError, ValueError, OSError):
@@ -76,8 +78,6 @@ def _lease_is_stale(path: Path, *, now: float, ttl_seconds: int) -> bool:
         owner_pid = 0
     if owner_pid > 0:
         return not _pid_is_alive(owner_pid)
-    if _pid_is_alive(owner_pid):
-        return False
     return now - created_at > ttl_seconds
 
 

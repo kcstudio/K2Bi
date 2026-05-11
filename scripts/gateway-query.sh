@@ -66,9 +66,12 @@ assert_invoked_from_macbook() {
 
 release_clientid_lease() {
     if [[ -n "${LEASE_PATH:-}" && -n "${LEASE_TOKEN:-}" ]]; then
-        "$LOCAL_PYTHON" "$CLIENTID_ALLOCATOR" release \
+        if ! "$LOCAL_PYTHON" "$CLIENTID_ALLOCATOR" release \
             --lease-path "$LEASE_PATH" \
-            --token "$LEASE_TOKEN" >/dev/null 2>&1 || true
+            --token "$LEASE_TOKEN"; then
+            echo "gateway-query.sh warning: clientId lease release failed: ${LEASE_PATH}" >&2
+            return 1
+        fi
     fi
 }
 

@@ -99,6 +99,24 @@ def test_clientid_allocator_reclaims_fresh_dead_owner_lease(tmp_path: Path) -> N
     clientid_allocator.release_client_id(reclaimed)
 
 
+def test_clientid_allocator_reclaims_malformed_lease_file(tmp_path: Path) -> None:
+    """F1 review hardening: corrupt lease files must not block the pool."""
+    from scripts.lib import clientid_allocator
+
+    lease_dir = tmp_path / "leases"
+    lease_dir.mkdir()
+    (lease_dir / "clientId-93.json").write_text("{not-json")
+
+    reclaimed = clientid_allocator.allocate_client_id(
+        lease_dir=lease_dir,
+        preferred=93,
+        owner="malformed-reclaiming-owner",
+    )
+
+    assert reclaimed.client_id == 93
+    clientid_allocator.release_client_id(reclaimed)
+
+
 def test_gateway_query_script_enforces_allocator_and_operator_context() -> None:
     """F1/F6: gateway-query.sh must allocate clientIds and block skill misuse."""
     script = (REPO_ROOT / "scripts" / "gateway-query.sh").read_text()
@@ -108,6 +126,7 @@ def test_gateway_query_script_enforces_allocator_and_operator_context() -> None:
     assert "K2BI_GATEWAY_QUERY_OPERATOR_OVERRIDE" in script
     assert "CLAUDE_CODE_SKILL_INVOCATION" in script
     assert "not an authentication boundary" in script
+    assert "clientId lease release failed" in script
     assert "clientId=1" in script
     assert "trap" in script
     assert "release" in script
