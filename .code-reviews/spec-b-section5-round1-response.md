@@ -81,3 +81,13 @@ The backlog note now pins the planned CLI shape, required arguments, input field
 ## Current Verification
 
 Post-fix §0 after `1c99ad3`: `2026-05-11T06:27:18.856568+00:00`, G qty 71, avgCost 32.7840873, exactly one G open STP SELL qty 71 @30, no Spec B test orders open, `k2bi-engine` inactive and disabled.
+
+## Round 2 Review
+
+Kimi round-2 verdict: APPROVE.
+
+Review log: `.code-reviews/2026-05-11T06-30-54Z_38f53e.log`
+
+## K2B PM Checkpoint Draft
+
+§5 closed clean - amendment `2ea841b`, limitations/backlog `8a1c14e`, amendment disposition `4321174`, review fix `1c99ad3`, round-1 disposition `03abb90`, Kimi APPROVE `.code-reviews/2026-05-11T06-30-54Z_38f53e.log`. Pytest closure gate pending. Codex self-judge rejected 1 finding, rationale captured in `.code-reviews/spec-b-section5-round1-response.md`. Awaiting architect audit.
