@@ -215,8 +215,11 @@ def pending_order_map_from_journal(
             pending.setdefault(key, set()).add(order_id)
             order_keys[order_id] = key
             qty = record.get("qty")
-            if isinstance(qty, int) and not isinstance(qty, bool):
-                order_qty[order_id] = qty
+            if not isinstance(qty, int) or isinstance(qty, bool):
+                raise JournalReplayMalformedJsonError(
+                    "order_submitted missing or invalid qty"
+                )
+            order_qty[order_id] = qty
             continue
 
         if event_type == "order_terminal":

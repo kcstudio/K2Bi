@@ -1267,6 +1267,8 @@ class Engine:
                         "strategy_id": snap.name,
                         "symbol": decision.candidate.ticker.upper(),
                         "pending_order_id": pending_order_ids[0],
+                        "pending_order_ids": pending_order_ids,
+                        "pending_order_count": len(pending_order_ids),
                         "cycle_id": trade_id,
                     },
                     strategy=snap.name,

@@ -76,6 +76,7 @@ def _raw_record(
     strategy: str | None = "spy-rotational",
     broker_order_id: str | None = "42",
     ticker: str | None = "SPY",
+    qty: int | None = 10,
     payload: dict | None = None,
 ) -> str:
     record = {
@@ -90,6 +91,8 @@ def _raw_record(
     }
     if ticker is not None:
         record["ticker"] = ticker
+    if qty is not None:
+        record["qty"] = qty
     if broker_order_id is not None:
         record["broker_order_id"] = broker_order_id
     return json.dumps(record)
@@ -228,6 +231,20 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skips[0]["payload"]["strategy_id"], "spy-rotational")
         self.assertEqual(skips[0]["payload"]["symbol"], "SPY")
         self.assertEqual(skips[0]["payload"]["pending_order_id"], "42")
+
+    async def test_d1b_multiple_pending_ids_are_fully_journaled(self) -> None:
+        await self._init_engine()
+        self._append_prior_submission(broker_order_id="42")
+        self._append_prior_submission(broker_order_id="43")
+
+        tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 0)
+        skips = self._events("cycle_skipped_pending_prior_submission")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["payload"]["pending_order_id"], "42")
+        self.assertEqual(skips[0]["payload"]["pending_order_ids"], ["42", "43"])
+        self.assertEqual(skips[0]["payload"]["pending_order_count"], 2)
 
     async def test_d2_terminal_filled_order_does_not_block_submit(self) -> None:
         await self._init_engine()
@@ -413,6 +430,18 @@ class OrderDedupTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(JournalReplayMalformedJsonError):
+            await self.engine.tick_once()
+
+    async def test_d4g_order_submitted_missing_qty_fails_closed_on_replay(
+        self,
+    ) -> None:
+        await self._patch_now(_mid_session_utc())
+        self.journal.path_for_today().write_text(
+            _raw_record(event_type="order_submitted", qty=None) + "\n",
             encoding="utf-8",
         )
 
