@@ -32,7 +32,7 @@ plan-review-required: true
 Before any Spec B code lands, operator runs `scripts/gateway-query.sh -f <snippet.py>` (clientId=99) and confirms:
 
 - G qty = 71 shares
-- Exactly 1 G open order: SELL STP 71 @ $30 GTC, permId 1981941503, clientId=98 (verified via `reqAllOpenOrders()` to catch orphans bound to other clientIds)
+- Exactly 1 G open order by durable identity: SELL STP 71 @ $30 GTC, permId 113371621, side SELL, stop_price 30, qty 71, status PreSubmitted or Submitted (verified via `reqAllOpenOrders()` to catch orphans bound to other clientIds)
 - No other G orders visible
 - Engine systemd unit (`k2bi-engine.service`) reports `inactive` AND `disabled` at the moment of verify (not just "supposed to be")
 
@@ -45,6 +45,12 @@ Before any Spec B code lands, operator runs `scripts/gateway-query.sh -f <snippe
 
 - $32.8295 from 2026-05-08 pre-incident state through 2026-05-11 regression test
 - $32.0540875 from 2026-05-12 onward (re-anchored by K2B-architect 2026-05-12 02:30 HKT after planned regression-test round-trip; rationale in `K2Bi-Vault/wiki/insights/2026-05-12_spec-b-section8-1-section0-cost-basis-drift.md` + K2B PM session transcript)
+
+**Known §0 limitations:**
+
+IBKR `parentId` is a session/client-scoped `orderId` reference, not a durable broker-side identity. After IBC `ClosedownAt` daily reauth, the parent BUY's `orderId` is no longer live in any session, so the STP's parent pointer can appear as `0`. Cross-clientId reads from master clientId 99 can also return `parentId=0` because order access and modification are bound to the submitting clientId. `parentId` binding is verified at submission time only (§4 unit tests + Phase C of the regression test). The durable post-submission identity is permId + stop_price + qty + side + status.
+
+Sources: [IBKR Order class reference](https://interactivebrokers.github.io/tws-api/classIBApi_1_1Order.html) defines `parentId` as the parent order's `orderId`, `orderId` as the API client's order id, and `permId` as the host order identifier; [IBKR active orders docs](https://interactivebrokers.github.io/tws-api/open_orders.html) state API orders are bound to the clientId that submitted them and describe permId to API orderId mapping; [IBKR bracket order docs](https://interactivebrokers.github.io/tws-api/bracket_order.html) show child orders setting `ParentId` to the parent orderId at submission; [ib_async order docs](https://ib-api-reloaded.github.io/ib_async/api.html#ib_async.order.Order) expose separate `orderId`, `clientId`, `permId`, `parentId`, and `parentPermId` fields.
 
 **Freshness requirement:**
 
