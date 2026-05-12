@@ -61,6 +61,7 @@ from ..connectors.types import (
     LIVE_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
 )
+from ..journal.reader import find_terminal_for_trade_id
 from ..journal.schema import reject_non_finite_json_constant
 from ..journal.ulid import new_ulid
 from ..journal.writer import JournalWriter
@@ -761,6 +762,7 @@ class Engine:
 
         # Adopt broker state as engine state.
         self._positions = reco.adopted_positions
+        self._journal_recovery_self_heals(journal_tail)
         # If there was a journal-pending order still open at broker,
         # resume in AWAITING_FILL. MVP handles at most one in-flight,
         # so multiple still-open orders must refuse-to-start -- silently
@@ -2611,6 +2613,40 @@ class Engine:
         if event.strategy is not None:
             kwargs["strategy"] = event.strategy
         self.journal.append(event.event_type, **kwargs)
+
+    def _journal_recovery_self_heals(
+        self,
+        journal_tail: list[dict[str, Any]],
+    ) -> None:
+        healed_trade_ids = {
+            str(rec.get("trade_id"))
+            for rec in journal_tail
+            if rec.get("event_type") == "recovery_self_healed_pending_order"
+            and rec.get("trade_id")
+        }
+        submitted_trade_ids = {
+            str(rec.get("trade_id"))
+            for rec in journal_tail
+            if rec.get("event_type") == "order_submitted" and rec.get("trade_id")
+        }
+        for trade_id in sorted(submitted_trade_ids - healed_trade_ids):
+            terminal = find_terminal_for_trade_id(trade_id, journal_tail)
+            if terminal is None:
+                continue
+            self.journal.append(
+                "recovery_self_healed_pending_order",
+                payload={
+                    "trade_id": trade_id,
+                    "terminal_event_type": terminal.get("event_type"),
+                    "terminal_journal_entry_id": terminal.get("journal_entry_id"),
+                    "rationale": (
+                        "journal-rebuild matched terminal signal not reflected "
+                        "in awaiting state"
+                    ),
+                },
+                strategy=None,
+                trade_id=trade_id,
+            )
 
     def _journal_validator_reject(
         self,

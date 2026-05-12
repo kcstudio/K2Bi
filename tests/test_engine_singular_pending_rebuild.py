@@ -133,6 +133,7 @@ class EngineSingularPendingRebuildTests(unittest.IsolatedAsyncioTestCase):
                 status="Submitted",
                 submitted_at=_now(),
                 tif="DAY",
+                client_tag="k2bi:spy-rotational:T-singular",
             )
         ]
 

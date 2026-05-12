@@ -36,6 +36,7 @@ from enum import Enum
 from typing import Any, Iterable
 
 from .recovery_context import _RECOVERY_CONTEXT_TOKEN
+from ..journal.reader import is_terminal_signal_event
 
 
 LOG = logging.getLogger("k2bi.engine.recovery")
@@ -1594,6 +1595,8 @@ def _pending_from_journal(
                 order_type=order_type,
             )
             per_key_filled.setdefault(key, 0)
+        elif is_terminal_signal_event(rec):
+            per_key.pop(key, None)
         elif event_type == "order_filled":
             # Track cumulative fill. Prefer the engine-authored
             # `cumulative_filled_qty` when present (accurate across
@@ -1616,7 +1619,7 @@ def _pending_from_journal(
             pending = per_key.get(key)
             if pending is not None and per_key_filled.get(key, 0) >= pending.qty:
                 per_key.pop(key, None)
-        elif event_type in {"order_rejected", "order_timeout"}:
+        elif event_type == "order_rejected":
             per_key.pop(key, None)
         elif event_type == "kill_blocked":
             # Codex round-9 P2: kill_blocked can fire between an
