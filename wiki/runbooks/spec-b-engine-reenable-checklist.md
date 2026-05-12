@@ -94,7 +94,10 @@ Expected broker state:
 - [ ] G position qty is 71.
 - [ ] G avgCost is within 0.5% of the baseline 32.0540875 ± $0.16/share.
       See Spec B §0 Baseline re-anchor history for the 2026-05-12 ruling.
-- [ ] Exactly one G open STP SELL order exists for qty 71 at stop 30.
+- [ ] Exactly one G open STP SELL order exists by durable identity:
+      permId 113371621, qty 71, stop 30, status PreSubmitted or Submitted.
+      `parentId` is informational after daily reauth; see Spec B §0 Known
+      limitations.
 - [ ] No Spec B test orders remain open.
 
 Write the audit line:
