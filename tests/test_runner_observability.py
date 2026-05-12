@@ -140,10 +140,22 @@ class RunnerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["payload"]["current_qty"], 10)
         self.assertEqual(event["payload"]["target_qty"], 10)
         self.assertTrue(event["payload"]["cycle_id"])
+        self.assertIsNone(event["trade_id"])
         self.assertEqual(
             event["payload"]["evaluation_timestamp"],
             _mid_session_utc().isoformat(),
         )
+
+        second_tick = await self.engine.tick_once()
+
+        self.assertEqual(second_tick.orders_submitted, 0)
+        events = self._events("cycle_evaluated_skip_position_held")
+        self.assertEqual(len(events), 2)
+        self.assertNotEqual(
+            events[0]["payload"]["cycle_id"],
+            events[1]["payload"]["cycle_id"],
+        )
+        self.assertTrue(all(event["trade_id"] is None for event in events))
 
     async def test_d8_3_2_zero_position_does_not_emit_event(self) -> None:
         self.engine._positions = []

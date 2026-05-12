@@ -2,9 +2,9 @@
 
 Takes ApprovedStrategySnapshot + MarketSnapshot + engine context,
 returns a CandidateOrder or None. The normal evaluation path contains
-NO connector calls and NO validator invocation -- the engine's tick
-owns those. Spec B §8.3 allows the engine-owned call path to pass a
-journal for position-held skip observability. The recovery-only
+NO I/O, NO connector calls, NO validator invocation -- the engine's tick
+owns those. Spec B §8.3 exposes a helper the engine can call after a
+position-held skip decision to journal observability. The recovery-only
 protective-stop repair verb at the bottom is an explicit Spec B §4
 exception guarded by a private recovery token.
 
@@ -86,8 +86,6 @@ def evaluate(
     *,
     current_regime: str | None = None,
     cash_only_config: dict[str, Any] | None = None,
-    journal: JournalWriter | None = None,
-    cycle_id: str | None = None,
 ) -> EvaluationDecision:
     """Single-strategy evaluation entrypoint.
 
@@ -142,17 +140,6 @@ def evaluate(
     # the runner never stacks.
     current_qty = _position_qty(ticker, ctx)
     if current_qty != 0:
-        if journal is not None:
-            if not cycle_id:
-                raise ValueError("cycle_id is required when journaling runner skips")
-            _journal_cycle_evaluated_skip_position_held(
-                journal=journal,
-                snapshot=snapshot,
-                ctx=ctx,
-                market=market,
-                current_qty=current_qty,
-                cycle_id=cycle_id,
-            )
         return EvaluationDecision(
             candidate=None,
             reason=SKIP_POSITION_HELD,
@@ -213,7 +200,7 @@ def _position_qty(ticker: str, ctx: RiskContext) -> int:
     return sum(p.qty for p in ctx.positions if p.ticker.upper() == target)
 
 
-def _journal_cycle_evaluated_skip_position_held(
+def journal_cycle_evaluated_skip_position_held(
     *,
     journal: JournalWriter,
     snapshot: ApprovedStrategySnapshot,
@@ -236,7 +223,7 @@ def _journal_cycle_evaluated_skip_position_held(
             "evaluation_timestamp": evaluation_time.isoformat(),
         },
         strategy=snapshot.name,
-        trade_id=cycle_id,
+        trade_id=None,
         ticker=symbol,
         side=spec.side,
         qty=spec.qty,
@@ -558,6 +545,7 @@ __all__ = [
     "SKIP_UNKNOWN_STRATEGY_TYPE",
     "attach_protective_stop_to_existing_position",
     "evaluate",
+    "journal_cycle_evaluated_skip_position_held",
     "pending_order_map_from_journal",
     "_pending_orders_for_strategy",
 ]

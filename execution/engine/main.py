@@ -1293,12 +1293,25 @@ class Engine:
                 ctx,
                 current_regime=current_regime,
                 cash_only_config=self.validator_config,
-                journal=self.journal,
-                cycle_id=cycle_id,
             )
             if decision.candidate is None:
+                if decision.reason == strategy_runner.SKIP_POSITION_HELD:
+                    try:
+                        strategy_runner.journal_cycle_evaluated_skip_position_held(
+                            journal=self.journal,
+                            snapshot=snap,
+                            ctx=ctx,
+                            market=market,
+                            current_qty=int(decision.detail["current_qty"]),
+                            cycle_id=cycle_id,
+                        )
+                    except Exception as exc:  # pragma: no cover - best effort
+                        LOG.warning(
+                            "runner position-held observability write failed: %s",
+                            exc,
+                        )
                 continue
-            trade_id = cycle_id
+            trade_id = new_ulid()
             if await self._skip_buy_for_existing_position(
                 snap=snap,
                 symbol=decision.candidate.ticker,
