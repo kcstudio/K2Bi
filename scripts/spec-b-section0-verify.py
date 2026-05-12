@@ -159,20 +159,27 @@ def main() -> int:
 
     positions: list[dict[str, Any]] = []
     open_orders: list[dict[str, Any]] = []
+    broker_connected = False
+    broker_query_succeeded = False
     ib = IB()
     try:
         ib.connect("127.0.0.1", 4002, clientId=99, timeout=10)
+        broker_connected = True
         positions = _position_rows(ib)
         open_orders = _open_order_rows(ib)
+        broker_query_succeeded = True
     except Exception as exc:  # noqa: BLE001 -- live broker gate fails closed
         failures.append(f"broker query failed: {type(exc).__name__}: {exc}")
     finally:
-        try:
-            ib.disconnect()
-        except Exception as exc:  # noqa: BLE001 -- preserve primary failure
-            failures.append(f"broker disconnect failed: {type(exc).__name__}: {exc}")
+        if broker_connected:
+            try:
+                ib.disconnect()
+            except Exception as exc:  # noqa: BLE001 -- preserve primary failure
+                failures.append(
+                    f"broker disconnect failed: {type(exc).__name__}: {exc}"
+                )
 
-    if not any(f.startswith("broker query failed:") for f in failures):
+    if broker_query_succeeded:
         _verify_positions(positions, failures)
         _verify_g_stop(open_orders, failures)
 

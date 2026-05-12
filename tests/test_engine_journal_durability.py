@@ -230,7 +230,7 @@ class EngineJournalDurabilityTests(unittest.IsolatedAsyncioTestCase):
         ]
         self._set_mismatched_read_back()
 
-        await self.engine.tick_once()
+        result = await self.engine.tick_once()
 
         stopped = self._events("engine_stopped")
         self.assertEqual(len(stopped), 1)
@@ -241,4 +241,5 @@ class EngineJournalDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stopped[0]["payload"]["pending_order"], pending.trade_id)
         self.assertIs(self.engine._pending_order, pending)
         self.assertEqual(self.engine.state, EngineState.SHUTDOWN)
+        self.assertEqual(result.state_after, EngineState.SHUTDOWN)
         self.assertTrue(self.engine._shutdown_requested)

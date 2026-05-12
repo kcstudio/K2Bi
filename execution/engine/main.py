@@ -505,7 +505,7 @@ class Engine:
                 await self._poll_awaiting(poll_result)
             except JournalDurabilityError as exc:
                 await self._handle_journal_durability_error(exc)
-                break
+                return
             if (
                 self._pending_order is None
                 or self._pending_order.trade_id != original_trade_id
@@ -598,6 +598,8 @@ class Engine:
                     await self._poll_awaiting(result)
                 except JournalDurabilityError as exc:
                     await self._handle_journal_durability_error(exc)
+                    result.state_after = self.state
+                    return result
             result.state_after = self.state
             return result
 
@@ -613,6 +615,8 @@ class Engine:
             await self._run_tick_body(result)
         except JournalDurabilityError as exc:
             await self._handle_journal_durability_error(exc)
+            result.state_after = self.state
+            return result
         result.state_after = self.state
         return result
 
