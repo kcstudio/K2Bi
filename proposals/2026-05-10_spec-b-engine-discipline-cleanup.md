@@ -38,8 +38,13 @@ Before any Spec B code lands, operator runs `scripts/gateway-query.sh -f <snippe
 
 **Cost basis tolerance (corporate-action sentinel):**
 
-- avgCost change ≤ 0.5% from baseline ($32.8295 ± $0.16/share): informational only, recorded in the §0 log line, does not block
+- avgCost change ≤ 0.5% from baseline ($32.0540875 ± $0.16/share; new window: $31.89 to $32.21): informational only, recorded in the §0 log line, does not block
 - avgCost change > 0.5% with qty unchanged: STOP. File incident note. Investigate corporate action (split, reverse split, spin-off) before any code lands. The 0.5% threshold catches material economic exposure changes while ignoring routine T+2 commission settlement (~14bps observed on this position)
+
+**Baseline re-anchor history:**
+
+- $32.8295 from 2026-05-08 pre-incident state through 2026-05-11 regression test
+- $32.0540875 from 2026-05-12 onward (re-anchored by K2B-architect 2026-05-12 02:30 HKT after planned regression-test round-trip; rationale in `K2Bi-Vault/wiki/insights/2026-05-12_spec-b-section8-1-section0-cost-basis-drift.md` + K2B PM session transcript)
 
 **Freshness requirement:**
 
