@@ -32,6 +32,7 @@ from typing import Any
 from ..engine.recovery_context import is_recovery_context_token
 from ..journal.schema import (
     JournalReplayMalformedJsonError,
+    validate_cycle_evaluated_skip_position_held_payload,
     validate_protective_stop_attached_payload,
     validate_protective_stop_attach_refused_drift_payload,
     validate_protective_stop_attach_refused_no_context_payload,
@@ -212,16 +213,18 @@ def journal_cycle_evaluated_skip_position_held(
     spec = snapshot.order_spec
     symbol = spec.ticker.upper()
     evaluation_time = ctx.now or market.ts
+    payload = {
+        "strategy_id": snapshot.name,
+        "symbol": symbol,
+        "current_qty": current_qty,
+        "target_qty": spec.qty,
+        "cycle_id": cycle_id,
+        "evaluation_timestamp": evaluation_time.isoformat(),
+    }
+    validate_cycle_evaluated_skip_position_held_payload(payload)
     journal.append(
         "cycle_evaluated_skip_position_held",
-        payload={
-            "strategy_id": snapshot.name,
-            "symbol": symbol,
-            "current_qty": current_qty,
-            "target_qty": spec.qty,
-            "cycle_id": cycle_id,
-            "evaluation_timestamp": evaluation_time.isoformat(),
-        },
+        payload=payload,
         strategy=snapshot.name,
         trade_id=None,
         ticker=symbol,

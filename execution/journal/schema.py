@@ -47,6 +47,10 @@ v2 additive (2026-04-26, Q42 orphan-STOP adoption):
 v2 additive (2026-05-11, Spec B §4):
     - Added protective-stop repair events for the recovery-only existing-
       position stop attachment verb. Additive-only; SCHEMA_VERSION unchanged.
+
+v2 additive (2026-05-12, Spec B §8):
+    - Added post-fill durability, singular-pending recovery self-heal, and
+      runner-side position-held observability events.
 """
 
 from __future__ import annotations
@@ -464,3 +468,34 @@ def validate_protective_stop_attach_refused_no_context_payload(
         raise JournalSchemaError(f"{event_type} qty must be positive, got {qty!r}")
     _require_positive_decimal_str(payload, event_type, "stop_price")
     _require_non_empty_str(payload, event_type, "reason")
+
+
+def validate_cycle_evaluated_skip_position_held_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "cycle_evaluated_skip_position_held"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "symbol")
+    current_qty = _require_int(payload, event_type, "current_qty")
+    if current_qty == 0:
+        raise JournalSchemaError(
+            f"{event_type} current_qty must be non-zero, got {current_qty!r}"
+        )
+    target_qty = _require_int(payload, event_type, "target_qty")
+    if target_qty <= 0:
+        raise JournalSchemaError(
+            f"{event_type} target_qty must be positive, got {target_qty!r}"
+        )
+    _require_non_empty_str(payload, event_type, "cycle_id")
+    raw_ts = _require_non_empty_str(payload, event_type, "evaluation_timestamp")
+    try:
+        parsed = datetime.fromisoformat(raw_ts)
+    except ValueError:
+        raise JournalSchemaError(
+            f"{event_type} evaluation_timestamp not ISO8601: {raw_ts!r}"
+        )
+    if parsed.tzinfo is None:
+        raise JournalSchemaError(
+            f"{event_type} evaluation_timestamp must include timezone, "
+            f"got {raw_ts!r}"
+        )

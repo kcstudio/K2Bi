@@ -12,7 +12,9 @@ from zoneinfo import ZoneInfo
 from execution.connectors.mock import MockIBKRConnector
 from execution.engine.main import DEFAULT_TICK_SECONDS, Engine, EngineConfig, EngineState
 from execution.journal.writer import JournalWriter
-from execution.validators.types import Position
+from execution.strategies import runner as strategy_runner
+from execution.strategies.types import MarketSnapshot
+from execution.validators.types import Position, RiskContext
 
 
 ET = ZoneInfo("US/Eastern")
@@ -187,6 +189,44 @@ class RunnerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(
                 "runner position-held observability write failed: disk full" in line
+                for line in logs.output
+            )
+        )
+
+    async def test_malformed_skip_detail_logs_and_writes_no_event(self) -> None:
+        snap = self.engine._strategies[0]
+        ctx = RiskContext(
+            account_value=Decimal("1000000"),
+            cash=Decimal("1000000"),
+            positions=[
+                Position(ticker="SPY", qty=10, avg_price=Decimal("500"))
+            ],
+            now=_mid_session_utc(),
+        )
+        market = MarketSnapshot(
+            ts=_mid_session_utc(),
+            marks={"SPY": Decimal("500")},
+            account_value=Decimal("1000000"),
+        )
+        decision = strategy_runner.EvaluationDecision(
+            candidate=None,
+            reason=strategy_runner.SKIP_POSITION_HELD,
+            detail={},
+        )
+
+        with self.assertLogs("k2bi.engine", level="ERROR") as logs:
+            ok = self.engine._journal_runner_position_held_skip(
+                snap=snap,
+                ctx=ctx,
+                market=market,
+                decision=decision,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(self._events("cycle_evaluated_skip_position_held"), [])
+        self.assertTrue(
+            any(
+                "runner position-held skip detail malformed" in line
                 for line in logs.output
             )
         )
