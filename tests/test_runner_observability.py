@@ -165,6 +165,32 @@ class RunnerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tick.orders_submitted, 1)
         self.assertEqual(self._events("cycle_evaluated_skip_position_held"), [])
 
+    async def test_observability_write_failure_logs_and_continues(self) -> None:
+        self.engine._positions = [
+            Position(ticker="SPY", qty=10, avg_price=Decimal("500"))
+        ]
+        original_append = self.engine.journal.append
+
+        def fail_skip_event(event_type: str, *args, **kwargs):
+            if event_type == "cycle_evaluated_skip_position_held":
+                raise OSError("disk full")
+            return original_append(event_type, *args, **kwargs)
+
+        self.engine.journal.append = fail_skip_event  # type: ignore[method-assign]
+
+        with self.assertLogs("k2bi.engine", level="ERROR") as logs:
+            tick = await self.engine.tick_once()
+
+        self.assertEqual(tick.orders_submitted, 0)
+        self.assertEqual(tick.state_after, EngineState.CONNECTED_IDLE)
+        self.assertEqual(self._events("cycle_evaluated_skip_position_held"), [])
+        self.assertTrue(
+            any(
+                "runner position-held observability write failed: disk full" in line
+                for line in logs.output
+            )
+        )
+
     async def test_d8_3_3_partial_position_emits_observability_event(self) -> None:
         self.engine._positions = [
             Position(ticker="SPY", qty=3, avg_price=Decimal("500"))

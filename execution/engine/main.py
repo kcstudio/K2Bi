@@ -1214,6 +1214,33 @@ class Engine:
             if self.state == EngineState.PROCESSING_TICK:
                 self.state = EngineState.CONNECTED_IDLE
 
+    def _journal_runner_position_held_skip(
+        self,
+        *,
+        snap: ApprovedStrategySnapshot,
+        ctx: RiskContext,
+        market: MarketSnapshot,
+        decision: strategy_runner.EvaluationDecision,
+    ) -> bool:
+        try:
+            current_qty = int(decision.detail["current_qty"])
+        except (KeyError, TypeError, ValueError) as exc:
+            LOG.error("runner position-held skip detail malformed: %s", exc)
+            return False
+        try:
+            strategy_runner.journal_cycle_evaluated_skip_position_held(
+                journal=self.journal,
+                snapshot=snap,
+                ctx=ctx,
+                market=market,
+                current_qty=current_qty,
+                cycle_id=new_ulid(),
+            )
+        except Exception as exc:
+            LOG.error("runner position-held observability write failed: %s", exc)
+            return False
+        return True
+
     async def _process_strategies(self, result: TickResult) -> None:
         if not self._strategies:
             return
@@ -1286,7 +1313,6 @@ class Engine:
                 continue
 
             result.strategies_evaluated += 1
-            cycle_id = new_ulid()
             decision = strategy_runner.evaluate(
                 snap,
                 market,
@@ -1296,20 +1322,12 @@ class Engine:
             )
             if decision.candidate is None:
                 if decision.reason == strategy_runner.SKIP_POSITION_HELD:
-                    try:
-                        strategy_runner.journal_cycle_evaluated_skip_position_held(
-                            journal=self.journal,
-                            snapshot=snap,
-                            ctx=ctx,
-                            market=market,
-                            current_qty=int(decision.detail["current_qty"]),
-                            cycle_id=cycle_id,
-                        )
-                    except Exception as exc:  # pragma: no cover - best effort
-                        LOG.warning(
-                            "runner position-held observability write failed: %s",
-                            exc,
-                        )
+                    self._journal_runner_position_held_skip(
+                        snap=snap,
+                        ctx=ctx,
+                        market=market,
+                        decision=decision,
+                    )
                 continue
             trade_id = new_ulid()
             if await self._skip_buy_for_existing_position(
