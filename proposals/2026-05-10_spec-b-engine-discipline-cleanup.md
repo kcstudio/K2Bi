@@ -44,7 +44,7 @@ Before any Spec B code lands, operator runs `scripts/gateway-query.sh -f <snippe
 **Baseline re-anchor history:**
 
 - $32.8295 from 2026-05-08 pre-incident state through 2026-05-11 regression test
-- $32.0540875 from 2026-05-12 onward (re-anchored by K2B-architect 2026-05-12 02:30 HKT after planned regression-test round-trip; rationale in `K2Bi-Vault/wiki/insights/2026-05-12_spec-b-section8-1-section0-cost-basis-drift.md` + K2B PM session transcript)
+- $32.0540875 from 2026-05-12 onward (re-anchored by K2B-architect 2026-05-12 02:30 HKT after planned regression-test round-trip; rationale in `K2Bi-Vault/wiki/insights/2026-05-12_spec-b-section8-1-section0-cascade-blockers.md` + K2B PM session transcript)
 
 **Known §0 limitations:**
 
