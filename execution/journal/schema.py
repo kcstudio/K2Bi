@@ -157,6 +157,7 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_4 = frozenset(
 
 EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_8 = frozenset(
     {
+        "cycle_evaluated_skip_position_held",
         "recovery_self_healed_pending_order",
     }
 )

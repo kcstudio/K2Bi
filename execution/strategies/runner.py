@@ -2,9 +2,11 @@
 
 Takes ApprovedStrategySnapshot + MarketSnapshot + engine context,
 returns a CandidateOrder or None. The normal evaluation path contains
-NO I/O, NO connector calls, NO validator invocation -- the engine's tick
-owns those. The recovery-only protective-stop repair verb at the bottom
-is an explicit Spec B §4 exception guarded by a private recovery token.
+NO connector calls and NO validator invocation -- the engine's tick
+owns those. Spec B §8.3 allows the engine-owned call path to pass a
+journal for position-held skip observability. The recovery-only
+protective-stop repair verb at the bottom is an explicit Spec B §4
+exception guarded by a private recovery token.
 
 Why this lives separately from the engine (architect Q1-refined):
     - Bundle 4's invest-backtest reuses `evaluate()` against historical
@@ -84,6 +86,8 @@ def evaluate(
     *,
     current_regime: str | None = None,
     cash_only_config: dict[str, Any] | None = None,
+    journal: JournalWriter | None = None,
+    cycle_id: str | None = None,
 ) -> EvaluationDecision:
     """Single-strategy evaluation entrypoint.
 
@@ -136,11 +140,27 @@ def evaluate(
     # position in its ticker OR a pending order, skip. Hand_crafted
     # strategies are single-shot per "engine-lifetime or human reset";
     # the runner never stacks.
-    if _any_position(ticker, ctx):
+    current_qty = _position_qty(ticker, ctx)
+    if current_qty != 0:
+        if journal is not None:
+            if not cycle_id:
+                raise ValueError("cycle_id is required when journaling runner skips")
+            _journal_cycle_evaluated_skip_position_held(
+                journal=journal,
+                snapshot=snapshot,
+                ctx=ctx,
+                market=market,
+                current_qty=current_qty,
+                cycle_id=cycle_id,
+            )
         return EvaluationDecision(
             candidate=None,
             reason=SKIP_POSITION_HELD,
-            detail={"ticker": ticker},
+            detail={
+                "ticker": ticker,
+                "current_qty": current_qty,
+                "target_qty": spec.qty,
+            },
         )
     if _any_pending_order_for_strategy(snapshot.name, ctx):
         return EvaluationDecision(
@@ -188,8 +208,39 @@ def evaluate(
     )
 
 
-def _any_position(ticker: str, ctx: RiskContext) -> bool:
-    return any(p.ticker == ticker and p.qty != 0 for p in ctx.positions)
+def _position_qty(ticker: str, ctx: RiskContext) -> int:
+    target = ticker.upper()
+    return sum(p.qty for p in ctx.positions if p.ticker.upper() == target)
+
+
+def _journal_cycle_evaluated_skip_position_held(
+    *,
+    journal: JournalWriter,
+    snapshot: ApprovedStrategySnapshot,
+    ctx: RiskContext,
+    market: MarketSnapshot,
+    current_qty: int,
+    cycle_id: str,
+) -> None:
+    spec = snapshot.order_spec
+    symbol = spec.ticker.upper()
+    evaluation_time = ctx.now or market.ts
+    journal.append(
+        "cycle_evaluated_skip_position_held",
+        payload={
+            "strategy_id": snapshot.name,
+            "symbol": symbol,
+            "current_qty": current_qty,
+            "target_qty": spec.qty,
+            "cycle_id": cycle_id,
+            "evaluation_timestamp": evaluation_time.isoformat(),
+        },
+        strategy=snapshot.name,
+        trade_id=cycle_id,
+        ticker=symbol,
+        side=spec.side,
+        qty=spec.qty,
+    )
 
 
 def _any_pending_order_for_strategy(name: str, ctx: RiskContext) -> bool:

@@ -1286,16 +1286,19 @@ class Engine:
                 continue
 
             result.strategies_evaluated += 1
+            cycle_id = new_ulid()
             decision = strategy_runner.evaluate(
                 snap,
                 market,
                 ctx,
                 current_regime=current_regime,
                 cash_only_config=self.validator_config,
+                journal=self.journal,
+                cycle_id=cycle_id,
             )
             if decision.candidate is None:
                 continue
-            trade_id = new_ulid()
+            trade_id = cycle_id
             if await self._skip_buy_for_existing_position(
                 snap=snap,
                 symbol=decision.candidate.ticker,
