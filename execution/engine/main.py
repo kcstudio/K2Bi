@@ -762,7 +762,10 @@ class Engine:
 
         # Adopt broker state as engine state.
         self._positions = reco.adopted_positions
-        self._journal_recovery_self_heals(journal_tail)
+        self._journal_recovery_self_heals(
+            journal_tail,
+            since=narrow_lookback_start,
+        )
         # If there was a journal-pending order still open at broker,
         # resume in AWAITING_FILL. MVP handles at most one in-flight,
         # so multiple still-open orders must refuse-to-start -- silently
@@ -2614,20 +2617,14 @@ class Engine:
             kwargs["strategy"] = event.strategy
         self.journal.append(event.event_type, **kwargs)
 
-    def _journal_recovery_self_healed_trade_ids(self) -> set[str]:
+    def _journal_recovery_self_healed_trade_ids(self, since: datetime) -> set[str]:
         out: set[str] = set()
-        try:
-            journal_paths = sorted(self.journal.base_dir.glob("*.jsonl"))
-        except OSError as exc:
-            LOG.warning("journal self-heal dedupe glob raised: %s", exc)
-            return out
-        for path in journal_paths:
-            try:
-                when = datetime.strptime(path.stem, "%Y-%m-%d").replace(
-                    tzinfo=timezone.utc
-                )
-            except ValueError:
-                continue
+        now = datetime.now(timezone.utc)
+        since_utc = since.astimezone(timezone.utc)
+        day_span = max((now.date() - since_utc.date()).days, 0)
+        since_iso = since_utc.isoformat()
+        for day_offset in range(day_span, -1, -1):
+            when = now - timedelta(days=day_offset)
             try:
                 records = self.journal.read_all(when)
             except Exception as exc:  # pragma: no cover - shouldn't raise
@@ -2638,6 +2635,8 @@ class Engine:
                 )
                 continue
             for rec in records:
+                if str(rec.get("ts", "")) < since_iso:
+                    continue
                 if rec.get("event_type") != "recovery_self_healed_pending_order":
                     continue
                 trade_id = rec.get("trade_id")
@@ -2648,8 +2647,10 @@ class Engine:
     def _journal_recovery_self_heals(
         self,
         journal_tail: list[dict[str, Any]],
+        *,
+        since: datetime,
     ) -> None:
-        healed_trade_ids = self._journal_recovery_self_healed_trade_ids()
+        healed_trade_ids = self._journal_recovery_self_healed_trade_ids(since)
         healed_trade_ids.update(
             str(rec.get("trade_id"))
             for rec in journal_tail

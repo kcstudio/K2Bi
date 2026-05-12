@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -262,8 +263,14 @@ class EngineSingularPendingRebuildTests(unittest.IsolatedAsyncioTestCase):
         )
 
         restart_engine = self._make_engine()
-        restart_tick = await restart_engine.tick_once()
+        with mock.patch.object(
+            restart_engine,
+            "_journal_recovery_self_heals",
+            wraps=restart_engine._journal_recovery_self_heals,
+        ) as heal_spy:
+            restart_tick = await restart_engine.tick_once()
 
         self.assertEqual(restart_tick.state_after, EngineState.CONNECTED_IDLE)
         self.assertIsNone(restart_engine._pending_order)
+        self.assertEqual(heal_spy.call_count, 1)
         self.assertEqual(len(self._self_heal_events()), 1)

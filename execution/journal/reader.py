@@ -55,10 +55,34 @@ def terminal_signals_by_trade_id(
 ) -> dict[str, dict[str, Any]]:
     """Index newest terminal signal by trade_id in one forward scan."""
     out: dict[str, dict[str, Any]] = {}
+    trade_id_by_perm: dict[str, str] = {}
+    trade_id_by_order: dict[str, str] = {}
     for event in records:
+        event_type = event.get("event_type")
         trade_id = event.get("trade_id")
-        if not trade_id:
+        if event_type == "order_submitted" and trade_id:
+            broker_perm_id = event.get("broker_perm_id")
+            broker_order_id = event.get("broker_order_id")
+            if broker_perm_id:
+                trade_id_by_perm[str(broker_perm_id)] = str(trade_id)
+            if broker_order_id:
+                trade_id_by_order[str(broker_order_id)] = str(trade_id)
+        if not is_terminal_signal_event(event):
             continue
-        if is_terminal_signal_event(event):
-            out[str(trade_id)] = event
+        indexed_trade_id = str(trade_id) if trade_id else None
+        if indexed_trade_id is None:
+            broker_perm_id = event.get("broker_perm_id")
+            broker_order_id = event.get("broker_order_id")
+            if broker_perm_id:
+                indexed_trade_id = trade_id_by_perm.get(str(broker_perm_id))
+            if indexed_trade_id is None and broker_order_id:
+                indexed_trade_id = trade_id_by_order.get(str(broker_order_id))
+        if indexed_trade_id is None:
+            LOG.warning(
+                "journal terminal scan: terminal %s missing trade_id and "
+                "broker-id fallback",
+                event.get("journal_entry_id"),
+            )
+            continue
+        out[indexed_trade_id] = event
     return out
