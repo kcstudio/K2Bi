@@ -2033,7 +2033,7 @@ class Engine:
         *,
         terminal_status: str,
     ) -> None:
-        record = self.journal.append(
+        record, last = self.journal.append_and_read_back(
             "order_terminal",
             payload={
                 "broker_order_id": pending.broker_order_id,
@@ -2047,25 +2047,27 @@ class Engine:
             broker_order_id=pending.broker_order_id,
             broker_perm_id=pending.broker_perm_id,
         )
-        try:
-            last = self.journal.read_back_last_event()
-        except Exception as exc:
-            raise JournalDurabilityError(
-                "order_terminal write durability check failed: "
-                f"read-back raised {type(exc).__name__}: {exc}"
-            ) from exc
+        payload = last.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
         if (
             last.get("event_type") != "order_terminal"
             or last.get("trade_id") != pending.trade_id
             or last.get("journal_entry_id") != record.get("journal_entry_id")
+            or payload.get("terminal_status") != terminal_status
+            or payload.get("broker_order_id") != pending.broker_order_id
         ):
             raise JournalDurabilityError(
                 "order_terminal write durability check failed: "
                 f"expected event_type=order_terminal trade_id={pending.trade_id} "
-                f"journal_entry_id={record.get('journal_entry_id')}, "
+                f"journal_entry_id={record.get('journal_entry_id')} "
+                f"terminal_status={terminal_status} "
+                f"broker_order_id={pending.broker_order_id}, "
                 f"got event_type={last.get('event_type')} "
                 f"trade_id={last.get('trade_id')} "
-                f"journal_entry_id={last.get('journal_entry_id')}"
+                f"journal_entry_id={last.get('journal_entry_id')} "
+                f"terminal_status={payload.get('terminal_status')} "
+                f"broker_order_id={payload.get('broker_order_id')}"
             )
         key = (pending.strategy, pending.order.ticker.upper())
         order_ids = self._pending_orders.get(key)

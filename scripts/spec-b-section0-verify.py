@@ -157,16 +157,24 @@ def main() -> int:
     if not killed_present:
         failures.append(f"expected kill sentinel present at {KILL_PATH}")
 
+    positions: list[dict[str, Any]] = []
+    open_orders: list[dict[str, Any]] = []
     ib = IB()
-    ib.connect("127.0.0.1", 4002, clientId=99, timeout=10)
     try:
+        ib.connect("127.0.0.1", 4002, clientId=99, timeout=10)
         positions = _position_rows(ib)
         open_orders = _open_order_rows(ib)
+    except Exception as exc:  # noqa: BLE001 -- live broker gate fails closed
+        failures.append(f"broker query failed: {type(exc).__name__}: {exc}")
     finally:
-        ib.disconnect()
+        try:
+            ib.disconnect()
+        except Exception as exc:  # noqa: BLE001 -- preserve primary failure
+            failures.append(f"broker disconnect failed: {type(exc).__name__}: {exc}")
 
-    _verify_positions(positions, failures)
-    _verify_g_stop(open_orders, failures)
+    if not any(f.startswith("broker query failed:") for f in failures):
+        _verify_positions(positions, failures)
+        _verify_g_stop(open_orders, failures)
 
     result = {
         "ts_utc": datetime.now(timezone.utc).isoformat(),

@@ -105,6 +105,92 @@ class JournalWriter:
         metadata: dict[str, Any] | None = None,
         ts: datetime | None = None,
     ) -> dict[str, Any]:
+        when, record = self._make_record(
+            event_type,
+            payload,
+            strategy=strategy,
+            trade_id=trade_id,
+            ticker=ticker,
+            side=side,
+            qty=qty,
+            broker_order_id=broker_order_id,
+            broker_perm_id=broker_perm_id,
+            slippage_bps=slippage_bps,
+            commission_usd=commission_usd,
+            fees_total_usd=fees_total_usd,
+            correlation_vs_portfolio=correlation_vs_portfolio,
+            error=error,
+            metadata=metadata,
+            ts=ts,
+        )
+        self._atomic_append(self._path_for(when), record)
+        return record
+
+    def append_and_read_back(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        strategy: str | None = None,
+        trade_id: str | None = None,
+        ticker: str | None = None,
+        side: str | None = None,
+        qty: int | None = None,
+        broker_order_id: str | None = None,
+        broker_perm_id: str | None = None,
+        slippage_bps: float | None = None,
+        commission_usd: float | None = None,
+        fees_total_usd: float | None = None,
+        correlation_vs_portfolio: float | None = None,
+        error: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        ts: datetime | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Append a record and read back the final line under one lock."""
+        when, record = self._make_record(
+            event_type,
+            payload,
+            strategy=strategy,
+            trade_id=trade_id,
+            ticker=ticker,
+            side=side,
+            qty=qty,
+            broker_order_id=broker_order_id,
+            broker_perm_id=broker_perm_id,
+            slippage_bps=slippage_bps,
+            commission_usd=commission_usd,
+            fees_total_usd=fees_total_usd,
+            correlation_vs_portfolio=correlation_vs_portfolio,
+            error=error,
+            metadata=metadata,
+            ts=ts,
+        )
+        last = self._atomic_append_and_read_back(self._path_for(when), record)
+        return record, last
+
+    def path_for_today(self) -> Path:
+        return self._path_for(datetime.now(timezone.utc))
+
+    def _make_record(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        strategy: str | None = None,
+        trade_id: str | None = None,
+        ticker: str | None = None,
+        side: str | None = None,
+        qty: int | None = None,
+        broker_order_id: str | None = None,
+        broker_perm_id: str | None = None,
+        slippage_bps: float | None = None,
+        commission_usd: float | None = None,
+        fees_total_usd: float | None = None,
+        correlation_vs_portfolio: float | None = None,
+        error: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        ts: datetime | None = None,
+    ) -> tuple[datetime, dict[str, Any]]:
         when = ts or datetime.now(timezone.utc)
         # Normalize to UTC so daily rotation + schema contract stay consistent
         # regardless of what tz the caller hands us. A naive datetime is
@@ -167,11 +253,7 @@ class JournalWriter:
             record["metadata"] = metadata
 
         validate(record)
-        self._atomic_append(self._path_for(when), record)
-        return record
-
-    def path_for_today(self) -> Path:
-        return self._path_for(datetime.now(timezone.utc))
+        return when, record
 
     def read_all(self, when: datetime | None = None) -> list[dict[str, Any]]:
         ref = when or datetime.now(timezone.utc)
@@ -298,30 +380,7 @@ class JournalWriter:
 
         lock_fd = self._acquire_shared_lock(target)
         try:
-            data = target.read_bytes()
-            if not data:
-                return {}
-            if not data.endswith(b"\n"):
-                raise JournalReplayTruncatedLineError(
-                    f"journal read-back found truncated final line: {target}"
-                )
-            lines = [line for line in data.splitlines() if line.strip()]
-            if not lines:
-                return {}
-            try:
-                record = json.loads(
-                    lines[-1].decode("utf-8"),
-                    parse_constant=reject_non_finite_json_constant,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                raise JournalReplayMalformedJsonError(
-                    f"journal read-back JSON parse failed at {target}: {exc}"
-                ) from exc
-            if not isinstance(record, dict):
-                raise JournalReplayMalformedJsonError(
-                    f"journal read-back expected object at {target}"
-                )
-            return record
+            return self._read_last_event_holding_lock(target)
         finally:
             self._release_lock(lock_fd)
 
@@ -582,9 +641,48 @@ class JournalWriter:
             finally:
                 os.close(dir_fd)
 
+    def _read_last_event_holding_lock(self, path: Path) -> dict[str, Any]:
+        """Read the last complete record. Caller MUST hold the sidecar lock."""
+        data = path.read_bytes()
+        if not data:
+            return {}
+        if not data.endswith(b"\n"):
+            raise JournalReplayTruncatedLineError(
+                f"journal read-back found truncated final line: {path}"
+            )
+        lines = [line for line in data.splitlines() if line.strip()]
+        if not lines:
+            return {}
+        try:
+            record = json.loads(
+                lines[-1].decode("utf-8"),
+                parse_constant=reject_non_finite_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise JournalReplayMalformedJsonError(
+                f"journal read-back JSON parse failed at {path}: {exc}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise JournalReplayMalformedJsonError(
+                f"journal read-back expected object at {path}"
+            )
+        return record
+
     def _atomic_append(self, path: Path, record: dict[str, Any]) -> None:
         lock_fd = self._acquire_lock(path)
         try:
             self._write_record_holding_lock(path, record)
+        finally:
+            self._release_lock(lock_fd)
+
+    def _atomic_append_and_read_back(
+        self,
+        path: Path,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        lock_fd = self._acquire_lock(path)
+        try:
+            self._write_record_holding_lock(path, record)
+            return self._read_last_event_holding_lock(path)
         finally:
             self._release_lock(lock_fd)

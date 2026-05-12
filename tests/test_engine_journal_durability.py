@@ -112,10 +112,16 @@ class EngineJournalDurabilityTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     def _set_mismatched_read_back(self) -> None:
-        self.journal.read_back_last_event = lambda: {  # type: ignore[attr-defined]
-            "event_type": "engine_started",
-            "trade_id": "T-stale",
-        }
+        real_append_and_read_back = self.journal.append_and_read_back
+
+        def append_and_stale_read_back(*args, **kwargs):  # type: ignore[no-untyped-def]
+            record, _last = real_append_and_read_back(*args, **kwargs)
+            return record, {
+                "event_type": "engine_started",
+                "trade_id": "T-stale",
+            }
+
+        self.journal.append_and_read_back = append_and_stale_read_back  # type: ignore[method-assign]
 
     def _set_consistent_read_back_fallback(self) -> None:
         if not hasattr(self.journal, "read_back_last_event"):
@@ -168,7 +174,7 @@ class EngineJournalDurabilityTests(unittest.IsolatedAsyncioTestCase):
         def fail_append(*args, **kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError("journal append failed")
 
-        self.journal.append = fail_append  # type: ignore[method-assign]
+        self.journal.append_and_read_back = fail_append  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(RuntimeError, "journal append failed"):
             await self.engine._reconcile_fill(
@@ -234,3 +240,5 @@ class EngineJournalDurabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stopped[0]["payload"]["pending_order"], pending.trade_id)
         self.assertIs(self.engine._pending_order, pending)
+        self.assertEqual(self.engine.state, EngineState.SHUTDOWN)
+        self.assertTrue(self.engine._shutdown_requested)
