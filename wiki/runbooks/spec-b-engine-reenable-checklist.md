@@ -15,8 +15,11 @@ operator completes every checkbox below and manually runs the final command.
 
 ## Preconditions
 
-- [ ] Spec B sections 1 through 6 are committed.
+- [ ] Spec B sections 1 through 8 are committed.
 - [ ] `pytest tests/ -q` passes on the MacBook after the final Spec B commit.
+- [ ] `pytest tests/test_engine_journal_durability.py -v` passes (§8.1).
+- [ ] `pytest tests/test_engine_singular_pending_rebuild.py -v` passes (§8.2).
+- [ ] `pytest tests/test_runner_observability.py -v` passes (§8.3).
 - [ ] `git status --short --untracked-files=all` shows only accepted local-only paths.
 - [ ] No agent has created or removed `~/Projects/K2Bi-Vault/System/.killed`.
 
@@ -112,6 +115,10 @@ scripts/wiki-log-append.sh /spec-b "§0-recheck-completed" "pre-reenable: ts_utc
 
 - [ ] DEVLOG.md has the Spec B entry.
 - [ ] `wiki/concepts/feature_k2bi-discipline-cleanup.md` has Known §5 limitations and Section 6 closure dispositions.
+- [ ] `JournalDurabilityError` exists in `execution/engine/main.py`.
+- [ ] `read_back_last_event()` exists in `execution/journal/writer.py`.
+- [ ] Terminal-signal recovery helper exists in `execution/journal/reader.py`.
+- [ ] `cycle_evaluated_skip_position_held` is registered in `execution/journal/schema.py`.
 - [ ] The post-Spec-B regression test plan remains queued for a fresh K2Bi session.
 
 ## Final Manual Action
