@@ -975,5 +975,94 @@ def test_record_sync_concurrent_writes_no_tempfile_collision(
     assert len(final) == 40 and all(c in "0123456789abcdef" for c in final)
 
 
+def test_deploy_script_ssh_restart_does_not_drain_category_loop(
+    tmp_path: Path,
+) -> None:
+    """Regression for shell stdin theft during the execution restart hook.
+
+    The deploy script iterates categories through a stdin-backed loop. A plain
+    ssh call inside that loop inherits the same stdin and can drain the
+    remaining category names. This fake transport intentionally consumes stdin;
+    the script must still sync scripts and skills after execution.
+    """
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / ".claude" / "skills" / "one").mkdir(parents=True)
+    (repo / "execution" / "engine.py").write_text("engine\n")
+    (repo / ".claude" / "skills" / "one" / "SKILL.md").write_text("skill\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+          - path: scripts/
+            category: scripts
+          - path: .claude/skills/
+            category: skills
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            cat >/dev/null
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    _init_git_repo(repo)
+    _git_commit_all(repo, "initial")
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "all"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Syncing category: execution" in result.stdout
+    assert "Syncing category: scripts" in result.stdout
+    assert "Syncing category: skills" in result.stdout
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

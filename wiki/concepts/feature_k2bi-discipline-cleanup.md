@@ -85,6 +85,25 @@ MasterClientID=99 visibility does NOT extend to cancellation. On the current IBC
 
 The 5/8 incident's "11 orphan STPs cancelled via bounded clientId=1 exception" pattern remains the canonical cleanup path until the post-Spec-B orphan-cleanup tool ships.
 
+## Known deploy-script limitations
+
+**Deploy-script stdin discipline.** SSH calls from inside bash loops that read
+from stdin (`while ... done < ...`, here-docs, here-strings) must explicitly
+close SSH stdin with `</dev/null` or use `ssh -n`. Rule of thumb: any
+`ssh_vps()` call site that does not intentionally pipe input to SSH should be
+safe by default. `scripts/deploy-to-vps.sh` now makes that true at the
+function level for direct SSH commands while leaving `ssh-vps-transport.sh`
+unchanged because rsync uses it via `-e` and legitimately needs its own
+transport protocol.
+
+**Open architect flag, 2026-05-13.** During the failed recovery deploy,
+the execution-category restart hook started `k2bi-engine.service` while
+`.killed` was present, and systemctl reported the unit as `active` before the
+operator manually stopped it. This may be a legitimate brief window before the
+engine reads `.killed` and exits, or it may be missing `.killed` respect on the
+systemd restart path. No code fix was applied in this session; architect must
+rule whether this needs §8.x or Phase 3.11 retro coverage.
+
 ## Cross-references
 
 - `.code-reviews/2026-05-08T04-22-34Z_d294dc.log` -- the review log itself.

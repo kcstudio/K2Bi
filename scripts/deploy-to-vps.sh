@@ -23,6 +23,8 @@ VPS="hostinger"
 LOCAL_BASE="$HOME/Projects/K2Bi"
 REMOTE_BASE="/home/k2bi/Projects/K2Bi"
 CONFIG_HELPER="$LOCAL_BASE/scripts/lib/deploy_config.py"
+SSH_TRANSPORT="$LOCAL_BASE/scripts/ssh-vps-transport.sh"
+SSH_OPTS=(-o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 DRY_RUN=false
 MODE=""
 RESTART_FAILED=false
@@ -55,6 +57,10 @@ KNOWN_CATEGORIES=$(python3 "$CONFIG_HELPER" list-categories)
 
 # --- helpers --------------------------------------------------------------
 
+ssh_vps() {
+    "$SSH_TRANSPORT" "${SSH_OPTS[@]}" "k2bi@$VPS" "$@" </dev/null
+}
+
 detect_changed_categories() {
     # Ask the config helper for the set of categories with pending changes
     # since the last successful sync (sentinel at .sync-state/last-synced-commit).
@@ -85,10 +91,12 @@ rsync_target() {
 
     if [[ -d "$LOCAL_BASE/$stripped" ]]; then
         rsync -av $rsync_flag --delete \
+            -e "$SSH_TRANSPORT" \
             --exclude '__pycache__/' --exclude '*.pyc' --exclude '.venv/' \
             "$LOCAL_BASE/$stripped/" "k2bi@$VPS:$REMOTE_BASE/$stripped/"
     elif [[ -f "$LOCAL_BASE/$stripped" ]]; then
-        rsync -av $rsync_flag "$LOCAL_BASE/$stripped" "k2bi@$VPS:$REMOTE_BASE/$stripped"
+        rsync -av $rsync_flag -e "$SSH_TRANSPORT" \
+            "$LOCAL_BASE/$stripped" "k2bi@$VPS:$REMOTE_BASE/$stripped"
     else
         if $DRY_RUN; then
             warn "  (dry-run) would remove k2bi@$VPS:$REMOTE_BASE/$stripped if present"
@@ -96,7 +104,7 @@ rsync_target() {
         fi
         # Mirror local deletion to remote so state stays consistent.
         local result
-        result=$(ssh "k2bi@$VPS" "
+        result=$(ssh_vps "
             if [ -d $REMOTE_BASE/$stripped ]; then
                 rm -rf $REMOTE_BASE/$stripped && echo REMOVED_DIR
             elif [ -f $REMOTE_BASE/$stripped ]; then
@@ -130,7 +138,7 @@ sync_category() {
     # drift between MacBook and VPS skill-folder counts surfaces loudly.
     if [[ "$category" == "skills" ]] && ! $DRY_RUN; then
         local remote_count local_count
-        remote_count=$(ssh "k2bi@$VPS" "ls -d $REMOTE_BASE/.claude/skills/*/ 2>/dev/null | wc -l" | tr -d ' ')
+        remote_count=$(ssh_vps "ls -d $REMOTE_BASE/.claude/skills/*/ 2>/dev/null | wc -l" | tr -d ' ')
         local_count=$(ls -d "$LOCAL_BASE/.claude/skills/"*/ 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$remote_count" == "$local_count" ]]; then
             log "  skills verified: $remote_count skill folders on both machines"
@@ -145,7 +153,7 @@ sync_category() {
         case "$category" in
             execution)
                 log "  restarting k2bi-engine.service on VPS"
-                ssh "k2bi@$VPS" "sudo systemctl restart k2bi-engine.service" || {
+                ssh_vps "sudo systemctl restart k2bi-engine.service" || {
                     err "  RESTART FAILED for category '$category': k2bi-engine.service did not restart cleanly. Sync sentinel will NOT advance; re-run /sync after resolving the restart issue."
                     RESTART_FAILED=true
                 }
@@ -155,7 +163,7 @@ sync_category() {
                 # systemd service as execution. Kept as `pm2` in deploy-config.yml
                 # so downstream readers (skills, preflight) need no rename.
                 log "  restarting k2bi-engine.service on VPS (pm2 category -> systemd)"
-                ssh "k2bi@$VPS" "sudo systemctl restart k2bi-engine.service" || {
+                ssh_vps "sudo systemctl restart k2bi-engine.service" || {
                     err "  RESTART FAILED for category '$category': k2bi-engine.service did not restart cleanly. Sync sentinel will NOT advance; re-run /sync after resolving the restart issue."
                     RESTART_FAILED=true
                 }
@@ -218,8 +226,8 @@ esac
 
 # --- execute --------------------------------------------------------------
 
-if ! ssh -o ConnectTimeout=5 "k2bi@$VPS" "echo ok" &>/dev/null; then
-    err "Cannot reach Hostinger VPS (ssh k2bi@$VPS). Is it on?"
+if ! ssh_vps "echo ok" &>/dev/null; then
+    err "Cannot reach Hostinger VPS through scripts/ssh-vps-transport.sh. Is it on?"
     exit 1
 fi
 
@@ -227,7 +235,7 @@ fi
 # The rsync commands build directory structure as they go, but a first-time
 # deploy into a virgin REMOTE_BASE needs the parent there.
 REMOTE_MKDIRS=$(python3 "$CONFIG_HELPER" list-targets | awk -F/ '{if ($1 != $0) print $1}' | sort -u)
-ssh "k2bi@$VPS" "mkdir -p $REMOTE_BASE $(echo "$REMOTE_MKDIRS" | awk -v base="$REMOTE_BASE" '{print base"/"$0}' | tr '\n' ' ')" || {
+ssh_vps "mkdir -p $REMOTE_BASE $(echo "$REMOTE_MKDIRS" | awk -v base="$REMOTE_BASE" '{print base"/"$0}' | tr '\n' ' ')" || {
     err "Failed to create remote base directories"
     exit 1
 }
