@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from execution.strategies import loader
+from execution.strategies import types as strategy_types
 from execution.strategies.types import (
     ALLOWED_STATUSES,
     STATUS_APPROVED,
@@ -20,6 +21,8 @@ from execution.strategies.types import (
     StrategyFileModifiedError,
     StrategyLoaderError,
 )
+
+STATUS_STOPPED_OUT = getattr(strategy_types, "STATUS_STOPPED_OUT", "stopped_out")
 
 
 def _write_strategy(
@@ -142,12 +145,35 @@ class LoadDocumentTests(unittest.TestCase):
     def test_rejected_status_in_allowed_set(self):
         self.assertIn(STATUS_REJECTED, ALLOWED_STATUSES)
         self.assertIn(STATUS_RETIRED, ALLOWED_STATUSES)
+        self.assertIn(STATUS_STOPPED_OUT, ALLOWED_STATUSES)
         self.assertEqual(
             ALLOWED_STATUSES,
             frozenset(
-                {STATUS_PROPOSED, STATUS_APPROVED, STATUS_REJECTED, STATUS_RETIRED}
+                {
+                    STATUS_PROPOSED,
+                    STATUS_APPROVED,
+                    STATUS_REJECTED,
+                    STATUS_RETIRED,
+                    STATUS_STOPPED_OUT,
+                }
             ),
         )
+
+    def test_stopped_out_status_parses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_strategy(
+                Path(tmp),
+                "stopped",
+                status=STATUS_STOPPED_OUT,
+                extra_frontmatter={
+                    "stopped_out_at": "2026-05-13T14:26:23Z",
+                    "stopped_out_fill_perm_id": "1677427049",
+                    "stopped_out_fill_price": "29.93",
+                    "re_approve_path": '"/invest-ship --re-approve stopped"',
+                },
+            )
+            doc = loader.load_document(path)
+            self.assertEqual(doc.status, STATUS_STOPPED_OUT)
 
     def test_missing_order_on_hand_crafted_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,6 +521,17 @@ class LoadAllApprovedTests(unittest.TestCase):
                 status=STATUS_PROPOSED,
                 approved_at=None,
                 approved_commit_sha=None,
+            )
+            _write_strategy(
+                Path(tmp),
+                "stopped-one",
+                status=STATUS_STOPPED_OUT,
+                extra_frontmatter={
+                    "stopped_out_at": "2026-05-13T14:26:23Z",
+                    "stopped_out_fill_perm_id": "1677427049",
+                    "stopped_out_fill_price": "29.93",
+                    "re_approve_path": '"/invest-ship --re-approve stopped-one"',
+                },
             )
             snaps = loader.load_all_approved(Path(tmp))
             self.assertEqual(len(snaps), 1)

@@ -40,8 +40,15 @@ STATUS_PROPOSED = "proposed"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 STATUS_RETIRED = "retired"
+STATUS_STOPPED_OUT = "stopped_out"
 ALLOWED_STATUSES = frozenset(
-    {STATUS_PROPOSED, STATUS_APPROVED, STATUS_REJECTED, STATUS_RETIRED}
+    {
+        STATUS_PROPOSED,
+        STATUS_APPROVED,
+        STATUS_REJECTED,
+        STATUS_RETIRED,
+        STATUS_STOPPED_OUT,
+    }
 )
 
 # Strategy types we know how to evaluate. Phase 2 ships hand_crafted

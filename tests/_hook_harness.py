@@ -179,6 +179,11 @@ def strategy_text(
     approved_commit_sha: str | None = None,
     retired_at: str | None = None,
     retired_reason: str | None = None,
+    stopped_out_at: str | None = None,
+    stopped_out_fill_perm_id: str | int | None = None,
+    stopped_out_fill_price: str | None = None,
+    stopped_out_realized_pnl_usd: str | None = None,
+    re_approve_path: str | None = None,
     rejected_at: str | None = None,
     rejected_reason: str | None = None,
     how_this_works: str | None = "Plain-English explanation body.",
@@ -211,6 +216,16 @@ def strategy_text(
         lines.append(f"retired_at: {retired_at}")
     if retired_reason is not None:
         lines.append(f'retired_reason: "{retired_reason}"')
+    if stopped_out_at is not None:
+        lines.append(f"stopped_out_at: {stopped_out_at}")
+    if stopped_out_fill_perm_id is not None:
+        lines.append(f"stopped_out_fill_perm_id: {stopped_out_fill_perm_id}")
+    if stopped_out_fill_price is not None:
+        lines.append(f"stopped_out_fill_price: {stopped_out_fill_price}")
+    if stopped_out_realized_pnl_usd is not None:
+        lines.append(f"stopped_out_realized_pnl_usd: {stopped_out_realized_pnl_usd}")
+    if re_approve_path is not None:
+        lines.append(f're_approve_path: "{re_approve_path}"')
     if rejected_at is not None:
         lines.append(f"rejected_at: {rejected_at}")
     if rejected_reason is not None:

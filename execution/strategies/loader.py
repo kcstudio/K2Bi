@@ -162,7 +162,7 @@ def load_approved(path: Path) -> ApprovedStrategySnapshot:
     if doc.status != STATUS_APPROVED:
         raise StrategyLoaderError(
             f"{path}: load_approved() requires status={STATUS_APPROVED!r}, "
-            f"got {doc.status!r}. Use load_document() for proposed/retired."
+            f"got {doc.status!r}. Use load_document() for inactive statuses."
         )
     if doc.approved_at is None:
         raise StrategyLoaderError(
@@ -243,7 +243,8 @@ def load_all_approved(strategies_dir: Path) -> list[ApprovedStrategySnapshot]:
     with status=approved.
 
     Codex round-11 P1: only files that claim status=approved have to
-    parse cleanly. An in-progress draft (status=proposed / retired)
+    parse cleanly. An in-progress or inactive strategy
+    (status=proposed / retired / stopped_out)
     that fails parse is NOT a runtime concern -- runtime only consumes
     approved strategies -- so we skip it with a log-worthy warning
     rather than aborting engine startup. Approved strategies that fail
@@ -265,7 +266,7 @@ def load_all_approved(strategies_dir: Path) -> list[ApprovedStrategySnapshot]:
             # cannot see from full YAML might STILL be an approved
             # strategy. Peek at the raw status line to decide:
             #   approved-intent + parse fails  -> raise (runtime gap)
-            #   draft/retired + parse fails    -> quietly skip
+            #   draft/inactive + parse fails   -> quietly skip
             peek = _peek_status(path)
             if peek == STATUS_APPROVED:
                 errors.append((path, exc))
@@ -291,7 +292,7 @@ def _peek_status(path: Path) -> str | None:
 
     Used when load_document() fails: we still want to know if the
     file's INTENT was approved (and therefore a load failure should
-    be loud) or draft/retired (quiet skip). Returns the trimmed
+    be loud) or draft/inactive (quiet skip). Returns the trimmed
     status value, or None when the file has no readable status line.
     """
     try:

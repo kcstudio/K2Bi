@@ -65,6 +65,16 @@ def _retire_message(slug: str = "foo") -> str:
     )
 
 
+def _stop_message(slug: str = "foo") -> str:
+    return (
+        f"feat(strategy): stop out {slug}\n"
+        "\n"
+        "Strategy-Transition: approved -> stopped_out\n"
+        f"Stopped-Out-Strategy: strategy_{slug}\n"
+        "Co-Shipped-By: invest-ship\n"
+    )
+
+
 def _seed_proposed(repo: Path, env: dict, slug: str = "foo") -> str:
     write_strategy(repo, slug, status="proposed")
     run_git(repo, "add", "-A", env=env, check=True)
@@ -171,6 +181,25 @@ class HappyTransitions(unittest.TestCase):
             result = run_git(
                 repo, "commit", "-m", _retire_message(), env=env
             )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_approved_to_stopped_out_passes(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            write_strategy(
+                repo,
+                "foo",
+                status="stopped_out",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+                stopped_out_at='"2026-05-13T14:26:23Z"',
+                stopped_out_fill_perm_id=1677427049,
+                stopped_out_fill_price="29.93",
+                re_approve_path="/invest-ship --re-approve foo",
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            result = run_git(repo, "commit", "-m", _stop_message(), env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_body_only_edit_on_proposed_needs_no_trailers(self):
@@ -286,6 +315,32 @@ class MissingTrailers(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Retired-Strategy", result.stderr)
 
+    def test_missing_stopped_out_strategy_trailer_fails(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            write_strategy(
+                repo,
+                "foo",
+                status="stopped_out",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+                stopped_out_at='"2026-05-13T14:26:23Z"',
+                stopped_out_fill_perm_id=1677427049,
+                stopped_out_fill_price="29.93",
+                re_approve_path="/invest-ship --re-approve foo",
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            msg = (
+                "feat(strategy): stop out foo\n"
+                "\n"
+                "Strategy-Transition: approved -> stopped_out\n"
+                "Co-Shipped-By: invest-ship\n"
+            )
+            result = run_git(repo, "commit", "-m", msg, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Stopped-Out-Strategy", result.stderr)
+
     def test_missing_rejected_strategy_trailer_fails(self):
         with hook_repo() as (repo, env):
             seed_initial_commit(repo, env)
@@ -358,6 +413,42 @@ class ForbiddenTransitions(unittest.TestCase):
                 or "forbidden" in stderr_lower,
                 f"expected rejection message, got: {result.stderr}",
             )
+
+    def test_stopped_out_to_approved_rejected(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            write_strategy(
+                repo,
+                "foo",
+                status="stopped_out",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+                stopped_out_at='"2026-05-13T14:26:23Z"',
+                stopped_out_fill_perm_id=1677427049,
+                stopped_out_fill_price="29.93",
+                re_approve_path="/invest-ship --re-approve foo",
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            run_git(repo, "commit", "-m", _stop_message(), env=env, check=True)
+
+            write_strategy(
+                repo,
+                "foo",
+                status="approved",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            result = run_git(
+                repo,
+                "commit",
+                "-m",
+                _approve_message(),
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("forbidden", result.stderr.lower())
 
     def test_rejected_to_approved_rejected(self):
         with hook_repo() as (repo, env):

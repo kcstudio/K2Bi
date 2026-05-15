@@ -129,6 +129,16 @@ if [ -n "$STRATEGY_FILES" ]; then
       # Capture status for Check B conditional.
       staged_status=$(${FRONTMATTER} status < "$staged_file" 2>/dev/null || true)
 
+      # Spec B §9.2: any staged stopped_out strategy must carry strict
+      # stop-out metadata. This is status-based, not transition-based, so
+      # repair commits cannot land malformed stopped_out files.
+      if [ "$staged_status" = "stopped_out" ]; then
+        if ! err=$(${FRONTMATTER} validate-stopped-out-metadata < "$staged_file" 2>&1); then
+          echo "error: $path (Check A2 -- stopped_out metadata): $err" >&2
+          exit 1
+        fi
+      fi
+
       # ---------- Check B -- How This Works non-empty ----------
       if [ "$staged_status" = "proposed" ] || [ "$staged_status" = "approved" ]; then
         if ! ${FRONTMATTER} how-this-works < "$staged_file" >/dev/null 2>&1; then

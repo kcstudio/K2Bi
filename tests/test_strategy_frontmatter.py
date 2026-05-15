@@ -172,10 +172,10 @@ class HowThisWorksTests(unittest.TestCase):
 
 class AllowedStatusesTests(unittest.TestCase):
     def test_enum_has_four_values(self):
-        # Spec §2.2 authoritative set.
+        # Spec §9.2 adds stopped_out as the fifth lifecycle status.
         self.assertEqual(
             sf.ALLOWED_STATUSES,
-            frozenset({"proposed", "approved", "rejected", "retired"}),
+            frozenset({"proposed", "approved", "rejected", "retired", "stopped_out"}),
         )
 
     def test_enum_matches_loader_types(self):
@@ -193,6 +193,7 @@ class AllowedTransitionsTests(unittest.TestCase):
             ("proposed", "approved"),
             ("proposed", "rejected"),
             ("approved", "retired"),
+            ("approved", "stopped_out"),
         ]:
             self.assertIn(pair, sf.ALLOWED_TRANSITIONS)
 
@@ -201,11 +202,15 @@ class AllowedTransitionsTests(unittest.TestCase):
             (sf.NEW_FILE, "approved"),
             (sf.NEW_FILE, "rejected"),
             (sf.NEW_FILE, "retired"),
+            (sf.NEW_FILE, "stopped_out"),
             ("approved", "proposed"),
             ("rejected", "approved"),
             ("rejected", "proposed"),
             ("retired", "approved"),
             ("retired", "proposed"),
+            ("stopped_out", "approved"),
+            ("stopped_out", "proposed"),
+            ("stopped_out", "retired"),
             ("approved", "rejected"),
         ]
         for pair in forbidden:
@@ -266,6 +271,72 @@ class CheckImmutableTests(unittest.TestCase):
             sp = self._write(tmp, "s.md", staged)
             code, msg = sf.check_immutable(hp, sp)
             self.assertEqual(code, 0, msg)
+
+    def test_approved_to_stopped_out_with_required_fields_allowed(self):
+        head = _strategy(status="approved", how_this_works="Body.")
+        staged = _strategy(
+            status="stopped_out",
+            how_this_works="Body.",
+            extras={
+                "stopped_out_at": '"2026-05-13T14:26:23Z"',
+                "stopped_out_fill_perm_id": "1677427049",
+                "stopped_out_fill_price": "29.93",
+                "re_approve_path": '"/invest-ship --re-approve foo"',
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            hp = self._write(tmp, "h.md", head)
+            sp = self._write(tmp, "s.md", staged)
+            code, msg = sf.check_immutable(hp, sp)
+            self.assertEqual(code, 0, msg)
+
+    def test_stopped_out_missing_metadata_rejected_even_without_transition(self):
+        content = _strategy(status="stopped_out")
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_stopped_out_metadata(sf.parse(content))
+        self.assertIn("stopped_out_at", str(cm.exception))
+
+    def test_stopped_out_metadata_rejects_non_positive_perm_id(self):
+        content = _strategy(
+            status="stopped_out",
+            extras={
+                "stopped_out_at": '"2026-05-13T14:26:23Z"',
+                "stopped_out_fill_perm_id": "0",
+                "stopped_out_fill_price": "29.93",
+                "re_approve_path": '"/invest-ship --re-approve foo"',
+            },
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_stopped_out_metadata(sf.parse(content))
+        self.assertIn("positive int", str(cm.exception))
+
+    def test_stopped_out_metadata_rejects_non_positive_price(self):
+        content = _strategy(
+            status="stopped_out",
+            extras={
+                "stopped_out_at": '"2026-05-13T14:26:23Z"',
+                "stopped_out_fill_perm_id": "1677427049",
+                "stopped_out_fill_price": "0",
+                "re_approve_path": '"/invest-ship --re-approve foo"',
+            },
+        )
+        with self.assertRaises(ValueError) as cm:
+            sf.validate_stopped_out_metadata(sf.parse(content))
+        self.assertIn("positive Decimal", str(cm.exception))
+
+    def test_stopped_out_metadata_accepts_optional_realized_pnl(self):
+        content = _strategy(
+            status="stopped_out",
+            extras={
+                "stopped_out_at": '"2026-05-13T14:26:23Z"',
+                "stopped_out_fill_perm_id": "1677427049",
+                "stopped_out_fill_price": "29.93",
+                "stopped_out_realized_pnl_usd": "-27.69",
+                "re_approve_path": '"/invest-ship --re-approve foo"',
+            },
+        )
+        sf.validate_stopped_out_metadata(sf.parse(content))
 
     def test_approved_body_edit_rejected(self):
         head = _strategy(status="approved", how_this_works="Original body.")
@@ -399,6 +470,23 @@ class CheckTransitionTests(unittest.TestCase):
             code, _, old, new = sf.check_transition(head, staged)
             self.assertEqual(code, 0)
             self.assertEqual((old, new), ("approved", "retired"))
+
+    def test_approved_to_stopped_out_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            head = self._write(tmp, "h.md", _strategy(status="approved"))
+            staged = self._write(tmp, "s.md", _strategy(status="stopped_out"))
+            code, _, old, new = sf.check_transition(head, staged)
+            self.assertEqual(code, 0)
+            self.assertEqual((old, new), ("approved", "stopped_out"))
+
+    def test_stopped_out_to_approved_forbidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            head = self._write(tmp, "h.md", _strategy(status="stopped_out"))
+            staged = self._write(tmp, "s.md", _strategy(status="approved"))
+            code, _, _, _ = sf.check_transition(head, staged)
+            self.assertEqual(code, 1)
 
     def test_body_only_edit_returns_same_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -666,10 +754,17 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"pending", result.stderr)
 
-    def test_validate_status_accepts_all_four(self):
-        for s in ("proposed", "approved", "rejected", "retired"):
+    def test_validate_status_accepts_all_statuses(self):
+        for s in ("proposed", "approved", "rejected", "retired", "stopped_out"):
             result = self._run(["validate-status"], stdin=_strategy(status=s))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_validate_stopped_out_metadata_cli_rejects_missing_fields(self):
+        result = self._run(
+            ["validate-stopped-out-metadata"], stdin=_strategy(status="stopped_out")
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"stopped_out_at", result.stderr)
 
     def test_how_this_works_returns_body(self):
         result = self._run(

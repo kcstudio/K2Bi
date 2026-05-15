@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import subprocess
 import sys
 import traceback
@@ -125,13 +126,18 @@ from scripts.lib.invest_ship_strategy import (  # noqa: E402
     resolve_vault_root,
 )
 from scripts.lib.strategy_frontmatter import (  # noqa: E402
+    atomic_write_bytes,
     extract_status,
     parse as parse_frontmatter,
+    validate_stopped_out_metadata,
 )
 
 
 RETIRED_TRAILER_RE = re.compile(
     r"^Retired-Strategy:\s*strategy_[^\s]+\s*$", re.MULTILINE
+)
+STOPPED_OUT_TRAILER_RE = re.compile(
+    r"^Stopped-Out-Strategy:\s*strategy_[^\s]+\s*$", re.MULTILINE
 )
 STRATEGY_PATH_RE = re.compile(r"^wiki/strategies/strategy_[^/]+\.md$")
 
@@ -557,6 +563,73 @@ def _run_retire_sentinel_phase(message: str, commit_sha: str) -> None:
             continue
 
 
+def _stopped_out_sentinel_path(base_dir: Path, slug: str, commit_sha: str) -> Path:
+    return base_dir / f".stopped-out-{slug}-{commit_sha[:16]}"
+
+
+def _run_stopped_out_sentinel_phase(message: str, commit_sha: str) -> None:
+    """Write stopped-out sentinels for approved -> stopped_out commits."""
+    if not STOPPED_OUT_TRAILER_RE.search(message):
+        return
+
+    stopped_dir = _resolve_retired_dir()
+    stopped_dir.mkdir(parents=True, exist_ok=True)
+
+    for path in _changed_strategy_paths():
+        content = _file_at_head(path)
+        if not content:
+            continue
+        try:
+            fm = parse_frontmatter(content)
+        except ValueError as exc:
+            _log_stderr(f"{path}: frontmatter parse failed ({exc}); skipping")
+            continue
+        if extract_status(fm) != "stopped_out":
+            continue
+        try:
+            validate_stopped_out_metadata(fm)
+        except ValueError as exc:
+            _log_stderr(f"{path}: stopped_out metadata invalid ({exc}); skipping")
+            _log_wiki(
+                "stopped_out_sentinel_write_failed",
+                f"{path} commit={commit_sha} metadata={exc}",
+            )
+            continue
+        slug = derive_retire_slug(path)
+        stopped_out_at = str(fm["stopped_out_at"])
+        record = {
+            "ts": stopped_out_at,
+            "source": "engine stop-out lifecycle",
+            "slug": slug,
+            "commit_sha": commit_sha,
+            "strategy_path": path,
+            "stopped_out_at": stopped_out_at,
+            "stopped_out_fill_perm_id": int(fm["stopped_out_fill_perm_id"]),
+            "stopped_out_fill_price": str(fm["stopped_out_fill_price"]),
+            "re_approve_path": str(fm["re_approve_path"]),
+        }
+        if "stopped_out_realized_pnl_usd" in fm:
+            record["stopped_out_realized_pnl_usd"] = str(
+                fm["stopped_out_realized_pnl_usd"]
+            )
+        sentinel = _stopped_out_sentinel_path(stopped_dir, slug, commit_sha)
+        try:
+            atomic_write_bytes(
+                sentinel,
+                (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"),
+            )
+        except Exception:  # noqa: BLE001 -- surface then continue
+            _log_stderr(
+                f"{path}: stopped_out sentinel write failed:\n"
+                f"{traceback.format_exc()}"
+            )
+            _log_wiki(
+                "stopped_out_sentinel_write_failed",
+                f"{path} commit={commit_sha}",
+            )
+            continue
+
+
 def main() -> int:
     message = _commit_message()
     commit_sha = _commit_sha()
@@ -576,6 +649,14 @@ def main() -> int:
     except Exception:  # noqa: BLE001 -- defense-in-depth; never raise
         _log_stderr(
             f"unexpected error in retire-sentinel phase:\n{traceback.format_exc()}"
+        )
+
+    try:
+        _run_stopped_out_sentinel_phase(message, commit_sha)
+    except Exception:  # noqa: BLE001 -- defense-in-depth; never raise
+        _log_stderr(
+            f"unexpected error in stopped-out sentinel phase:\n"
+            f"{traceback.format_exc()}"
         )
 
     # Post-commit hooks cannot fail the commit (git ignores non-zero

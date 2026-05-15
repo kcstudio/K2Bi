@@ -55,6 +55,7 @@ import os
 import sys
 import tempfile
 import unicodedata
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -67,7 +68,9 @@ FRONTMATTER_DELIM = "---"
 # Spec §2.2 authoritative set. Kept in lockstep with
 # `execution.strategies.types.ALLOWED_STATUSES` (verified by
 # test_strategy_frontmatter.AllowedStatusesTests.test_enum_matches_loader_types).
-ALLOWED_STATUSES = frozenset({"proposed", "approved", "rejected", "retired"})
+ALLOWED_STATUSES = frozenset(
+    {"proposed", "approved", "rejected", "retired", "stopped_out"}
+)
 
 # Sentinel used when a strategy file has no prior HEAD state (new file
 # at this commit). Lets `(old, new)` pair lookups stay total.
@@ -81,6 +84,7 @@ ALLOWED_TRANSITIONS = frozenset(
         ("proposed", "approved"),
         ("proposed", "rejected"),
         ("approved", "retired"),
+        ("approved", "stopped_out"),
     }
 )
 
@@ -89,6 +93,22 @@ ALLOWED_TRANSITIONS = frozenset(
 # separately; these are the *new keys* that may appear in the staged
 # frontmatter but not in HEAD.
 RETIRE_ADDED_FIELDS = frozenset({"retired_at", "retired_reason"})
+STOPPED_OUT_REQUIRED_FIELDS = frozenset(
+    {
+        "stopped_out_at",
+        "stopped_out_fill_perm_id",
+        "stopped_out_fill_price",
+        "re_approve_path",
+    }
+)
+STOPPED_OUT_REQUIRED_FIELD_ORDER = (
+    "stopped_out_at",
+    "stopped_out_fill_perm_id",
+    "stopped_out_fill_price",
+    "re_approve_path",
+)
+STOPPED_OUT_OPTIONAL_FIELDS = frozenset({"stopped_out_realized_pnl_usd"})
+STOPPED_OUT_ADDED_FIELDS = STOPPED_OUT_REQUIRED_FIELDS | STOPPED_OUT_OPTIONAL_FIELDS
 
 
 STRATEGY_FILENAME_PREFIX = "strategy_"
@@ -573,6 +593,73 @@ def extract_status(frontmatter: dict[str, Any]) -> str | None:
     return s or None
 
 
+def _require_iso_timestamp(frontmatter: dict[str, Any], field: str) -> None:
+    raw = frontmatter.get(field)
+    if isinstance(raw, _dt.datetime):
+        return
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{field} must be a non-empty ISO timestamp")
+    candidate = raw.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = _dt.datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO timestamp: {raw!r}") from exc
+    if isinstance(parsed, _dt.datetime):
+        return
+
+
+def _require_positive_int(frontmatter: dict[str, Any], field: str) -> None:
+    raw = frontmatter.get(field)
+    if type(raw) is not int or raw <= 0:
+        raise ValueError(f"{field} must be a positive int")
+
+
+def _require_decimal(
+    frontmatter: dict[str, Any],
+    field: str,
+    *,
+    positive: bool,
+) -> None:
+    raw = frontmatter.get(field)
+    if raw is None or isinstance(raw, bool):
+        raise ValueError(
+            f"{field} must be a {'positive ' if positive else ''}Decimal"
+        )
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field} must be a {'positive ' if positive else ''}Decimal"
+        ) from exc
+    if not value.is_finite() or (positive and value <= 0):
+        raise ValueError(
+            f"{field} must be a {'positive ' if positive else ''}Decimal"
+        )
+
+
+def validate_stopped_out_metadata(frontmatter: dict[str, Any]) -> None:
+    """Validate required stopped_out lifecycle metadata."""
+    missing = [
+        field
+        for field in STOPPED_OUT_REQUIRED_FIELD_ORDER
+        if field not in frontmatter
+    ]
+    if missing:
+        raise ValueError(
+            f"stopped_out metadata missing required field {missing[0]!r}"
+        )
+    _require_iso_timestamp(frontmatter, "stopped_out_at")
+    _require_positive_int(frontmatter, "stopped_out_fill_perm_id")
+    _require_decimal(frontmatter, "stopped_out_fill_price", positive=True)
+    re_approve_path = frontmatter.get("re_approve_path")
+    if not isinstance(re_approve_path, str) or not re_approve_path.strip():
+        raise ValueError("re_approve_path must be a non-empty string")
+    if "stopped_out_realized_pnl_usd" in frontmatter:
+        _require_decimal(frontmatter, "stopped_out_realized_pnl_usd", positive=False)
+
+
 def extract_how_this_works_body(content: bytes) -> str:
     """Return the body of the `## How This Works` section, stripped.
 
@@ -706,6 +793,41 @@ def check_immutable(head_path: Path, staged_path: Path) -> tuple[int, str]:
                 "approved->retired must not change the body (markdown "
                 "after the closing `---` fence). Body changes require "
                 "retire + new proposed draft."
+            )
+        return 0, ""
+
+    if staged_status == "stopped_out":
+        try:
+            validate_stopped_out_metadata(staged_fm)
+        except ValueError as exc:
+            return 1, f"approved->stopped_out metadata invalid: {exc}"
+        if removed:
+            return 1, (
+                f"approved->stopped_out must not remove frontmatter keys; "
+                f"removed: {sorted(removed)}"
+            )
+        extraneous = added - STOPPED_OUT_ADDED_FIELDS
+        if extraneous:
+            return 1, (
+                f"approved->stopped_out may only add "
+                f"{sorted(STOPPED_OUT_ADDED_FIELDS)} fields; got "
+                f"{sorted(extraneous)}"
+            )
+        non_status_changed = [
+            k for k in changed if k != "status" and _nfc(head_fm[k]) != _nfc(staged_fm.get(k))
+        ]
+        if non_status_changed:
+            key = non_status_changed[0]
+            return 1, (
+                f"approved->stopped_out must not change frontmatter field "
+                f"{key!r} (head={head_fm[key]!r}, "
+                f"staged={staged_fm.get(key)!r})"
+            )
+        if _nfc(head_body) != _nfc(staged_body):
+            return 1, (
+                "approved->stopped_out must not change the body (markdown "
+                "after the closing `---` fence). Body changes require "
+                "a new proposed draft after re-approval work lands."
             )
         return 0, ""
 
@@ -845,6 +967,16 @@ def _cli_how_this_works(content: bytes) -> int:
     return 1
 
 
+def _cli_validate_stopped_out_metadata(content: bytes) -> int:
+    try:
+        fm = parse(content)
+        validate_stopped_out_metadata(fm)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="strategy_frontmatter",
@@ -860,6 +992,10 @@ def main(argv: list[str] | None = None) -> int:
         "how-this-works",
         help="print body of `## How This Works` section from stdin; "
         "exit 1 if missing",
+    )
+    sub.add_parser(
+        "validate-stopped-out-metadata",
+        help="exit 0 if stdin carries valid stopped_out metadata",
     )
     immut = sub.add_parser(
         "check-approved-immutable",
@@ -883,13 +1019,20 @@ def main(argv: list[str] | None = None) -> int:
     slug.add_argument("path", help="strategy file path")
     args = parser.parse_args(argv)
 
-    if args.cmd in {"status", "validate-status", "how-this-works"}:
+    if args.cmd in {
+        "status",
+        "validate-status",
+        "how-this-works",
+        "validate-stopped-out-metadata",
+    }:
         content = sys.stdin.buffer.read()
         if args.cmd == "status":
             return _cli_status(content)
         if args.cmd == "validate-status":
             return _cli_validate_status(content)
-        return _cli_how_this_works(content)
+        if args.cmd == "how-this-works":
+            return _cli_how_this_works(content)
+        return _cli_validate_stopped_out_metadata(content)
 
     if args.cmd == "check-approved-immutable":
         code, msg = check_immutable(Path(args.head), Path(args.staged))

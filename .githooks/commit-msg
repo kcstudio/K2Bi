@@ -138,7 +138,7 @@ while IFS= read -r path; do
     continue
   fi
 
-  # Any remaining transition lands in {approved, rejected, retired}
+  # Any remaining transition lands in {approved, rejected, retired, stopped_out}
   # (forbidden transitions already exited above via rc=1). Slug is
   # derived through the shared helper so hook + engine always agree
   # (parity covered by tests/test_strategy_frontmatter).
@@ -161,6 +161,7 @@ while IFS= read -r path; do
     approved) action="Approved" ;;
     rejected) action="Rejected" ;;
     retired)  action="Retired"  ;;
+    stopped_out) action="Stopped-Out" ;;
     *)
       echo "error: $path: unexpected target status ${new_status}; this is a hook bug" >&2
       exit 1

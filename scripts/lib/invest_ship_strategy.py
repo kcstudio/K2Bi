@@ -194,7 +194,7 @@ except RuntimeError:
 # are all in the same buffer). Round-trip with build_trailers is
 # enforced by `TrailerRegexRoundTrip` in test_invest_ship_mirror.py.
 MIRROR_TRAILER_RE = re.compile(
-    r"^Strategy-Transition: (?:proposed -> approved|approved -> retired)$",
+    r"^Strategy-Transition: (?:proposed -> approved|approved -> retired|approved -> stopped_out)$",
     re.MULTILINE,
 )
 
@@ -204,7 +204,7 @@ MIRROR_TRAILER_RE = re.compile(
 # message cannot make the hook mirror a status it shouldn't (e.g. a
 # commit that smuggles the approve trailer onto a body with
 # status=proposed).
-MIRROR_STATUSES = frozenset({"approved", "retired"})
+MIRROR_STATUSES = frozenset({"approved", "retired", "stopped_out"})
 
 # Codex R7 #2 (HIGH): per-file (old, new) transitions that warrant a
 # mirror. Set is the SAME as the trailer enum, expressed as pairs so
@@ -216,10 +216,11 @@ MIRROR_STATUSES = frozenset({"approved", "retired"})
 # per-file transition for the second file is ("approved", "approved")
 # -- not in this set -- so the second file is NOT mirrored.
 MIRROR_ELIGIBLE_TRANSITIONS = frozenset(
-    {
-        ("proposed", "approved"),
-        ("approved", "retired"),
-    }
+        {
+            ("proposed", "approved"),
+            ("approved", "retired"),
+            ("approved", "stopped_out"),
+        }
 )
 
 
@@ -1801,6 +1802,7 @@ def build_trailers(
             "approved": "Approved-Strategy",
             "rejected": "Rejected-Strategy",
             "retired": "Retired-Strategy",
+            "stopped_out": "Stopped-Out-Strategy",
         }.get(new_status)
         if action_label is None:
             raise ValueError(

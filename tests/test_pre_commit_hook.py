@@ -425,6 +425,55 @@ class CheckD_ApprovedContentImmutability(unittest.TestCase):
             result = run_git(repo, "commit", "-m", message, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_approved_pure_stopped_out_passes_check_d(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            self._seed_approved(repo, env)
+            write_strategy(
+                repo,
+                "foo",
+                status="stopped_out",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+                stopped_out_at='"2026-05-13T14:26:23Z"',
+                stopped_out_fill_perm_id=1677427049,
+                stopped_out_fill_price="29.93",
+                re_approve_path="/invest-ship --re-approve foo",
+            )
+            message = (
+                "feat(strategy): stop out foo\n"
+                "\n"
+                "Strategy-Transition: approved -> stopped_out\n"
+                "Stopped-Out-Strategy: strategy_foo\n"
+                "Co-Shipped-By: invest-ship\n"
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            result = run_git(repo, "commit", "-m", message, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stopped_out_missing_metadata_rejected_on_staged_status(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            self._seed_approved(repo, env)
+            write_strategy(
+                repo,
+                "foo",
+                status="stopped_out",
+                approved_at="2026-04-19T10:00:00Z",
+                approved_commit_sha="abc1234",
+            )
+            message = (
+                "feat(strategy): stop out foo\n"
+                "\n"
+                "Strategy-Transition: approved -> stopped_out\n"
+                "Stopped-Out-Strategy: strategy_foo\n"
+                "Co-Shipped-By: invest-ship\n"
+            )
+            run_git(repo, "add", "-A", env=env, check=True)
+            result = run_git(repo, "commit", "-m", message, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stopped_out_at", result.stderr)
+
     def test_retire_with_comingled_qty_change_rejected(self):
         with hook_repo() as (repo, env):
             seed_initial_commit(repo, env)

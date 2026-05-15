@@ -470,6 +470,13 @@ class BuildTrailersTests(unittest.TestCase):
         self.assertEqual(trailers[1], "Retired-Strategy: strategy_foo")
         self.assertIn("Strategy-Transition: approved -> retired", trailers)
 
+    def test_stopped_out_trailers(self):
+        trailers = iss.build_trailers(
+            "strategy", "approved -> stopped_out", "foo"
+        )
+        self.assertEqual(trailers[1], "Stopped-Out-Strategy: strategy_foo")
+        self.assertIn("Strategy-Transition: approved -> stopped_out", trailers)
+
     def test_limits_trailers(self):
         trailers = iss.build_trailers(
             "limits",

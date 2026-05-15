@@ -61,6 +61,10 @@ def _sentinel_path(retired_dir: Path, slug: str) -> Path:
     return retired_dir / f".retired-{digest}"
 
 
+def _stopped_out_sentinel_path(retired_dir: Path, slug: str, commit_sha: str) -> Path:
+    return retired_dir / f".stopped-out-{slug}-{commit_sha[:16]}"
+
+
 def _approve_message(slug: str = "foo") -> str:
     return (
         f"feat(strategy): approve {slug}\n"
@@ -79,6 +83,16 @@ def _retire_message(slug: str = "foo", reason: str = "obsolete") -> str:
         "\n"
         "Strategy-Transition: approved -> retired\n"
         f"Retired-Strategy: strategy_{slug}\n"
+        "Co-Shipped-By: invest-ship\n"
+    )
+
+
+def _stop_message(slug: str = "foo") -> str:
+    return (
+        f"feat(strategy): stop out {slug}\n"
+        "\n"
+        "Strategy-Transition: approved -> stopped_out\n"
+        f"Stopped-Out-Strategy: strategy_{slug}\n"
         "Co-Shipped-By: invest-ship\n"
     )
 
@@ -118,6 +132,30 @@ def _land_retire(repo: Path, env: dict, slug: str = "foo") -> str:
     if result.returncode != 0:
         raise AssertionError(
             f"retire commit was rejected: {result.stderr}"
+        )
+    res = run_git(repo, "rev-parse", "HEAD", env=env, check=True)
+    return res.stdout.strip()
+
+
+def _land_stopped_out(repo: Path, env: dict, slug: str = "foo") -> str:
+    """Stage + commit a pure stopped_out transition. Returns the commit sha."""
+    write_strategy(
+        repo,
+        slug,
+        status="stopped_out",
+        approved_at="2026-04-19T10:00:00Z",
+        approved_commit_sha="abc1234",
+        stopped_out_at='"2026-05-13T14:26:23Z"',
+        stopped_out_fill_perm_id=1677427049,
+        stopped_out_fill_price="29.93",
+        stopped_out_realized_pnl_usd="-27.69",
+        re_approve_path=f"/invest-ship --re-approve {slug}",
+    )
+    run_git(repo, "add", "-A", env=env, check=True)
+    result = run_git(repo, "commit", "-m", _stop_message(slug), env=env)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"stopped_out commit was rejected: {result.stderr}"
         )
     res = run_git(repo, "rev-parse", "HEAD", env=env, check=True)
     return res.stdout.strip()
@@ -250,6 +288,44 @@ class RetireCommitWritesSentinel(unittest.TestCase):
                 p for p in retired_dir.iterdir() if p.name.startswith(".retired-")
             ]
             self.assertEqual(sentinels, [], f"override bypassed? {sentinels}")
+
+
+class StoppedOutCommitWritesSentinel(unittest.TestCase):
+    def test_stopped_out_commit_lands_sentinel_written(self):
+        with hook_repo() as (repo, env):
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            commit_sha = _land_stopped_out(repo, env)
+
+            retired_dir = Path(env["K2BI_RETIRED_DIR"])
+            sentinel = _stopped_out_sentinel_path(retired_dir, "foo", commit_sha)
+            self.assertTrue(
+                sentinel.exists(),
+                f"stopped-out sentinel not found at {sentinel}; dir contents: "
+                f"{list(retired_dir.iterdir())}",
+            )
+            record = json.loads(sentinel.read_text())
+            self.assertEqual(record["slug"], "foo")
+            self.assertEqual(record["commit_sha"], commit_sha)
+            self.assertEqual(record["source"], "engine stop-out lifecycle")
+            self.assertEqual(record["stopped_out_fill_perm_id"], 1677427049)
+            self.assertEqual(record["stopped_out_fill_price"], "29.93")
+
+    def test_mirror_failure_still_lands_stopped_out_sentinel(self):
+        with hook_repo() as (repo, env):
+            bogus_vault = repo / "does-not-exist-yet"
+            env["K2BI_VAULT_ROOT"] = str(bogus_vault)
+            os.environ["K2BI_VAULT_ROOT"] = str(bogus_vault)
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            commit_sha = _land_stopped_out(repo, env)
+
+            retired_dir = Path(env["K2BI_RETIRED_DIR"])
+            sentinel = _stopped_out_sentinel_path(retired_dir, "foo", commit_sha)
+            self.assertTrue(
+                sentinel.exists(),
+                "stopped-out sentinel must still land when vault mirror fails",
+            )
 
 
 class RetiredDirConfigResolution(unittest.TestCase):
@@ -648,6 +724,21 @@ class MirrorOnRetireCommit(unittest.TestCase):
             self.assertEqual(
                 json.loads(sentinel.read_text())["commit_sha"], commit_sha
             )
+
+
+class MirrorOnStoppedOutCommit(unittest.TestCase):
+    def test_stopped_out_commit_mirrors_file_and_sentinel_lands(self):
+        with hook_repo() as (repo, env):
+            vault = _use_separate_vault(repo, env)
+            seed_initial_commit(repo, env)
+            _seed_approved(repo, env)
+            commit_sha = _land_stopped_out(repo, env)
+
+            dest = _vault_strategy_path(vault)
+            self.assertIn(b"status: stopped_out", dest.read_bytes())
+            retired_dir = Path(env["K2BI_RETIRED_DIR"])
+            sentinel = _stopped_out_sentinel_path(retired_dir, "foo", commit_sha)
+            self.assertTrue(sentinel.exists())
 
 
 class MirrorOnRejectNoMirror(unittest.TestCase):

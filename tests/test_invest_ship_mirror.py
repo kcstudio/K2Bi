@@ -330,6 +330,25 @@ class TrailerRegexRoundTrip(unittest.TestCase):
             f"{transition_line!r}; anchor drift would silently no-op.",
         )
 
+    def test_stopped_out_trailer_matches_mirror_regex(self) -> None:
+        trailers = iss.build_trailers(
+            "strategy", "approved -> stopped_out", "spy"
+        )
+        transition_line = trailers[0]
+        self.assertEqual(
+            transition_line, "Strategy-Transition: approved -> stopped_out"
+        )
+        self.assertIsNotNone(
+            iss.MIRROR_TRAILER_RE.fullmatch(transition_line),
+            f"MIRROR_TRAILER_RE did not fullmatch build_trailers output "
+            f"{transition_line!r}; stopped_out mirror would silently no-op.",
+        )
+
+    def test_stopped_out_to_approved_not_mirror_eligible(self) -> None:
+        self.assertNotIn(
+            ("stopped_out", "approved"), iss.MIRROR_ELIGIBLE_TRANSITIONS
+        )
+
     def test_reject_trailer_does_not_match_mirror_regex(self) -> None:
         # Decision 1 (LOCKED): rejected strategies NEVER mirror. Prove
         # the regex rejects the rejected-transition trailer so a
