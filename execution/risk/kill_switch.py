@@ -292,6 +292,19 @@ def _retired_path(slug: str, base_dir: Path | None) -> Path:
     return (base_dir or DEFAULT_RETIRED_DIR) / f".retired-{digest}"
 
 
+def _stopped_out_prefix(slug: str) -> str:
+    _validate_slug(slug)
+    return f".stopped-out-{slug}-"
+
+
+def _stopped_out_paths(slug: str, base_dir: Path | None) -> list[Path]:
+    base = base_dir or DEFAULT_RETIRED_DIR
+    prefix = _stopped_out_prefix(slug)
+    if not base.exists():
+        return []
+    return sorted(p for p in base.iterdir() if p.name.startswith(prefix))
+
+
 def is_strategy_retired(slug: str, base_dir: Path | None = None) -> bool:
     target = _retired_path(slug, base_dir)
     try:
@@ -306,6 +319,19 @@ def is_strategy_retired(slug: str, base_dir: Path | None = None) -> bool:
             "retired sentinel path %s inaccessible (%s); "
             "treating as retired (fail-closed)",
             target,
+            type(exc).__name__,
+        )
+        return True
+
+
+def is_strategy_stopped_out(slug: str, base_dir: Path | None = None) -> bool:
+    try:
+        return bool(_stopped_out_paths(slug, base_dir))
+    except OSError as exc:
+        LOG.warning(
+            "stopped-out sentinel dir %s inaccessible (%s); "
+            "treating as stopped_out (fail-closed)",
+            base_dir or DEFAULT_RETIRED_DIR,
             type(exc).__name__,
         )
         return True
@@ -342,6 +368,35 @@ def read_retired_record(
             type(exc).__name__,
         )
         return None
+
+
+def read_stopped_out_records(
+    slug: str,
+    base_dir: Path | None = None,
+) -> list[dict[str, Any] | None]:
+    records: list[dict[str, Any] | None] = []
+    try:
+        paths = _stopped_out_paths(slug, base_dir)
+    except OSError as exc:
+        LOG.warning(
+            "stopped-out sentinel dir %s unreadable (%s); returning empty records",
+            base_dir or DEFAULT_RETIRED_DIR,
+            type(exc).__name__,
+        )
+        return []
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                records.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as exc:
+            LOG.warning(
+                "stopped-out sentinel %s exists but is unreadable (%s); "
+                "treating as record=None -- gate stays closed via file-exists check",
+                path,
+                type(exc).__name__,
+            )
+            records.append(None)
+    return records
 
 
 def write_retired(
@@ -432,6 +487,22 @@ class StrategyRetiredError(RuntimeError):
         self.record = record
 
 
+class StrategyStoppedOutError(RuntimeError):
+    """Raised when the engine tries to run a stopped-out strategy."""
+
+    def __init__(
+        self,
+        strategy_slug: str,
+        paths: list[Path],
+        records: list[dict[str, Any] | None],
+    ) -> None:
+        first = paths[0] if paths else DEFAULT_RETIRED_DIR
+        super().__init__(f"strategy {strategy_slug!r} stopped_out at {first}")
+        self.strategy_slug = strategy_slug
+        self.paths = paths
+        self.records = records
+
+
 def assert_strategy_not_retired(
     slug: str, base_dir: Path | None = None
 ) -> None:
@@ -465,3 +536,37 @@ def assert_strategy_not_retired(
             path=target,
             record=read_retired_record(slug, base_dir),
         )
+
+
+def assert_strategy_not_stopped_out(
+    slug: str,
+    base_dir: Path | None = None,
+) -> None:
+    try:
+        paths = _stopped_out_paths(slug, base_dir)
+    except OSError as exc:
+        raise StrategyStoppedOutError(
+            strategy_slug=slug,
+            paths=[],
+            records=[
+                {
+                    "error": "base_dir_inaccessible",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            ],
+        ) from exc
+    if paths:
+        raise StrategyStoppedOutError(
+            strategy_slug=slug,
+            paths=paths,
+            records=read_stopped_out_records(slug, base_dir),
+        )
+
+
+def assert_strategy_not_inactive(
+    slug: str,
+    base_dir: Path | None = None,
+) -> None:
+    assert_strategy_not_retired(slug, base_dir)
+    assert_strategy_not_stopped_out(slug, base_dir)

@@ -57,6 +57,8 @@ ROUTINE_ALWAYS = frozenset(
     {
         "cycle_evaluated_skip_position_held",
         "recovery_self_healed_pending_order",
+        "cycle_skipped_strategy_stopped_out",
+        "cycle_position_partial_close_observed",
     }
 )
 ROUTINE_ONCE_PER_BOOT = frozenset({"engine_started", "engine_recovered"})
@@ -72,6 +74,8 @@ ANOMALY_EVENTS = frozenset(
         "JournalDurabilityError",
         "engine_stopped",
         "position_visibility_lost",
+        "strategy_stopped_out",
+        "cycle_position_unexpectedly_zero",
     }
 )
 

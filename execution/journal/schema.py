@@ -55,6 +55,9 @@ v2 additive (2026-05-12, Spec B §8):
 v2 additive (2026-05-14, Spec B §9.1):
     - Added position_visibility_lost and position-visibility metadata on
       cycle_evaluated_skip_position_held.
+
+v2 additive (2026-05-16, Spec B §9.2):
+    - Added stopped-out lifecycle events for protective-stop detection.
 """
 
 from __future__ import annotations
@@ -177,6 +180,15 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1 = frozenset(
     }
 )
 
+EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2 = frozenset(
+    {
+        "strategy_stopped_out",
+        "cycle_skipped_strategy_stopped_out",
+        "cycle_position_unexpectedly_zero",
+        "cycle_position_partial_close_observed",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
@@ -187,6 +199,7 @@ EVENT_TYPES = (
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_4
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_8
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1
+    | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
@@ -587,3 +600,65 @@ def validate_position_visibility_lost_payload(payload: dict[str, Any]) -> None:
         event_type,
         "last_valid_age_seconds",
     )
+
+
+def validate_strategy_stopped_out_payload(payload: dict[str, Any]) -> None:
+    event_type = "strategy_stopped_out"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "ticker")
+    _require_non_empty_str(payload, event_type, "stopped_out_at")
+    fill_perm_id = _require_int(payload, event_type, "fill_perm_id")
+    if fill_perm_id <= 0:
+        raise JournalSchemaError(
+            f"{event_type} fill_perm_id must be positive, got {fill_perm_id!r}"
+        )
+    _require_positive_decimal_str(payload, event_type, "fill_price")
+    _require_non_empty_str(payload, event_type, "cycle_id")
+
+
+def validate_cycle_skipped_strategy_stopped_out_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "cycle_skipped_strategy_stopped_out"
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "stopped_out_at")
+    _require_non_empty_str(payload, event_type, "cycle_id")
+
+
+def validate_cycle_position_unexpectedly_zero_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "cycle_position_unexpectedly_zero"
+    _require_non_empty_str(payload, event_type, "ticker")
+    prev_qty = _require_int(payload, event_type, "prev_qty")
+    if prev_qty <= 0:
+        raise JournalSchemaError(
+            f"{event_type} prev_qty must be positive, got {prev_qty!r}"
+        )
+    _require_non_empty_str(payload, event_type, "cycle_id")
+    reason = _require_non_empty_str(payload, event_type, "reason")
+    if reason not in {
+        "no_active_protective_stop_record",
+        "protective_stop_record_orphaned",
+    }:
+        raise JournalSchemaError(
+            f"{event_type} reason unsupported: {reason!r}"
+        )
+
+
+def validate_cycle_position_partial_close_observed_payload(
+    payload: dict[str, Any],
+) -> None:
+    event_type = "cycle_position_partial_close_observed"
+    _require_non_empty_str(payload, event_type, "ticker")
+    prev_qty = _require_int(payload, event_type, "prev_qty")
+    curr_qty = _require_int(payload, event_type, "curr_qty")
+    if prev_qty <= 0:
+        raise JournalSchemaError(
+            f"{event_type} prev_qty must be positive, got {prev_qty!r}"
+        )
+    if curr_qty <= 0 or curr_qty >= prev_qty:
+        raise JournalSchemaError(
+            f"{event_type} curr_qty must be between 0 and prev_qty, got {curr_qty!r}"
+        )
+    _require_non_empty_str(payload, event_type, "cycle_id")

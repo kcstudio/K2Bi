@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -54,6 +55,7 @@ from ..connectors.ibkr import ConnectorImportError
 from ..connectors.types import (
     AuthRequiredError,
     BrokerOrderAck,
+    BrokerOrderStatusEvent,
     BrokerPosition,
     ConnectorError,
     DisconnectedError,
@@ -62,13 +64,18 @@ from ..connectors.types import (
     POSITION_SOURCE_DISCONNECTED,
     PositionSnapshot,
     TERMINAL_ORDER_STATUSES,
+    parse_client_tag,
 )
 from ..journal.reader import terminal_signals_by_trade_id
 from ..journal.schema import (
     ABORT_PHASE_PRE_SUBMIT_RECHECK,
     reject_non_finite_json_constant,
     validate_cycle_skipped_position_query_failed_payload,
+    validate_cycle_position_partial_close_observed_payload,
+    validate_cycle_position_unexpectedly_zero_payload,
+    validate_cycle_skipped_strategy_stopped_out_payload,
     validate_position_visibility_lost_payload,
+    validate_strategy_stopped_out_payload,
 )
 from ..journal.ulid import new_ulid
 from ..journal.writer import JournalWriter
@@ -82,11 +89,13 @@ from ..strategies.types import (
     CandidateOrder,
     MarketSnapshot,
     STATUS_APPROVED,
+    STATUS_STOPPED_OUT,
 )
 from ..validators.config import load_config
 from ..validators.runner import as_journal_payload, run_all
 from ..validators.types import Order, Position, RiskContext
 from . import recovery as recovery_mod
+from scripts.lib import strategy_frontmatter
 
 LOG = logging.getLogger("k2bi.engine")
 
@@ -912,6 +921,11 @@ class Engine:
             self.state = EngineState.HALTED
             self._shutdown_requested = True
             return
+        await self._replay_stopped_out_stop_fills(
+            journal_tail=journal_tail,
+            broker_status=broker_status,
+            cycle_id="startup_recovery",
+        )
 
         self.journal.append(
             "engine_started",
@@ -1207,6 +1221,8 @@ class Engine:
             return
         if self.state == EngineState.DISCONNECTED:
             return
+        await self._detect_strategy_stop_outs(cycle_id=new_ulid())
+        self._journal_stopped_out_strategy_skips(cycle_id=new_ulid())
 
         # Drift-check approved strategies (file-level hash comparison).
         for snap in self._strategies:
@@ -1340,7 +1356,7 @@ class Engine:
             # strategy_name_invalid and skipping it; other strategies
             # in self._strategies continue to be evaluated.
             try:
-                kill_switch.assert_strategy_not_retired(
+                kill_switch.assert_strategy_not_inactive(
                     self._retire_slug(snap), base_dir=self._retired_dir()
                 )
             except kill_switch.StrategyRetiredError as exc:
@@ -1349,6 +1365,21 @@ class Engine:
                     payload={
                         "reason": "strategy_retired",
                         "retired_record": exc.record,
+                        "strategy_sha256": snap.source_sha256,
+                        "strategy_approved_commit": snap.approved_commit_sha,
+                    },
+                    strategy=snap.name,
+                    trade_id=new_ulid(),
+                )
+                result.strategies_evaluated += 1
+                result.orders_rejected += 1
+                continue
+            except kill_switch.StrategyStoppedOutError as exc:
+                self.journal.append(
+                    "order_rejected",
+                    payload={
+                        "reason": "strategy_stopped_out",
+                        "stopped_out_records": exc.records,
                         "strategy_sha256": snap.source_sha256,
                         "strategy_approved_commit": snap.approved_commit_sha,
                     },
@@ -1909,6 +1940,418 @@ class Engine:
         self._position_visibility_valid = True
         return True
 
+    @staticmethod
+    def _position_qty_map(positions: list[BrokerPosition]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for position in positions:
+            out[position.ticker.upper()] = out.get(position.ticker.upper(), 0) + int(
+                position.qty
+            )
+        return out
+
+    def _journal_position_unexpectedly_zero(
+        self,
+        *,
+        ticker: str,
+        prev_qty: int,
+        cycle_id: str,
+        reason: str,
+    ) -> None:
+        payload = {
+            "ticker": ticker,
+            "prev_qty": prev_qty,
+            "cycle_id": cycle_id,
+            "reason": reason,
+        }
+        validate_cycle_position_unexpectedly_zero_payload(payload)
+        self.journal.append("cycle_position_unexpectedly_zero", payload=payload)
+
+    def _journal_position_partial_close(
+        self,
+        *,
+        ticker: str,
+        prev_qty: int,
+        curr_qty: int,
+        cycle_id: str,
+    ) -> None:
+        payload = {
+            "ticker": ticker,
+            "prev_qty": prev_qty,
+            "curr_qty": curr_qty,
+            "cycle_id": cycle_id,
+        }
+        validate_cycle_position_partial_close_observed_payload(payload)
+        self.journal.append("cycle_position_partial_close_observed", payload=payload)
+
+    @staticmethod
+    def _looks_like_resymbolized_position(
+        *,
+        ticker: str,
+        prev_qty: int,
+        curr_positions: dict[str, int],
+    ) -> bool:
+        return any(
+            symbol != ticker and qty == prev_qty
+            for symbol, qty in curr_positions.items()
+            if qty > 0
+        )
+
+    async def _detect_strategy_stop_outs(self, *, cycle_id: str) -> None:
+        if not self._position_visibility_valid:
+            return
+        if not self._positions_prev:
+            return
+        prev_positions = self._position_qty_map(self._positions_prev)
+        curr_positions = self._position_qty_map(self._positions)
+        stopped_strategy_ids: set[str] = set()
+        for ticker, prev_qty in prev_positions.items():
+            if prev_qty <= 0:
+                continue
+            curr_qty = curr_positions.get(ticker, 0)
+            if curr_qty == 0:
+                record = self._active_protective_stops.get(ticker)
+                if record is None:
+                    self._journal_position_unexpectedly_zero(
+                        ticker=ticker,
+                        prev_qty=prev_qty,
+                        cycle_id=cycle_id,
+                        reason="no_active_protective_stop_record",
+                    )
+                    continue
+                if self._looks_like_resymbolized_position(
+                    ticker=ticker,
+                    prev_qty=prev_qty,
+                    curr_positions=curr_positions,
+                ):
+                    self._journal_position_unexpectedly_zero(
+                        ticker=ticker,
+                        prev_qty=prev_qty,
+                        cycle_id=cycle_id,
+                        reason="protective_stop_record_orphaned",
+                    )
+                    continue
+                await self._flip_strategy_to_stopped_out(
+                    strategy_id=record.strategy_id,
+                    ticker=ticker,
+                    fill_perm_id=record.stop_perm_id,
+                    fill_price=record.stop_price,
+                    cycle_id=cycle_id,
+                )
+                self._clear_active_protective_stop_on_terminal(
+                    ticker=ticker,
+                    stop_perm_id=record.stop_perm_id,
+                    terminal_status="Filled",
+                )
+                stopped_strategy_ids.add(record.strategy_id)
+            elif curr_qty < prev_qty:
+                self._journal_position_partial_close(
+                    ticker=ticker,
+                    prev_qty=prev_qty,
+                    curr_qty=curr_qty,
+                    cycle_id=cycle_id,
+                )
+        if stopped_strategy_ids:
+            self._strategies = [
+                snap for snap in self._strategies if snap.name not in stopped_strategy_ids
+            ]
+
+    def _journal_stopped_out_strategy_skips(self, *, cycle_id: str) -> None:
+        if not self.engine_config.strategies_dir.exists():
+            return
+        for path in sorted(self.engine_config.strategies_dir.glob("*.md")):
+            if path.name == "index.md":
+                continue
+            try:
+                doc = strategy_loader.load_document(path)
+            except strategy_loader.StrategyLoaderError:
+                continue
+            if doc.status != STATUS_STOPPED_OUT:
+                continue
+            stopped_out_at = str(doc.raw_frontmatter.get("stopped_out_at") or "").strip()
+            payload = {
+                "strategy_id": doc.name,
+                "stopped_out_at": stopped_out_at,
+                "cycle_id": cycle_id,
+            }
+            validate_cycle_skipped_strategy_stopped_out_payload(payload)
+            self.journal.append(
+                "cycle_skipped_strategy_stopped_out",
+                payload=payload,
+                strategy=doc.name,
+            )
+
+    def _strategy_snapshot(self, strategy_id: str) -> ApprovedStrategySnapshot:
+        for snap in self._strategies:
+            if snap.name == strategy_id:
+                return snap
+        raise ValueError(f"strategy {strategy_id!r} is not loaded as approved")
+
+    def _strategy_lifecycle_path(self, snap: ApprovedStrategySnapshot) -> Path:
+        runtime_path = Path(snap.source_path)
+        if "K2Bi-Vault" not in runtime_path.parts:
+            return runtime_path
+        repo_candidate = (
+            Path(__file__).resolve().parents[2]
+            / "wiki"
+            / "strategies"
+            / runtime_path.name
+        )
+        if repo_candidate.exists():
+            return repo_candidate
+        return runtime_path
+
+    @staticmethod
+    def _stopped_out_commit_message(slug: str) -> str:
+        return (
+            f"chore(strategy): stop out {slug}\n\n"
+            "Strategy-Transition: approved -> stopped_out\n"
+            f"Stopped-Out-Strategy: strategy_{slug}\n"
+            "Co-Shipped-By: invest-ship\n"
+        )
+
+    @staticmethod
+    def _rewrite_stopped_out_frontmatter(
+        raw: str,
+        *,
+        stopped_out_at: str,
+        fill_perm_id: int,
+        fill_price: Decimal,
+        re_approve_path: str,
+    ) -> bytes:
+        lines = raw.splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            raise ValueError("strategy file has no YAML frontmatter fence")
+        try:
+            end = next(
+                idx for idx, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+            )
+        except StopIteration as exc:
+            raise ValueError("strategy file has unterminated YAML frontmatter") from exc
+        metadata_keys = {
+            "stopped_out_at",
+            "stopped_out_fill_perm_id",
+            "stopped_out_fill_price",
+            "stopped_out_realized_pnl_usd",
+            "re_approve_path",
+        }
+        status_idx = None
+        cleaned: list[str] = []
+        for idx, line in enumerate(lines[:end]):
+            key = line.split(":", 1)[0].strip() if ":" in line else ""
+            if key in metadata_keys:
+                continue
+            if key == "status":
+                status_idx = len(cleaned)
+                cleaned.append("status: stopped_out\n")
+            else:
+                cleaned.append(line)
+        if status_idx is None:
+            raise ValueError("strategy file has no status field")
+        metadata = [
+            f"stopped_out_at: '{stopped_out_at}'\n",
+            f"stopped_out_fill_perm_id: {fill_perm_id}\n",
+            f"stopped_out_fill_price: '{fill_price}'\n",
+            f"re_approve_path: '{re_approve_path}'\n",
+        ]
+        rewritten = (
+            cleaned[: status_idx + 1]
+            + metadata
+            + cleaned[status_idx + 1 :]
+            + lines[end:]
+        )
+        return "".join(rewritten).encode("utf-8")
+
+    def _git_commit_stopped_out_strategy(
+        self,
+        *,
+        path: Path,
+        slug: str,
+        message: str,
+    ) -> str:
+        try:
+            root = subprocess.check_output(
+                ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).strip()
+            subprocess.run(
+                ["git", "-C", root, "add", "--", str(path)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            subprocess.run(
+                ["git", "-C", root, "commit", "-m", message.split("\n", 1)[0], "-m", message.split("\n\n", 1)[1]],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            return subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"stopped_out strategy git commit failed: {exc}") from exc
+
+    async def _flip_strategy_to_stopped_out(
+        self,
+        *,
+        strategy_id: str,
+        ticker: str,
+        fill_perm_id: int,
+        fill_price: Decimal,
+        cycle_id: str,
+        source: str = "position_diff",
+    ) -> None:
+        snap = self._strategy_snapshot(strategy_id)
+        strategy_path = self._strategy_lifecycle_path(snap)
+        slug = derive_retire_slug(str(strategy_path))
+        stopped_out_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        re_approve_path = f"/invest-ship --re-approve {slug}"
+        raw = strategy_path.read_text(encoding="utf-8")
+        payload_bytes = self._rewrite_stopped_out_frontmatter(
+            raw,
+            stopped_out_at=stopped_out_at,
+            fill_perm_id=fill_perm_id,
+            fill_price=fill_price,
+            re_approve_path=re_approve_path,
+        )
+        strategy_frontmatter.validate_stopped_out_metadata(
+            strategy_frontmatter.parse(payload_bytes)
+        )
+        strategy_frontmatter.atomic_write_bytes(strategy_path, payload_bytes)
+        message = self._stopped_out_commit_message(slug)
+        commit_sha = self._git_commit_stopped_out_strategy(
+            path=strategy_path,
+            slug=slug,
+            message=message,
+        )
+        event_payload = {
+            "strategy_id": strategy_id,
+            "ticker": ticker.upper(),
+            "stopped_out_at": stopped_out_at,
+            "fill_perm_id": fill_perm_id,
+            "fill_price": str(fill_price),
+            "cycle_id": cycle_id,
+            "source": source,
+            "commit_sha": commit_sha,
+        }
+        validate_strategy_stopped_out_payload(event_payload)
+        self.journal.append(
+            "strategy_stopped_out",
+            payload=event_payload,
+            strategy=strategy_id,
+            ticker=ticker.upper(),
+            broker_perm_id=str(fill_perm_id),
+        )
+
+    @staticmethod
+    def _order_submitted_by_trade(
+        journal_tail: list[dict[str, Any]],
+        *,
+        strategy_id: str,
+        trade_id: str,
+    ) -> dict[str, Any] | None:
+        for record in reversed(journal_tail):
+            if (
+                record.get("event_type") == "order_submitted"
+                and record.get("strategy") == strategy_id
+                and record.get("trade_id") == trade_id
+            ):
+                return record
+        return None
+
+    @staticmethod
+    def _stopped_out_fill_already_journaled(
+        journal_tail: list[dict[str, Any]],
+        *,
+        fill_perm_id: int,
+    ) -> bool:
+        for record in journal_tail:
+            if record.get("event_type") != "strategy_stopped_out":
+                continue
+            payload = record.get("payload") or {}
+            if payload.get("fill_perm_id") == fill_perm_id:
+                return True
+        return False
+
+    async def _replay_stopped_out_stop_fills(
+        self,
+        *,
+        journal_tail: list[dict[str, Any]],
+        broker_status: list[BrokerOrderStatusEvent],
+        cycle_id: str,
+    ) -> None:
+        curr_positions = self._position_qty_map(self._positions)
+        stopped: set[str] = set()
+        for status in broker_status:
+            if status.status != "Filled":
+                continue
+            strategy_id, trade_id, is_stop = parse_client_tag(status.client_tag)
+            if not is_stop or strategy_id is None or trade_id is None:
+                continue
+            try:
+                fill_perm_id = self._positive_perm_id(
+                    status.broker_perm_id,
+                    field_name="broker_perm_id",
+                )
+            except ValueError:
+                continue
+            if self._stopped_out_fill_already_journaled(
+                journal_tail,
+                fill_perm_id=fill_perm_id,
+            ):
+                continue
+            submitted = self._order_submitted_by_trade(
+                journal_tail,
+                strategy_id=strategy_id,
+                trade_id=trade_id,
+            )
+            if submitted is None:
+                continue
+            submitted_payload = submitted.get("payload") or {}
+            try:
+                submitted_stop_perm_id = self._positive_perm_id(
+                    submitted_payload.get("stop_broker_perm_id"),
+                    field_name="stop_broker_perm_id",
+                )
+            except ValueError:
+                continue
+            if submitted_stop_perm_id != fill_perm_id:
+                continue
+            ticker = str(submitted.get("ticker") or "").upper()
+            if not ticker or curr_positions.get(ticker, 0) > 0:
+                continue
+            fill_price = status.avg_fill_price
+            if fill_price is None:
+                raw_price = submitted_payload.get("stop_price") or submitted_payload.get(
+                    "stop_loss"
+                )
+                try:
+                    fill_price = Decimal(str(raw_price))
+                except (InvalidOperation, ValueError, TypeError):
+                    continue
+            await self._flip_strategy_to_stopped_out(
+                strategy_id=strategy_id,
+                ticker=ticker,
+                fill_perm_id=fill_perm_id,
+                fill_price=fill_price,
+                cycle_id=cycle_id,
+                source="recovery_replay",
+            )
+            stopped.add(strategy_id)
+        if stopped:
+            self._strategies = [
+                snap for snap in self._strategies if snap.name not in stopped
+            ]
+
     async def _skip_buy_for_existing_position(
         self,
         *,
@@ -2033,7 +2476,7 @@ class Engine:
         # payload.reason on order_rejected (no new event type needed;
         # order_rejected is already in schema v2).
         try:
-            kill_switch.assert_strategy_not_retired(
+            kill_switch.assert_strategy_not_inactive(
                 self._retire_slug(snap), base_dir=self._retired_dir()
             )
         except kill_switch.StrategyRetiredError as exc:
@@ -2049,6 +2492,27 @@ class Engine:
                     "side": order.side,
                     "qty": order.qty,
                     "retired_record": exc.record,
+                    "strategy_sha256": snap.source_sha256,
+                    "strategy_approved_commit": snap.approved_commit_sha,
+                },
+                strategy=snap.name,
+                trade_id=trade_id,
+                ticker=order.ticker,
+                side=order.side,
+                qty=order.qty,
+            )
+            self.state = EngineState.CONNECTED_IDLE
+            result.orders_rejected += 1
+            return
+        except kill_switch.StrategyStoppedOutError as exc:
+            self.journal.append(
+                "order_rejected",
+                payload={
+                    "reason": "strategy_stopped_out",
+                    "ticker": order.ticker,
+                    "side": order.side,
+                    "qty": order.qty,
+                    "stopped_out_records": exc.records,
                     "strategy_sha256": snap.source_sha256,
                     "strategy_approved_commit": snap.approved_commit_sha,
                 },
@@ -2176,6 +2640,12 @@ class Engine:
             "stop_loss": str(order.stop_loss) if order.stop_loss else None,
             "time_in_force": tif,
         }
+        if ack.stop_broker_order_id is not None:
+            submitted_payload["stop_broker_order_id"] = ack.stop_broker_order_id
+        if ack.stop_broker_perm_id is not None:
+            submitted_payload["stop_broker_perm_id"] = ack.stop_broker_perm_id
+        if ack.stop_price is not None:
+            submitted_payload["stop_price"] = str(ack.stop_price)
         if ack.warnings:
             # Codex round-9 P1: connector-side warnings (e.g. stop
             # child rejected after parent filled) are captured on the

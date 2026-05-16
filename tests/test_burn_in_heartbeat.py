@@ -123,6 +123,7 @@ class BurnInHeartbeatTests(unittest.TestCase):
         from execution.journal.schema import (
             EVENT_TYPES,
             EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1,
+            EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2,
         )
 
         module = _load_module()
@@ -134,7 +135,16 @@ class BurnInHeartbeatTests(unittest.TestCase):
 
         self.assertEqual(module.EVENT_TYPES, EVENT_TYPES)
         self.assertLessEqual(EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1, EVENT_TYPES)
+        self.assertLessEqual(EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2, EVENT_TYPES)
         self.assertLessEqual(EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1, classified)
+        self.assertLessEqual(EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2, classified)
+        self.assertIn("strategy_stopped_out", module.ANOMALY_EVENTS)
+        self.assertIn("cycle_position_unexpectedly_zero", module.ANOMALY_EVENTS)
+        self.assertNotIn(
+            "cycle_position_partial_close_observed",
+            module.ANOMALY_EVENTS,
+        )
+        self.assertNotIn("cycle_skipped_strategy_stopped_out", module.ANOMALY_EVENTS)
 
     def _run(
         self,

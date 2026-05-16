@@ -48,6 +48,7 @@ from typing import Any
 
 import yaml
 
+from ..risk import kill_switch
 from .types import (
     ALLOWED_STATUSES,
     ALLOWED_STRATEGY_TYPES,
@@ -65,6 +66,7 @@ from .types import (
 
 
 FRONTMATTER_DELIM = "---"
+STRATEGY_FILENAME_PREFIX = "strategy_"
 
 
 def load_document(path: Path) -> StrategyDocument:
@@ -238,7 +240,11 @@ def assert_file_unchanged(snapshot: ApprovedStrategySnapshot) -> None:
         )
 
 
-def load_all_approved(strategies_dir: Path) -> list[ApprovedStrategySnapshot]:
+def load_all_approved(
+    strategies_dir: Path,
+    *,
+    sentinel_dir: Path | None = None,
+) -> list[ApprovedStrategySnapshot]:
     """Scan a directory of strategy files, return snapshots for those
     with status=approved.
 
@@ -273,6 +279,16 @@ def load_all_approved(strategies_dir: Path) -> list[ApprovedStrategySnapshot]:
             continue
         if doc.status != STATUS_APPROVED:
             continue
+        if sentinel_dir is not None:
+            slug = _sentinel_slug(path)
+            if kill_switch.is_strategy_retired(
+                slug,
+                base_dir=sentinel_dir,
+            ) or kill_switch.is_strategy_stopped_out(
+                slug,
+                base_dir=sentinel_dir,
+            ):
+                continue
         try:
             snap = load_approved(path)
         except StrategyLoaderError as exc:
@@ -285,6 +301,13 @@ def load_all_approved(strategies_dir: Path) -> list[ApprovedStrategySnapshot]:
             + "; ".join(f"{p.name}: {e}" for p, e in errors)
         )
     return out
+
+
+def _sentinel_slug(path: Path) -> str:
+    stem = path.stem
+    if stem.startswith(STRATEGY_FILENAME_PREFIX):
+        return stem[len(STRATEGY_FILENAME_PREFIX):]
+    return stem
 
 
 def _peek_status(path: Path) -> str | None:
