@@ -965,11 +965,25 @@ class IBKRConnector:
             self._classify_and_raise(exc, phase="submit")
 
         status = getattr(parent_trade.orderStatus, "status", "")
+        stop_broker_order_id = None
+        stop_broker_perm_id = None
+        stop_price = None
+        if (
+            child_trade is not None
+            and not warnings
+            and getattr(child_trade.order, "permId", 0)
+        ):
+            stop_broker_order_id = str(child_trade.order.orderId)
+            stop_broker_perm_id = str(child_trade.order.permId)
+            stop_price = stop_loss
         return BrokerOrderAck(
             broker_order_id=str(parent_trade.order.orderId),
             broker_perm_id=str(parent_trade.order.permId),
             submitted_at=datetime.now(timezone.utc),
             status=status,
+            stop_broker_order_id=stop_broker_order_id,
+            stop_broker_perm_id=stop_broker_perm_id,
+            stop_price=stop_price,
             warnings=tuple(warnings),
         )
 

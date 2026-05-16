@@ -47,6 +47,8 @@ class SubmittedOrderRecord:
     client_tag: str | None
     broker_order_id: str
     broker_perm_id: str
+    stop_broker_order_id: str | None = None
+    stop_broker_perm_id: str | None = None
     order_type: str = "LMT"
 
 
@@ -208,6 +210,13 @@ class MockIBKRConnector:
         broker_perm_id = str(self._next_perm_id)
         self._next_order_id += 1
         self._next_perm_id += 1
+        stop_broker_order_id = None
+        stop_broker_perm_id = None
+        if stop_loss is not None:
+            stop_broker_order_id = str(self._next_order_id)
+            stop_broker_perm_id = str(self._next_perm_id)
+            self._next_order_id += 1
+            self._next_perm_id += 1
 
         record = SubmittedOrderRecord(
             ticker=ticker,
@@ -219,6 +228,8 @@ class MockIBKRConnector:
             client_tag=client_tag,
             broker_order_id=broker_order_id,
             broker_perm_id=broker_perm_id,
+            stop_broker_order_id=stop_broker_order_id,
+            stop_broker_perm_id=stop_broker_perm_id,
             order_type=order_type,
         )
         self.submitted_orders.append(record)
@@ -231,6 +242,9 @@ class MockIBKRConnector:
             broker_perm_id=broker_perm_id,
             submitted_at=datetime.now(timezone.utc),
             status="Submitted",
+            stop_broker_order_id=stop_broker_order_id,
+            stop_broker_perm_id=stop_broker_perm_id,
+            stop_price=stop_loss,
         )
 
     async def submit_standalone_stop_order(

@@ -98,6 +98,9 @@ class BrokerOrderAck:
     broker_perm_id: str
     submitted_at: datetime
     status: str  # "Submitted" | "PreSubmitted" | ...
+    stop_broker_order_id: str | None = None
+    stop_broker_perm_id: str | None = None
+    stop_price: Decimal | None = None
     warnings: tuple[str, ...] = ()
 
 

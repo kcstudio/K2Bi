@@ -100,6 +100,7 @@ DISCONNECT_STATUS_INTERVAL = timedelta(minutes=5)
 DEFAULT_TICK_SECONDS = 30.0
 POSITION_CACHE_MAX_AGE_SECONDS = 90
 DEFAULT_FILL_TIMEOUT_SECONDS = 60.0
+PROTECTIVE_STOP_TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "Inactive"})
 # Q33 (MiniMax R1 finding #3, 2026-04-21): cap the pre-exit barrier
 # wait so a misconfigured deployment cannot hang --once indefinitely.
 # 300s is generous vs the 10s default but firmly rules out accidental
@@ -263,6 +264,18 @@ class AwaitingOrderState:
     cancel_requested_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class ProtectiveStopRecord:
+    """In-memory identity of an engine-owned broker-held stop child."""
+
+    ticker: str
+    stop_perm_id: int
+    stop_price: Decimal
+    parent_perm_id: int
+    submitted_at: datetime
+    strategy_id: str
+
+
 @dataclass
 class TickResult:
     """Structured view of what one tick did. Tests assert against this
@@ -314,6 +327,12 @@ class Engine:
     _positions_refreshed_at: datetime | None = None
     _position_visibility_valid: bool = False
     _position_source: str | None = None
+    # TODO(Piece 3): rebuild/clear active protective stops from journal replay
+    # after restart so a process crash between stop fill and detection can still
+    # complete the stopped_out lifecycle.
+    _active_protective_stops: dict[str, ProtectiveStopRecord] = field(
+        default_factory=dict
+    )
     _pending_order: AwaitingOrderState | None = None
     _pending_orders: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     _rapid_fire_window: dict[tuple[str, str], deque[datetime]] = field(
@@ -2174,6 +2193,7 @@ class Engine:
             broker_order_id=ack.broker_order_id,
             broker_perm_id=ack.broker_perm_id,
         )
+        self._record_active_protective_stop(snap=snap, order=order, ack=ack)
         self._pending_orders.setdefault(
             (snap.name, order.ticker.upper()), set()
         ).add(ack.broker_order_id)
@@ -2221,6 +2241,63 @@ class Engine:
         )
         self.state = EngineState.AWAITING_FILL
         result.orders_submitted += 1
+
+    @staticmethod
+    def _positive_perm_id(value: str | int, *, field_name: str) -> int:
+        try:
+            perm_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be a positive int") from exc
+        if perm_id <= 0:
+            raise ValueError(f"{field_name} must be a positive int")
+        return perm_id
+
+    def _record_active_protective_stop(
+        self,
+        *,
+        snap: ApprovedStrategySnapshot,
+        order: Order,
+        ack: BrokerOrderAck,
+    ) -> None:
+        if order.stop_loss is None:
+            return
+        if ack.stop_broker_perm_id is None or ack.stop_price is None:
+            return
+        key = order.ticker.upper()
+        self._active_protective_stops[key] = ProtectiveStopRecord(
+            ticker=key,
+            stop_perm_id=self._positive_perm_id(
+                ack.stop_broker_perm_id,
+                field_name="stop_broker_perm_id",
+            ),
+            stop_price=ack.stop_price,
+            parent_perm_id=self._positive_perm_id(
+                ack.broker_perm_id,
+                field_name="broker_perm_id",
+            ),
+            submitted_at=ack.submitted_at,
+            strategy_id=snap.name,
+        )
+
+    def _clear_active_protective_stop_on_terminal(
+        self,
+        *,
+        ticker: str,
+        stop_perm_id: str | int,
+        terminal_status: str,
+    ) -> None:
+        if terminal_status not in PROTECTIVE_STOP_TERMINAL_STATUSES:
+            return
+        key = ticker.upper()
+        record = self._active_protective_stops.get(key)
+        if record is None:
+            return
+        if record.stop_perm_id != self._positive_perm_id(
+            stop_perm_id,
+            field_name="stop_perm_id",
+        ):
+            return
+        self._active_protective_stops.pop(key, None)
 
     def _journal_order_terminal(
         self,
