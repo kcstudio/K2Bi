@@ -10,7 +10,11 @@ risk_envelope_pct: 0.0025
 regime_filter: []
 slug: g-2026-05_2nd-wave-paper-trade
 ticker: G
-status: approved
+status: stopped_out
+stopped_out_at: '2026-05-19T16:07:17+00:00'
+stopped_out_fill_perm_id: 1849923648
+stopped_out_fill_price: '32.44'
+re_approve_path: '/invest-ship --re-approve g-2026-05_2nd-wave-paper-trade'
 sigid: 2026-05-04-ai-agentic-2nd-wave-adopters
 thesis_ref: "[[../tickers/G]]"
 position_size_at_risk_pct_nav: 0.25
