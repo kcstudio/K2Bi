@@ -81,10 +81,12 @@ K2Bi/
 ```
 
 **Critical split**: `wiki/` is git-tracked (authorial truth for strategy specs,
-required for `approved_commit_sha` and pre-commit hooks). The engine's runtime
-read path is `K2Bi-Vault/wiki/` via Syncthing. The `.githooks/post-commit`
-mirror phase atomically copies approved/retired strategy files from the repo to
-the vault at commit time.
+required for `approved_commit_sha` and pre-commit hooks). The VPS runtime root is
+also a real git checkout so engine lifecycle code can commit status transitions
+and fire hooks. The engine's runtime read path is `K2Bi-Vault/wiki/` via
+Syncthing. The `.githooks/post-commit` mirror phase atomically copies
+approved/retired/stopped-out strategy files from the repo to the vault at commit
+time.
 
 ---
 
@@ -225,21 +227,40 @@ logged.
 
 ## 8. Deployment Process
 
-Deployment is **manual rsync to the VPS** (Hostinger KL, Phase 3.9+), not CI/CD.
+Deployment is **manual rsync into a git-backed VPS checkout** (Hostinger KL,
+Phase 3.9+), not CI/CD.
 
 1. `scripts/deploy-config.yml` is the single source of truth for deploy categories
    (`skills`, `execution`, `scripts`, `pm2`).
-2. `scripts/deploy-to-vps.sh` reads the config and runs `rsync -av --delete`.
-3. `.sync-state/last-synced-commit` tracks the last deployed SHA.
-4. The preflight (`scripts/lib/deploy_config.py preflight`) blocks `/ship` if any
+2. `/home/k2bi/Projects/K2Bi` on the VPS must be a real git checkout with
+   `.git/hooks` wrappers installed before `/sync` runs. The wrappers put
+   `.venv/bin` on `PATH` and exec the tracked `.githooks/*` scripts.
+   `scripts/deploy-to-vps.sh` verifies this and refuses to sync if `.git` or
+   the hook install is missing. The verification executes the hook wrappers,
+   not just file-existence checks; its `post-commit` smoke runs with
+   `K2BI_SKIP_POST_COMMIT_MIRROR=1` scoped to that single hook call so the
+   vault mirror is not mutated by verification.
+   `scripts/deploy-to-vps.sh --verify-runtime` additionally checks the VPS
+   checkout `HEAD` against the local baseline SHA.
+   Before a real rsync, the script snapshots the configured payload targets on
+   the VPS, checksum-verifies them after rsync, and restores that snapshot if
+   post-rsync integrity or runtime verification fails. It stops before service
+   restart and before `.sync-state/last-synced-commit` advances on those failures.
+3. `scripts/deploy-to-vps.sh` reads the config and runs `rsync -av --delete` for
+   configured payload paths only. It does not rsync `.git` or `.githooks`; those
+   come from the VPS checkout and are preserved.
+4. `.sync-state/last-synced-commit` tracks the last deployed SHA.
+5. The preflight (`scripts/lib/deploy_config.py preflight`) blocks `/ship` if any
    top-level repo path is uncovered by `targets:` or `excludes:`.
 
 **Excluded from deploy** (see `deploy-config.yml`):
 - `.git/`, `.githooks/`, `tests/`, `wiki/`, `proposals/`, `.pending-sync/`,
   `.minimax-reviews/`, `.code-reviews/`, `.sync-state/`, `.venv/`, `__pycache__/`
 
-`wiki/` is excluded because the vault mirror (post-commit hook) + Syncthing are
-the authoritative propagation paths.
+`wiki/` is excluded from rsync because the vault mirror (post-commit hook) +
+Syncthing are the authoritative propagation paths. The VPS checkout may still
+contain `wiki/` as tracked git content so runtime lifecycle commits can fire
+the same hooks as the MacBook repo.
 
 ---
 

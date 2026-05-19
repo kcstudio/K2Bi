@@ -104,6 +104,23 @@ engine reads `.killed` and exits, or it may be missing `.killed` respect on the
 systemd restart path. No code fix was applied in this session; architect must
 rule whether this needs §8.x or Phase 3.11 retro coverage.
 
+**Phase G git-runtime requirement, 2026-05-19.** `/home/k2bi/Projects/K2Bi` on
+the VPS is a git checkout, not a bare rsync tree. `scripts/deploy-to-vps.sh`
+must verify the checkout and `.git/hooks` wrapper install before syncing payload
+directories. The wrappers put `.venv/bin` on `PATH` and exec tracked
+`.githooks/*`, preserving the `.git` metadata required by engine-side lifecycle
+commits such as `approved -> stopped_out`. Operator runbooks should use
+`scripts/deploy-to-vps.sh --verify-runtime` rather than duplicating the check.
+That verify-only mode also compares the VPS checkout `HEAD` to the local
+baseline SHA. The hook smoke executes the wrappers and rejects a persistent
+`K2BI_SKIP_POST_COMMIT_MIRROR=1` service environment, but scopes
+`K2BI_SKIP_POST_COMMIT_MIRROR=1` to the single `post-commit` smoke call so
+verification cannot mirror strategy files or write retire sentinels. For real
+syncs, the deploy script snapshots the configured VPS payload targets before
+rsync, checksum-verifies them after rsync, and restores that snapshot if
+post-rsync integrity or runtime verification fails. Those failures stop before
+service restart and before the sync sentinel advances.
+
 ## Cross-references
 
 - `.code-reviews/2026-05-08T04-22-34Z_d294dc.log` -- the review log itself.

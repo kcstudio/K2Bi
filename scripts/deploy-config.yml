@@ -1,11 +1,12 @@
 # scripts/deploy-config.yml -- single source of truth for the VPS deploy pipeline.
 #
 # Both scripts/deploy-to-vps.sh and the /invest-ship step 12 preflight read this file.
-# The deploy script builds rsync invocations from `targets:`; the preflight validates
-# every top-level repo entry is either covered by `targets:` or explicitly in
-# `excludes:`. Any top-level dir that is neither is a drift signal that blocks /ship
-# until Keith resolves it (add to targets for new deploy coverage, or to excludes for
-# intentionally-local paths like design docs).
+# The deploy script builds rsync invocations from `targets:` after verifying the
+# VPS runtime root is already a git checkout with installed hooks. The preflight
+# validates every top-level repo entry is either covered by `targets:` or
+# explicitly in `excludes:`. Any top-level dir that is neither is a drift signal
+# that blocks /ship until Keith resolves it (add to targets for new deploy
+# coverage, or to excludes for intentionally-local paths like design docs).
 #
 # Categories mirror the four lanes invest-ship tracks for /sync mailbox routing:
 #   skills    -- CLAUDE.md, .claude/skills/, .claude/settings.json, README.md, DEVLOG.md
@@ -45,9 +46,9 @@ targets:
 
 excludes:
   # VCS + IDE
-  - .git
-  - .githooks                    # hooks run on commit on MacBook only; Mini is Trader tier
-  - .gitignore                   # ships via `git clone`, not rsync
+  - .git                         # preserved by the VPS git checkout, never rsync-managed
+  - .githooks                    # present via the VPS git checkout; .git/hooks wrappers exec these
+  - .gitignore                   # ships via the VPS git checkout, not rsync
   # Claude Code runtime artifacts (local-only)
   - .claude/plugins
   - .claude/plans

@@ -500,6 +500,15 @@ def _write_sentinel(repo: Path, sha: str) -> Path:
     return sentinel
 
 
+def _write_minimal_githooks(repo: Path) -> None:
+    githooks_dir = repo / ".githooks"
+    githooks_dir.mkdir(exist_ok=True)
+    for hook_name in ("pre-commit", "commit-msg", "post-commit"):
+        hook_path = githooks_dir / hook_name
+        hook_path.write_text("#!/usr/bin/env bash\nexit 0\n")
+        hook_path.chmod(0o755)
+
+
 def _standard_cfg(tmp_path: Path) -> Path:
     """Write a minimal multi-category config used by the cycle-5-scenario
     tests. Excludes cover .git + .sync-state so preflight on this tree is
@@ -1017,12 +1026,19 @@ def test_deploy_script_ssh_restart_does_not_drain_category_loop(
         """,
     )
 
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+
     ssh_log = tmp_path / "ssh.log"
     (scripts_dir / "ssh-vps-transport.sh").write_text(
         textwrap.dedent(
             f"""\
             #!/usr/bin/env bash
             printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
             cat >/dev/null
             exit 0
             """
@@ -1042,9 +1058,6 @@ def test_deploy_script_ssh_restart_does_not_drain_category_loop(
     )
     (bin_dir / "rsync").chmod(0o755)
 
-    _init_git_repo(repo)
-    _git_commit_all(repo, "initial")
-
     env = {
         **os.environ,
         "HOME": str(home),
@@ -1062,6 +1075,1160 @@ def test_deploy_script_ssh_restart_does_not_drain_category_loop(
     assert "Syncing category: execution" in result.stdout
     assert "Syncing category: scripts" in result.stdout
     assert "Syncing category: skills" in result.stdout
+
+
+def test_deploy_script_refuses_non_git_vps_runtime(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse --is-inside-work-tree"* ]]; then
+                printf 'false\\n'
+                exit 1
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rsync_log = tmp_path / "rsync.log"
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {rsync_log}
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    _git_commit_all(repo, "initial")
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "all"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    assert "Remote VPS runtime is not a git checkout" in (
+        result.stdout + result.stderr
+    )
+    assert not rsync_log.exists(), "deploy must not rsync into a no-git runtime"
+
+
+def test_deploy_script_verify_runtime_mode_does_not_rsync(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rsync_log = tmp_path / "rsync.log"
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {rsync_log}
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Remote git checkout verified at {baseline_sha[:7]}" in result.stdout
+    assert "Runtime verification complete" in result.stdout
+    assert rsync_log.exists(), "--verify-runtime should checksum-check .githooks"
+    rsync_calls = rsync_log.read_text().splitlines()
+    assert rsync_calls
+    assert all(".githooks/" in line and "--dry-run" in line for line in rsync_calls)
+    assert all("execution/" not in line for line in rsync_calls)
+
+
+def test_deploy_script_verify_runtime_fails_on_remote_head_mismatch(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    remote_sha = "f" * 40
+    assert remote_sha != baseline_sha
+
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{remote_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "Remote VPS runtime HEAD mismatch" in combined
+    assert baseline_sha in combined
+    assert remote_sha in combined
+
+
+def test_deploy_script_hook_verify_guards_post_commit_mirror(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "K2BI_SKIP_POST_COMMIT_MIRROR=1 .git/hooks/post-commit"
+        in ssh_log.read_text()
+    )
+
+
+def test_deploy_script_fetches_remote_head_in_separate_ssh_call(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ssh_calls = ssh_log.read_text().splitlines()
+    sha_calls = [
+        line
+        for line in ssh_calls
+        if "git rev-parse HEAD" in line and ".git/hooks/post-commit" not in line
+    ]
+    assert sha_calls, ssh_calls
+
+
+def test_deploy_script_verifies_hook_wrapper_exec_contract(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    verify_call = ssh_log.read_text()
+    assert 'sha256sum ".git/hooks/$hook"' in verify_call
+    assert "check_hook_wrapper pre-commit" in verify_call
+    assert "check_hook_wrapper commit-msg" in verify_call
+    assert "check_hook_wrapper post-commit" in verify_call
+    assert "K2BI_SKIP_POST_COMMIT_MIRROR=1 .git/hooks/post-commit" in verify_call
+
+
+def test_deploy_script_restores_backup_when_payload_integrity_fails(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rsync_log = tmp_path / "rsync.log"
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {rsync_log}
+            if [[ "$*" == *"execution/"* && "$*" == *"--checksum"* ]]; then
+                printf '>f.st...... execution/engine.py\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "execution"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "Post-rsync payload integrity check failed" in combined
+    ssh_text = ssh_log.read_text()
+    assert "Restoring VPS payload backup" in combined
+    assert "deploy-backups" in ssh_text
+    assert "sudo systemctl restart k2bi-engine.service" not in ssh_text
+    assert "record-sync" not in combined
+
+
+def test_deploy_script_restores_backup_when_post_sync_runtime_verify_fails(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_log = tmp_path / "ssh.log"
+    verify_count = tmp_path / "verify-count"
+    verify_count.write_text("0")
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *".git/hooks/post-commit"* ]]; then
+                count="$(cat {verify_count})"
+                count=$((count + 1))
+                printf '%s\\n' "$count" > {verify_count}
+                if [[ "$count" -ge 2 ]]; then
+                    exit 44
+                fi
+            fi
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "execution"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "Post-sync runtime verification failed" in combined
+    assert "Restoring VPS payload backup" in combined
+    ssh_text = ssh_log.read_text()
+    assert "deploy-backups" in ssh_text
+    assert "sudo systemctl restart k2bi-engine.service" not in ssh_text
+
+
+def test_deploy_script_reverifies_hooks_before_execution_restart(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "scripts" / "payload").mkdir(parents=True)
+    (repo / "execution" / "engine.py").write_text("engine\n")
+    (repo / "scripts" / "payload" / "sync_me.sh").write_text("payload\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+          - path: scripts/
+            category: scripts
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    ssh_events = tmp_path / "ssh-events.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [[ "$*" == *".git/hooks/post-commit"* ]]; then
+                printf 'VERIFY\\n' >> {ssh_events}
+            fi
+            if [[ "$*" == *"systemctl restart k2bi-engine.service"* ]]; then
+                printf 'RESTART\\n' >> {ssh_events}
+            fi
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "all"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = ssh_events.read_text().splitlines()
+    assert events.count("VERIFY") >= 2
+    assert "RESTART" in events
+    assert max(i for i, event in enumerate(events) if event == "VERIFY") < events.index(
+        "RESTART"
+    ), events
+
+
+def test_deploy_script_verify_runtime_fails_on_broken_hook_wrapper(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (repo / "execution").mkdir()
+    (repo / "execution" / "engine.py").write_text("engine\n")
+
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    _write_config(
+        repo,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [[ "$*" == *".git/hooks/post-commit"* ]]; then
+                exit 44
+            fi
+            if [[ "$*" == *"git rev-parse --short HEAD"* ]] || [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf 'b996942\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    _write_minimal_githooks(repo)
+    _init_git_repo(repo)
+    _git_commit_all(repo, "initial")
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    assert "Remote VPS runtime is not a git checkout" in (
+        result.stdout + result.stderr
+    )
+
+
+def _deploy_script_fixture(
+    tmp_path: Path,
+    config_body: str,
+    *,
+    files: dict[str, str] | None = None,
+) -> tuple[Path, Path, Path, str]:
+    home = tmp_path / "home"
+    repo = home / "Projects" / "K2Bi"
+    repo.mkdir(parents=True)
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "lib").mkdir()
+    (scripts_dir / "deploy-to-vps.sh").write_text(
+        (REPO_ROOT / "scripts" / "deploy-to-vps.sh").read_text()
+    )
+    (scripts_dir / "deploy-to-vps.sh").chmod(0o755)
+    (scripts_dir / "lib" / "deploy_config.py").write_text(HELPER.read_text())
+    githooks_dir = repo / ".githooks"
+    githooks_dir.mkdir()
+    for hook_name in ("pre-commit", "commit-msg", "post-commit"):
+        hook_path = githooks_dir / hook_name
+        hook_path.write_text("#!/usr/bin/env bash\nexit 0\n")
+        hook_path.chmod(0o755)
+    for rel_path, body in (files or {"execution/engine.py": "engine\n"}).items():
+        path = repo / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    _write_config(repo, config_body)
+    _init_git_repo(repo)
+    baseline_sha = _git_commit_all(repo, "initial")
+    return home, repo, scripts_dir, baseline_sha
+
+
+def _env_with_fake_rsync(home: Path, bin_dir: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+
+
+def test_deploy_script_restore_path_validates_realpaths_before_rm_rf(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [[ "$*" == *"execution/"* && "$*" == *"--dry-run"* ]]; then
+                printf 'execution/engine.py\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "execution"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    ssh_text = ssh_log.read_text()
+    assert "realpath" in ssh_text
+    assert "Refusing to restore target outside repo" in ssh_text
+    assert 'rm -rf "$stripped"' not in ssh_text
+
+
+def test_deploy_script_uses_checksum_only_verify_with_shared_rsync_excludes(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rsync_log = tmp_path / "rsync.log"
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {rsync_log}
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "execution"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    rsync_calls = rsync_log.read_text().splitlines()
+    verify_calls = [
+        line for line in rsync_calls
+        if "--dry-run" in line and "execution/" in line
+    ]
+    assert verify_calls, rsync_calls
+    assert all("-anic" not in line for line in verify_calls)
+    assert all("--checksum" in line for line in verify_calls)
+    sync_call = next(line for line in rsync_calls if "--dry-run" not in line)
+    for exclude in ("--exclude __pycache__/", "--exclude *.pyc", "--exclude .venv/"):
+        assert exclude in sync_call
+        assert all(exclude in line for line in verify_calls)
+
+
+def test_deploy_script_verifies_exact_hook_wrapper_hashes(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ssh_text = ssh_log.read_text()
+    assert 'sha256sum ".git/hooks/$hook"' in ssh_text
+    assert "check_hook_wrapper pre-commit" in ssh_text
+    assert "check_hook_wrapper commit-msg" in ssh_text
+    assert "check_hook_wrapper post-commit" in ssh_text
+    assert "grep -Eq" not in ssh_text
+
+
+def test_deploy_script_restarts_each_service_once_for_multi_category_sync(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+          - path: pm2/
+            category: pm2
+        excludes:
+          - .git
+          - .sync-state
+        """,
+        files={
+            "execution/engine.py": "engine\n",
+            "pm2/ecosystem.config.js": "module.exports = {}\n",
+        },
+    )
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "all"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    restart_calls = [
+        line for line in ssh_log.read_text().splitlines()
+        if "systemctl restart k2bi-engine.service" in line
+    ]
+    assert len(restart_calls) == 1, restart_calls
+
+
+def test_deploy_script_prunes_old_remote_payload_backups_on_success(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+    ssh_log = tmp_path / "ssh.log"
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {ssh_log}
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "rsync").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "execution"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ssh_text = ssh_log.read_text()
+    assert "find .sync-state/deploy-backups" in ssh_text
+    assert "-mtime +14" in ssh_text
+
+
+def test_deploy_script_verify_runtime_fails_on_githooks_version_skew(
+    tmp_path: Path,
+) -> None:
+    home, repo, scripts_dir, baseline_sha = _deploy_script_fixture(
+        tmp_path,
+        """
+        targets:
+          - path: execution/
+            category: execution
+        excludes:
+          - .git
+          - .sync-state
+        """,
+    )
+    (scripts_dir / "ssh-vps-transport.sh").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [[ "$*" == *"git rev-parse HEAD"* ]]; then
+                printf '{baseline_sha}\\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (scripts_dir / "ssh-vps-transport.sh").chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rsync_log = tmp_path / "rsync.log"
+    (bin_dir / "rsync").write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> {rsync_log}
+            if [[ "$*" == *".githooks/"* && "$*" == *"--dry-run"* ]]; then
+                printf 'post-commit\n'
+            fi
+            exit 0
+            """
+        )
+    )
+    (bin_dir / "rsync").chmod(0o755)
+
+    result = subprocess.run(
+        [str(scripts_dir / "deploy-to-vps.sh"), "--verify-runtime"],
+        capture_output=True,
+        text=True,
+        env=_env_with_fake_rsync(home, bin_dir),
+        cwd=str(repo),
+    )
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "Remote .githooks differs from local tracked hooks" in combined
+    assert ".githooks/" in rsync_log.read_text()
 
 
 if __name__ == "__main__":

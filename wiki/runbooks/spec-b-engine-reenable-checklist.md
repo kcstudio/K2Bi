@@ -28,6 +28,24 @@ operator completes every checkbox below and manually runs the final command.
 Run from the MacBook:
 
 ```bash
+scripts/deploy-to-vps.sh --verify-runtime
+```
+
+Expected:
+
+```text
+[sync] Remote git checkout verified at <short-sha>.
+[sync] Remote git checkout HEAD matches local baseline <short-sha>.
+[sync] Runtime verification complete.
+```
+
+- [ ] VPS runtime is a git checkout.
+- [ ] VPS runtime HEAD matches the approved deploy commit.
+- [ ] VPS git hooks are installed through `.git/hooks` wrappers that exec tracked `.githooks/*`.
+
+Run from the MacBook:
+
+```bash
 scripts/ssh-vps.sh 'systemctl is-active k2bi-engine.service; systemctl is-enabled k2bi-engine.service'
 ```
 
