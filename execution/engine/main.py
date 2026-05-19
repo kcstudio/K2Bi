@@ -51,6 +51,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import yaml
+from yaml.nodes import MappingNode, ScalarNode
+
 from ..connectors.ibkr import ConnectorImportError
 from ..connectors.types import (
     AuthRequiredError,
@@ -2121,45 +2124,112 @@ class Engine:
         lines = raw.splitlines(keepends=True)
         if not lines or lines[0].strip() != "---":
             raise ValueError("strategy file has no YAML frontmatter fence")
+        delimiter = strategy_frontmatter.FRONTMATTER_DELIM
         try:
             end = next(
-                idx for idx, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+                idx
+                for idx, line in enumerate(lines[1:], start=1)
+                if line.rstrip("\r\n") == delimiter
             )
         except StopIteration as exc:
             raise ValueError("strategy file has unterminated YAML frontmatter") from exc
-        metadata_keys = {
-            "stopped_out_at",
-            "stopped_out_fill_perm_id",
-            "stopped_out_fill_price",
-            "stopped_out_realized_pnl_usd",
-            "re_approve_path",
-        }
-        status_idx = None
-        cleaned: list[str] = []
-        for idx, line in enumerate(lines[:end]):
-            key = line.split(":", 1)[0].strip() if ":" in line else ""
-            if key in metadata_keys:
-                continue
-            if key == "status":
-                status_idx = len(cleaned)
-                cleaned.append("status: stopped_out\n")
-            else:
-                cleaned.append(line)
-        if status_idx is None:
+        metadata_keys = set(strategy_frontmatter.STOPPED_OUT_ADDED_FIELDS)
+        original_frontmatter = strategy_frontmatter.parse(raw.encode("utf-8"))
+        frontmatter_text = "".join(lines[1:end])
+        try:
+            root = yaml.compose(frontmatter_text)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"YAML syntax error in frontmatter: {exc}") from exc
+        if not isinstance(root, MappingNode):
+            raise ValueError("YAML frontmatter must be a mapping")
+
+        entries: list[tuple[str, int, int, Any, int]] = []
+        for idx, (key_node, value_node) in enumerate(root.value):
+            if not isinstance(key_node, ScalarNode):
+                raise ValueError("strategy frontmatter top-level keys must be scalar")
+            entries.append(
+                (
+                    str(key_node.value),
+                    key_node.start_mark.line + 1,
+                    key_node.start_mark.column,
+                    value_node,
+                    idx,
+                )
+            )
+
+        status_entries = [entry for entry in entries if entry[0] == "status"]
+        if not status_entries:
             raise ValueError("strategy file has no status field")
+        if len(status_entries) > 1:
+            raise ValueError("strategy file has multiple top-level status fields")
+
+        line_spans: dict[int, tuple[int, int]] = {}
+        for pos, (_, line_idx, _, value_node, entry_idx) in enumerate(entries):
+            next_line = entries[pos + 1][1] if pos + 1 < len(entries) else end
+            value_end = min(value_node.end_mark.line + 2, next_line)
+            line_spans[entry_idx] = (line_idx, max(line_idx + 1, value_end))
+
+        _, status_line, status_column, status_value_node, status_entry_idx = status_entries[0]
+        if (
+            not isinstance(status_value_node, ScalarNode)
+            or line_spans[status_entry_idx] != (status_line, status_line + 1)
+        ):
+            raise ValueError("strategy status field must be a single-line scalar")
+
+        skip_lines: set[int] = set()
+        for key, _, _, _, entry_idx in entries:
+            if key in metadata_keys:
+                start, stop = line_spans[entry_idx]
+                skip_lines.update(range(start, stop))
+
+        newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
+        status_prefix = lines[status_line][:status_column]
         metadata = [
-            f"stopped_out_at: '{stopped_out_at}'\n",
-            f"stopped_out_fill_perm_id: {fill_perm_id}\n",
-            f"stopped_out_fill_price: '{fill_price}'\n",
-            f"re_approve_path: '{re_approve_path}'\n",
+            f"{status_prefix}stopped_out_at: '{stopped_out_at}'{newline}",
+            f"{status_prefix}stopped_out_fill_perm_id: {fill_perm_id}{newline}",
+            f"{status_prefix}stopped_out_fill_price: '{fill_price}'{newline}",
+            f"{status_prefix}re_approve_path: '{re_approve_path}'{newline}",
         ]
-        rewritten = (
-            cleaned[: status_idx + 1]
-            + metadata
-            + cleaned[status_idx + 1 :]
-            + lines[end:]
+        rewritten_lines: list[str] = []
+        for idx, line in enumerate(lines[:end]):
+            if idx in skip_lines:
+                continue
+            if idx == status_line:
+                rewritten_lines.append(f"{status_prefix}status: stopped_out{newline}")
+                rewritten_lines.extend(metadata)
+            else:
+                rewritten_lines.append(line)
+        rewritten_bytes = "".join(rewritten_lines + lines[end:]).encode("utf-8")
+        rewritten_frontmatter = strategy_frontmatter.parse(rewritten_bytes)
+        Engine._validate_stopped_out_frontmatter_rewrite(
+            original_frontmatter,
+            rewritten_frontmatter,
+            metadata_keys=metadata_keys,
         )
-        return "".join(rewritten).encode("utf-8")
+        return rewritten_bytes
+
+    @staticmethod
+    def _validate_stopped_out_frontmatter_rewrite(
+        original: dict[str, Any],
+        rewritten: dict[str, Any],
+        *,
+        metadata_keys: set[str],
+    ) -> None:
+        if str(rewritten.get("status", "")).strip() != STATUS_STOPPED_OUT:
+            raise ValueError("rewritten strategy status is not stopped_out")
+        strategy_frontmatter.validate_stopped_out_metadata(rewritten)
+        original_preserved = {
+            key: value
+            for key, value in original.items()
+            if key not in metadata_keys and key != "status"
+        }
+        rewritten_preserved = {
+            key: value
+            for key, value in rewritten.items()
+            if key not in metadata_keys and key != "status"
+        }
+        if rewritten_preserved != original_preserved:
+            raise ValueError("stopped_out rewrite changed non-lifecycle frontmatter")
 
     def _git_commit_stopped_out_strategy(
         self,

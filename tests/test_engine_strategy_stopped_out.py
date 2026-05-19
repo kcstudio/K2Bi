@@ -308,6 +308,119 @@ class StoppedOutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         engine._git_commit_stopped_out_strategy = fake_commit  # type: ignore[method-assign]
         return calls
 
+    def test_rewrite_stopped_out_frontmatter_preserves_nested_order_status(
+        self,
+    ) -> None:
+        raw = (
+            "---\n"
+            "name: g-2026-05_2nd-wave-paper-trade\n"
+            "status: approved\n"
+            "strategy_type: hand_crafted\n"
+            "order:\n"
+            "  ticker: G\n"
+            "  status: proposed\n"
+            "  side: buy\n"
+            "  qty: 71\n"
+            "  order_type: MKT\n"
+            "---\n\n"
+            "## How This Works\n\nPlain-English block.\n"
+        )
+
+        rewritten = Engine._rewrite_stopped_out_frontmatter(
+            raw,
+            stopped_out_at="2026-05-19T13:59:18+00:00",
+            fill_perm_id=1849923648,
+            fill_price=Decimal("32.44"),
+            re_approve_path=f"/invest-ship --re-approve {STRATEGY_ID}",
+        )
+
+        text = rewritten.decode("utf-8")
+        self.assertIn("\nstatus: stopped_out\n", text)
+        self.assertNotIn("\nstatus: proposed\n", text)
+        self.assertIn(
+            "\norder:\n"
+            "  ticker: G\n"
+            "  status: proposed\n"
+            "  side: buy\n",
+            text,
+        )
+        parsed = engine_main.strategy_frontmatter.parse(rewritten)
+        self.assertEqual(parsed["status"], "stopped_out")
+        self.assertEqual(parsed["order"]["status"], "proposed")
+        self.assertEqual(parsed["order"]["side"], "buy")
+        engine_main.strategy_frontmatter.validate_stopped_out_metadata(parsed)
+
+    def test_rewrite_stopped_out_frontmatter_preserves_nested_yaml_structure(
+        self,
+    ) -> None:
+        raw = (
+            "---\n"
+            "  name: g-2026-05_2nd-wave-paper-trade\n"
+            "  status: approved\n"
+            "  stopped_out_at: 'old-value'\n"
+            "  strategy_type: hand_crafted\n"
+            "  order:\n"
+            "    ticker: G\n"
+            "    status: proposed\n"
+            "    side: buy\n"
+            "    qty: 71\n"
+            "    order_type: MKT\n"
+            "  risk_controls:\n"
+            "    primary:\n"
+            "      status: proposed\n"
+            "      side: buy\n"
+            "    secondary:\n"
+            "      status: active\n"
+            "      note: keep\n"
+            "  review_history:\n"
+            "    - status: proposed\n"
+            "      side: buy\n"
+            "    - label: 'status: proposed'\n"
+            "      status_like: 'status: proposed'\n"
+            "  top_level_after_nested: keep-me\n"
+            "---\n\n"
+            "## How This Works\n\nPlain-English block.\n"
+        )
+        original = engine_main.strategy_frontmatter.parse(raw.encode("utf-8"))
+
+        rewritten = Engine._rewrite_stopped_out_frontmatter(
+            raw,
+            stopped_out_at="2026-05-19T13:59:18+00:00",
+            fill_perm_id=1849923648,
+            fill_price=Decimal("32.44"),
+            re_approve_path=f"/invest-ship --re-approve {STRATEGY_ID}",
+        )
+
+        text = rewritten.decode("utf-8")
+        self.assertIn("\n  status: stopped_out\n", text)
+        self.assertNotIn("old-value", text)
+        self.assertIn("\n    status: proposed\n", text)
+        self.assertIn("\n  top_level_after_nested: keep-me\n", text)
+        parsed = engine_main.strategy_frontmatter.parse(rewritten)
+        self.assertEqual(parsed["status"], "stopped_out")
+        self.assertEqual(parsed["order"]["status"], "proposed")
+        self.assertEqual(parsed["order"]["side"], "buy")
+        self.assertEqual(parsed["risk_controls"]["primary"]["status"], "proposed")
+        self.assertEqual(parsed["risk_controls"]["primary"]["side"], "buy")
+        self.assertEqual(parsed["review_history"][0]["status"], "proposed")
+        self.assertEqual(parsed["review_history"][0]["side"], "buy")
+        self.assertEqual(parsed["review_history"][1]["label"], "status: proposed")
+        self.assertEqual(parsed["top_level_after_nested"], "keep-me")
+        engine_main.strategy_frontmatter.validate_stopped_out_metadata(parsed)
+
+        metadata_keys = set(engine_main.strategy_frontmatter.STOPPED_OUT_ADDED_FIELDS)
+        original_non_lifecycle = {
+            key: value
+            for key, value in original.items()
+            if key not in metadata_keys and key != "status"
+        }
+        parsed_non_lifecycle = {
+            key: value
+            for key, value in parsed.items()
+            if key not in metadata_keys and key != "status"
+        }
+        self.assertEqual(parsed_non_lifecycle, original_non_lifecycle)
+
     async def test_s1_stop_out_detection_flips_strategy_and_clears_record(self) -> None:
         engine = self._make_engine()
         self._load_strategy(engine)
