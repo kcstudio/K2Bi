@@ -105,6 +105,7 @@ Day-one consequences:
 - Apply relevant learnings from `self_improve_learnings.md` each session.
 - After modifying project files (skills, CLAUDE.md, code, scripts, validators), run `/ship`. The `.pending-sync/` mailbox pattern carries over from K2B.
 - The user approves strategies, not individual trades. Never propose a specific trade on the user's behalf without explicit ask.
+- Strategy spec drafting by K2Bi (or by an orchestrator-dispatched K2Bi worker) is permitted when the user explicitly asks. The user remains the approver: `/invest-ship --approve-strategy` is the gate. Validators (REQUIRED_STRATEGY_FIELDS, How-This-Works section presence, real values vs placeholders, position-size cap, hold-horizon-declared) are code-enforced at ship time regardless of who drafted the spec.
 
 ## Teach Mode
 
