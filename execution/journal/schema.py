@@ -58,6 +58,14 @@ v2 additive (2026-05-14, Spec B §9.1):
 
 v2 additive (2026-05-16, Spec B §9.2):
     - Added stopped-out lifecycle events for protective-stop detection.
+
+v2 additive (2026-05-28, Phase 4 P4-1):
+    - Added external_fill_observed for live Trade.fillEvent visibility.
+    - Added external_fill_malformed so malformed observations still leave
+      an incident-response audit trail.
+    - Added external_fill_malformed_type for observer contract violations.
+    - Added external_fill_event_unavailable for trades whose broker wrapper
+      does not expose fillEvent.
 """
 
 from __future__ import annotations
@@ -189,6 +197,16 @@ EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2 = frozenset(
     }
 )
 
+EVENT_TYPES_V2_ADDITIVE_PHASE_4_P4_1 = frozenset(
+    {
+        "external_fill_event_unavailable",
+        "external_fill_handoff_dropped",
+        "external_fill_malformed",
+        "external_fill_malformed_type",
+        "external_fill_observed",
+    }
+)
+
 EVENT_TYPES = (
     EVENT_TYPES_V1
     | EVENT_TYPES_V2_ADDITIONS
@@ -200,6 +218,7 @@ EVENT_TYPES = (
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_8
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_1
     | EVENT_TYPES_V2_ADDITIVE_SPEC_B_SECTION_9_2
+    | EVENT_TYPES_V2_ADDITIVE_PHASE_4_P4_1
 )
 
 KNOWN_SCHEMA_VERSIONS = frozenset({1, 2})
@@ -418,6 +437,19 @@ def _require_int(payload: dict[str, Any], event_type: str, field: str) -> int:
             f"{event_type} {field} must be int, got {value!r}"
         )
     return value
+
+
+def _require_timezone_iso(payload: dict[str, Any], event_type: str, field: str) -> str:
+    raw = _require_non_empty_str(payload, event_type, field)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        raise JournalSchemaError(f"{event_type} {field} not ISO8601: {raw!r}")
+    if parsed.tzinfo is None:
+        raise JournalSchemaError(
+            f"{event_type} {field} must include timezone, got {raw!r}"
+        )
+    return raw
 
 
 def _require_positive_decimal_str(
@@ -662,3 +694,128 @@ def validate_cycle_position_partial_close_observed_payload(
             f"{event_type} curr_qty must be between 0 and prev_qty, got {curr_qty!r}"
         )
     _require_non_empty_str(payload, event_type, "cycle_id")
+
+
+def validate_external_fill_observed_payload(payload: dict[str, Any]) -> None:
+    event_type = "external_fill_observed"
+    _require_non_empty_str(payload, event_type, "ticker")
+    side = _require_non_empty_str(payload, event_type, "side").lower()
+    if side not in {"buy", "sell"}:
+        raise JournalSchemaError(f"{event_type} side unsupported: {side!r}")
+    qty = _require_int(payload, event_type, "qty")
+    if qty <= 0:
+        raise JournalSchemaError(f"{event_type} qty must be positive, got {qty!r}")
+    _require_positive_decimal_str(payload, event_type, "price")
+    _require_timezone_iso(payload, event_type, "filled_at")
+    _require_timezone_iso(payload, event_type, "observed_at")
+    _require_non_empty_str(payload, event_type, "broker_order_id")
+    _require_non_empty_str(payload, event_type, "broker_perm_id")
+    _require_non_empty_str(payload, event_type, "exec_id")
+    _require_non_empty_str(payload, event_type, "client_tag")
+    source = _require_non_empty_str(payload, event_type, "source")
+    if source != "trade_fill_event":
+        raise JournalSchemaError(f"{event_type} source unsupported: {source!r}")
+    _require_non_empty_str(payload, event_type, "strategy_id")
+    _require_non_empty_str(payload, event_type, "trade_id")
+    _require_bool(payload, event_type, "is_stop_child")
+    handoff_sequence = _require_int(payload, event_type, "handoff_sequence")
+    observer_epoch = _require_int(payload, event_type, "observer_epoch")
+    if handoff_sequence <= 0:
+        raise JournalSchemaError(
+            f"{event_type} handoff_sequence must be positive, got {handoff_sequence!r}"
+        )
+    if observer_epoch <= 0:
+        raise JournalSchemaError(
+            f"{event_type} observer_epoch must be positive, got {observer_epoch!r}"
+        )
+
+
+def validate_external_fill_malformed_payload(payload: dict[str, Any]) -> None:
+    event_type = "external_fill_malformed"
+    _require_non_empty_str(payload, event_type, "ticker")
+    _require_non_empty_str(payload, event_type, "side")
+    _require_int(payload, event_type, "qty")
+    _require_decimal_str(payload, event_type, "price")
+    _require_timezone_iso(payload, event_type, "filled_at")
+    _require_timezone_iso(payload, event_type, "observed_at")
+    _require_non_empty_str(payload, event_type, "broker_order_id")
+    _require_non_empty_str(payload, event_type, "broker_perm_id")
+    _require_non_empty_str(payload, event_type, "exec_id")
+    _require_non_empty_str(payload, event_type, "client_tag")
+    source = _require_non_empty_str(payload, event_type, "source")
+    if source == "fill_event_unavailable":
+        raise JournalSchemaError(
+            "external_fill_malformed source=fill_event_unavailable must use "
+            "external_fill_event_unavailable"
+        )
+    _require_non_empty_str(payload, event_type, "exception_type")
+    _require_non_empty_str(payload, event_type, "exception_message")
+
+
+def validate_external_fill_event_unavailable_payload(payload: dict[str, Any]) -> None:
+    event_type = "external_fill_event_unavailable"
+    _require_non_empty_str(payload, event_type, "ticker")
+    side = _require_non_empty_str(payload, event_type, "side").lower()
+    if side not in {"buy", "sell"}:
+        raise JournalSchemaError(f"{event_type} side unsupported: {side!r}")
+    _require_non_empty_str(payload, event_type, "broker_order_id")
+    _require_non_empty_str(payload, event_type, "broker_perm_id")
+    _require_non_empty_str(payload, event_type, "client_tag")
+    _require_timezone_iso(payload, event_type, "observed_at")
+    _require_non_empty_str(payload, event_type, "unavailable_reason")
+    source = _require_non_empty_str(payload, event_type, "source")
+    if source != "fill_event_unavailable":
+        raise JournalSchemaError(f"{event_type} source unsupported: {source!r}")
+
+
+def validate_external_fill_malformed_type_payload(payload: dict[str, Any]) -> None:
+    event_type = "external_fill_malformed_type"
+    _require_non_empty_str(payload, event_type, "observation_type")
+    _require_non_empty_str(payload, event_type, "expected_type")
+    _require_non_empty_str(payload, event_type, "exception_type")
+    _require_non_empty_str(payload, event_type, "exception_message")
+
+
+def validate_external_fill_handoff_dropped_payload(payload: dict[str, Any]) -> None:
+    event_type = "external_fill_handoff_dropped"
+    observer_epoch = _require_int(payload, event_type, "observer_epoch")
+    dropped_count = _require_int(payload, event_type, "dropped_count")
+    first_sequence = _require_int(payload, event_type, "first_dropped_sequence")
+    last_sequence = _require_int(payload, event_type, "last_dropped_sequence")
+    buffer_depth = _require_int(payload, event_type, "buffer_depth")
+    cumulative_dropped = _require_int(payload, event_type, "cumulative_dropped")
+    oldest_pending_age = _require_non_negative_seconds_or_none(
+        payload,
+        event_type,
+        "oldest_pending_age_seconds",
+    )
+    if observer_epoch <= 0:
+        raise JournalSchemaError(
+            f"{event_type} observer_epoch must be positive, got {observer_epoch!r}"
+        )
+    if dropped_count <= 0:
+        raise JournalSchemaError(
+            f"{event_type} dropped_count must be positive, got {dropped_count!r}"
+        )
+    if first_sequence <= 0 or last_sequence <= 0:
+        raise JournalSchemaError(
+            f"{event_type} sequence range must be positive, got "
+            f"{first_sequence!r}-{last_sequence!r}"
+        )
+    if last_sequence < first_sequence:
+        raise JournalSchemaError(
+            f"{event_type} last_dropped_sequence must be >= first_dropped_sequence"
+        )
+    if buffer_depth < 0:
+        raise JournalSchemaError(
+            f"{event_type} buffer_depth must be non-negative, got {buffer_depth!r}"
+        )
+    if cumulative_dropped < dropped_count:
+        raise JournalSchemaError(
+            f"{event_type} cumulative_dropped must be >= dropped_count"
+        )
+    if oldest_pending_age is not None and oldest_pending_age < 0:
+        raise JournalSchemaError(
+            f"{event_type} oldest_pending_age_seconds must be non-negative"
+        )
+    _require_timezone_iso(payload, event_type, "last_dropped_at")

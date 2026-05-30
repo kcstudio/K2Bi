@@ -42,6 +42,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ from ..connectors.ibkr import ConnectorImportError
 from ..connectors.types import (
     AuthRequiredError,
     BrokerExecution,
+    BrokerFillObservation,
     BrokerOrderAck,
     BrokerOrderStatusEvent,
     BrokerPosition,
@@ -77,7 +79,12 @@ from ..journal.schema import (
     validate_cycle_skipped_position_query_failed_payload,
     validate_cycle_position_partial_close_observed_payload,
     validate_cycle_position_unexpectedly_zero_payload,
+    validate_external_fill_event_unavailable_payload,
+    validate_external_fill_handoff_dropped_payload,
     validate_cycle_skipped_strategy_stopped_out_payload,
+    validate_external_fill_malformed_payload,
+    validate_external_fill_malformed_type_payload,
+    validate_external_fill_observed_payload,
     validate_position_visibility_lost_payload,
     validate_strategy_stopped_out_payload,
 )
@@ -113,7 +120,12 @@ DISCONNECT_STATUS_INTERVAL = timedelta(minutes=5)
 DEFAULT_TICK_SECONDS = 30.0
 POSITION_CACHE_MAX_AGE_SECONDS = 90
 DEFAULT_FILL_TIMEOUT_SECONDS = 60.0
+DEFAULT_EXTERNAL_FILL_HANDOFF_LIMIT = 128
+EXTERNAL_FILL_HANDOFF_LOCK_TIMEOUT_SECONDS = 0.01
 PROTECTIVE_STOP_TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "Inactive"})
+EXTERNAL_FILL_OBSERVER_RUNNING = "running"
+EXTERNAL_FILL_OBSERVER_DRAINING = "draining"
+EXTERNAL_FILL_OBSERVER_STOPPED = "stopped"
 # Q33 (MiniMax R1 finding #3, 2026-04-21): cap the pre-exit barrier
 # wait so a misconfigured deployment cannot hang --once indefinitely.
 # 300s is generous vs the 10s default but firmly rules out accidental
@@ -177,6 +189,14 @@ class JournalDurabilityError(Exception):
     """Raised when a journal write is not visible on read-back."""
 
 
+@dataclass(frozen=True)
+class _ExternalFillHandoffItem:
+    sequence: int
+    observer_epoch: int
+    observation: object
+    accepted_at: datetime
+
+
 # States the tick loop treats as "engine no longer operates; early
 # return". Added HALTED alongside SHUTDOWN so the refuse-to-start
 # paths get a distinct operational label without changing tick
@@ -229,6 +249,10 @@ class EngineConfig:
     # with the pending-order trade_ids so Q39-B's recovery can
     # promote evidence to barrier_timeout on the next restart.
     once_exit_wait_seconds: float = 10.0
+    # Phase 4 P4-1B: bounded broker-thread to engine-loop external-fill
+    # handoff. 128 observations keeps memory bounded while absorbing bursty
+    # callback delivery; tests exercise smaller bounds deterministically.
+    external_fill_handoff_limit: int = DEFAULT_EXTERNAL_FILL_HANDOFF_LIMIT
 
     def __post_init__(self) -> None:
         # Q33 MiniMax R1 finding #3 (2026-04-21): clamp once_exit_wait_seconds
@@ -239,6 +263,13 @@ class EngineConfig:
         # are covered.
         if self.once_exit_wait_seconds > ONCE_EXIT_WAIT_SECONDS_MAX:
             self.once_exit_wait_seconds = ONCE_EXIT_WAIT_SECONDS_MAX
+        if (
+            type(self.external_fill_handoff_limit) is not int
+            or self.external_fill_handoff_limit <= 0
+        ):
+            raise ValueError(
+                "external_fill_handoff_limit must be a positive integer"
+            )
 
     # Codex round-12 P1: regime source for strategy gating. The file
     # is vault-side + populated by invest-regime (Phase 2 manual
@@ -337,6 +368,10 @@ class Engine:
     _strategy_drift_warned: set[str] = field(default_factory=set)
     _positions: list[BrokerPosition] = field(default_factory=list)
     _positions_prev: list[BrokerPosition] = field(default_factory=list)
+    # Writes update prev/current as one critical section. Reads stay on
+    # the engine's single asyncio event loop and must not await between
+    # paired prev/current reads.
+    _positions_lock: Any = field(default_factory=asyncio.Lock)
     _positions_refreshed_at: datetime | None = None
     _position_visibility_valid: bool = False
     _position_source: str | None = None
@@ -383,6 +418,22 @@ class Engine:
     # reason for downstream readers. Track whether stopping was
     # already recorded.
     _engine_stopped_journaled: bool = False
+    _external_fill_handoff_lock: Any = field(default_factory=threading.Lock)
+    _external_fill_pending: deque[_ExternalFillHandoffItem] = field(
+        default_factory=deque
+    )
+    _external_fill_loop: asyncio.AbstractEventLoop | None = None
+    _external_fill_observer_lifecycle: str = EXTERNAL_FILL_OBSERVER_STOPPED
+    _external_fill_observer_epoch: int = 0
+    _external_fill_next_sequence: int = 1
+    _external_fill_drain_scheduled: bool = False
+    _external_fill_drain_in_progress: bool = False
+    _external_fill_drain_schedule_failed: bool = False
+    _external_fill_pending_drop_count: int = 0
+    _external_fill_first_pending_drop_sequence: int | None = None
+    _external_fill_last_pending_drop_sequence: int | None = None
+    _external_fill_cumulative_dropped: int = 0
+    _external_fill_last_dropped_at: datetime | None = None
 
     @classmethod
     def from_environment(
@@ -406,6 +457,300 @@ class Engine:
             engine_config=eng_cfg,
         )
 
+    def __post_init__(self) -> None:
+        self._activate_external_fill_handoff()
+        set_observer = getattr(self.connector, "set_external_fill_observer", None)
+        if callable(set_observer):
+            set_observer(self._enqueue_external_fill_observation)
+
+    def _activate_external_fill_handoff(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        with self._external_fill_handoff_lock:
+            if self._external_fill_observer_epoch <= 0:
+                self._external_fill_observer_epoch = 1
+            self._external_fill_loop = loop
+            if self._external_fill_observer_lifecycle != EXTERNAL_FILL_OBSERVER_DRAINING:
+                self._external_fill_observer_lifecycle = EXTERNAL_FILL_OBSERVER_RUNNING
+
+    def _reset_external_fill_handoff_epoch(self) -> None:
+        self._activate_external_fill_handoff()
+        with self._external_fill_handoff_lock:
+            skip_drain = self._external_fill_drain_schedule_failed
+        if not skip_drain:
+            self._drain_external_fill_handoff()
+        drop_payloads: list[dict[str, Any]] = []
+        with self._external_fill_handoff_lock:
+            drop_payload = self._consume_external_fill_drop_payload_locked()
+            if drop_payload is not None:
+                drop_payloads.append(drop_payload)
+            pending_drop_payload = self._consume_external_fill_pending_drop_payload_locked(
+                drop_reason=(
+                    "drain_schedule_failed"
+                    if self._external_fill_drain_schedule_failed
+                    else "epoch_reset"
+                )
+            )
+            if pending_drop_payload is not None:
+                drop_payloads.append(pending_drop_payload)
+            self._external_fill_next_sequence = 1
+            self._external_fill_drain_scheduled = False
+            self._external_fill_drain_in_progress = False
+            self._external_fill_drain_schedule_failed = False
+            self._external_fill_observer_epoch = max(
+                1,
+                self._external_fill_observer_epoch + 1,
+            )
+            self._external_fill_observer_lifecycle = EXTERNAL_FILL_OBSERVER_RUNNING
+        for payload in drop_payloads:
+            self._journal_external_fill_handoff_dropped(payload)
+
+    def _enqueue_external_fill_observation(self, observation: object) -> None:
+        now = datetime.now(timezone.utc)
+        loop_to_schedule: asyncio.AbstractEventLoop | None = None
+        acquired = self._external_fill_handoff_lock.acquire(
+            timeout=EXTERNAL_FILL_HANDOFF_LOCK_TIMEOUT_SECONDS
+        )
+        if not acquired:
+            self._external_fill_cumulative_dropped += 1
+            self._external_fill_last_dropped_at = now
+            LOG.warning(
+                "external fill observation dropped: handoff lock unavailable"
+            )
+            return
+        try:
+            loop = self._external_fill_loop
+            if (
+                self._external_fill_observer_lifecycle
+                != EXTERNAL_FILL_OBSERVER_RUNNING
+            ):
+                self._external_fill_cumulative_dropped += 1
+                self._external_fill_last_dropped_at = now
+                LOG.warning(
+                    "external fill observation dropped: observer lifecycle=%s",
+                    self._external_fill_observer_lifecycle,
+                )
+                return
+            if loop is None or loop.is_closed():
+                self._external_fill_cumulative_dropped += 1
+                self._external_fill_last_dropped_at = now
+                LOG.warning("external fill observation dropped: engine loop unavailable")
+                return
+
+            sequence = self._external_fill_next_sequence
+            self._external_fill_next_sequence += 1
+            if (
+                len(self._external_fill_pending)
+                >= self.engine_config.external_fill_handoff_limit
+            ):
+                self._external_fill_pending_drop_count += 1
+                self._external_fill_cumulative_dropped += 1
+                if self._external_fill_first_pending_drop_sequence is None:
+                    self._external_fill_first_pending_drop_sequence = sequence
+                self._external_fill_last_pending_drop_sequence = sequence
+                self._external_fill_last_dropped_at = now
+            else:
+                self._external_fill_pending.append(
+                    _ExternalFillHandoffItem(
+                        sequence=sequence,
+                        observer_epoch=self._external_fill_observer_epoch,
+                        observation=observation,
+                        accepted_at=now,
+                    )
+                )
+
+            if not self._external_fill_drain_scheduled:
+                self._external_fill_drain_scheduled = True
+                loop_to_schedule = loop
+        finally:
+            self._external_fill_handoff_lock.release()
+
+        if loop_to_schedule is not None:
+            self._schedule_external_fill_drain(loop_to_schedule)
+
+    def _schedule_external_fill_drain(
+        self,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        try:
+            loop.call_soon_threadsafe(self._drain_external_fill_handoff)
+        except RuntimeError as exc:
+            LOG.warning("external fill handoff drain scheduling failed: %s", exc)
+            with self._external_fill_handoff_lock:
+                self._external_fill_drain_scheduled = False
+                if (
+                    self._external_fill_pending
+                    or self._external_fill_pending_drop_count
+                ):
+                    self._external_fill_drain_schedule_failed = True
+                self._external_fill_observer_lifecycle = EXTERNAL_FILL_OBSERVER_STOPPED
+
+    def _drain_external_fill_handoff(self) -> None:
+        with self._external_fill_handoff_lock:
+            if self._external_fill_drain_in_progress:
+                return
+            self._external_fill_drain_in_progress = True
+            self._external_fill_drain_scheduled = False
+        try:
+            while True:
+                with self._external_fill_handoff_lock:
+                    drop_payload = self._consume_external_fill_drop_payload_locked()
+                    item = (
+                        self._external_fill_pending.popleft()
+                        if self._external_fill_pending
+                        else None
+                    )
+                    if drop_payload is None and item is None:
+                        break
+                if drop_payload is not None:
+                    self._journal_external_fill_handoff_dropped(drop_payload)
+                    if self._shutdown_requested:
+                        break
+                if item is not None:
+                    self._observe_external_fill(
+                        item.observation,
+                        handoff_sequence=item.sequence,
+                        observer_epoch=item.observer_epoch,
+                    )
+                    if self._shutdown_requested:
+                        break
+        finally:
+            loop_to_schedule: asyncio.AbstractEventLoop | None = None
+            with self._external_fill_handoff_lock:
+                self._external_fill_drain_in_progress = False
+                has_more = bool(
+                    self._external_fill_pending
+                    or self._external_fill_pending_drop_count
+                )
+                loop = self._external_fill_loop
+                if (
+                    has_more
+                    and self._external_fill_observer_lifecycle
+                    == EXTERNAL_FILL_OBSERVER_RUNNING
+                    and loop is not None
+                    and not loop.is_closed()
+                    and not self._external_fill_drain_scheduled
+                ):
+                    self._external_fill_drain_scheduled = True
+                    loop_to_schedule = loop
+            if loop_to_schedule is not None:
+                self._schedule_external_fill_drain(loop_to_schedule)
+
+    def _build_external_fill_drop_payload_locked(
+        self,
+        *,
+        dropped_count: int,
+        first_dropped_sequence: int,
+        last_dropped_sequence: int,
+        last_dropped_at: datetime,
+        drop_reason: str | None,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        oldest_pending_age_seconds: float | None = None
+        if self._external_fill_pending:
+            oldest = self._external_fill_pending[0].accepted_at
+            oldest_pending_age_seconds = max(0.0, (now - oldest).total_seconds())
+        payload: dict[str, Any] = {
+            "observer_epoch": self._external_fill_observer_epoch,
+            "dropped_count": dropped_count,
+            "first_dropped_sequence": first_dropped_sequence,
+            "last_dropped_sequence": last_dropped_sequence,
+            "buffer_depth": len(self._external_fill_pending),
+            "oldest_pending_age_seconds": oldest_pending_age_seconds,
+            "cumulative_dropped": self._external_fill_cumulative_dropped,
+            "last_dropped_at": last_dropped_at.isoformat(),
+        }
+        if drop_reason is not None:
+            payload["drop_reason"] = drop_reason
+        return payload
+
+    def _consume_external_fill_drop_payload_locked(self) -> dict[str, Any] | None:
+        if (
+            self._external_fill_pending_drop_count <= 0
+            or self._external_fill_first_pending_drop_sequence is None
+            or self._external_fill_last_pending_drop_sequence is None
+            or self._external_fill_last_dropped_at is None
+        ):
+            return None
+        payload = self._build_external_fill_drop_payload_locked(
+            dropped_count=self._external_fill_pending_drop_count,
+            first_dropped_sequence=self._external_fill_first_pending_drop_sequence,
+            last_dropped_sequence=self._external_fill_last_pending_drop_sequence,
+            last_dropped_at=self._external_fill_last_dropped_at,
+            drop_reason="queue_overflow",
+        )
+        self._external_fill_pending_drop_count = 0
+        self._external_fill_first_pending_drop_sequence = None
+        self._external_fill_last_pending_drop_sequence = None
+        return payload
+
+    def _consume_external_fill_pending_drop_payload_locked(
+        self,
+        *,
+        drop_reason: str,
+    ) -> dict[str, Any] | None:
+        if not self._external_fill_pending:
+            return None
+        now = datetime.now(timezone.utc)
+        dropped_count = len(self._external_fill_pending)
+        first_sequence = self._external_fill_pending[0].sequence
+        last_sequence = self._external_fill_pending[-1].sequence
+        self._external_fill_cumulative_dropped += dropped_count
+        self._external_fill_last_dropped_at = now
+        payload = self._build_external_fill_drop_payload_locked(
+            dropped_count=dropped_count,
+            first_dropped_sequence=first_sequence,
+            last_dropped_sequence=last_sequence,
+            last_dropped_at=now,
+            drop_reason=drop_reason,
+        )
+        self._external_fill_pending.clear()
+        return payload
+
+    def external_fill_handoff_metrics(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self._external_fill_handoff_lock:
+            oldest_pending_age_seconds: float | None = None
+            if self._external_fill_pending:
+                oldest = self._external_fill_pending[0].accepted_at
+                oldest_pending_age_seconds = max(0.0, (now - oldest).total_seconds())
+            return {
+                "lifecycle": self._external_fill_observer_lifecycle,
+                "observer_epoch": self._external_fill_observer_epoch,
+                "buffer_depth": len(self._external_fill_pending),
+                "oldest_pending_age_seconds": oldest_pending_age_seconds,
+                "cumulative_dropped": self._external_fill_cumulative_dropped,
+                "last_dropped_at": (
+                    self._external_fill_last_dropped_at.isoformat()
+                    if self._external_fill_last_dropped_at is not None
+                    else None
+                ),
+            }
+
+    def _begin_external_fill_handoff_draining(self) -> None:
+        with self._external_fill_handoff_lock:
+            if (
+                self._external_fill_observer_lifecycle
+                != EXTERNAL_FILL_OBSERVER_STOPPED
+            ):
+                self._external_fill_observer_lifecycle = EXTERNAL_FILL_OBSERVER_DRAINING
+
+    def _stop_external_fill_handoff(self) -> None:
+        with self._external_fill_handoff_lock:
+            self._external_fill_observer_lifecycle = EXTERNAL_FILL_OBSERVER_STOPPED
+            self._external_fill_drain_scheduled = False
+
+    def _disable_external_fill_connector_observer(self) -> None:
+        set_observer = getattr(self.connector, "set_external_fill_observer", None)
+        if not callable(set_observer):
+            return
+        try:
+            set_observer(None)
+        except Exception as exc:
+            LOG.warning("external fill observer unregister failed: %s", exc)
+
     # ---------- lifecycle ----------
 
     async def run_forever(self) -> None:
@@ -422,6 +767,7 @@ class Engine:
         when the last tick was a DISCONNECTED reconnect attempt; the
         backoff inside _attempt_reconnect is the authoritative delay.
         """
+        self._activate_external_fill_handoff()
         self._install_signal_handlers()
         try:
             while not self._shutdown_requested:
@@ -455,6 +801,7 @@ class Engine:
         returning. Covers the Session F fill-callback race where
         --once exited between broker fill and journal write.
         """
+        self._activate_external_fill_handoff()
         result = await self.tick_once()
         for _ in range(2):
             if result.state_after in {
@@ -623,6 +970,7 @@ class Engine:
             3. Connection recovery.
             4. Tick body (strategy evaluation + submit).
         """
+        self._activate_external_fill_handoff()
         state_before = self.state
         result = TickResult(state_before=state_before, state_after=state_before)
 
@@ -690,6 +1038,7 @@ class Engine:
         if not conn_status.connected:
             try:
                 await self.connector.connect()
+                self._reset_external_fill_handoff_epoch()
             except ConnectorImportError as exc:
                 # Codex R21 P2: missing ib_async is a permanent
                 # condition on this host. Reconnect loop cannot
@@ -822,11 +1171,16 @@ class Engine:
             return
 
         # Adopt broker state as engine state.
-        self._positions = reco.adopted_positions
-        self._positions_prev = []
-        self._positions_refreshed_at = position_snapshot.fetched_at
-        self._position_source = position_snapshot.source
-        self._position_visibility_valid = True
+        await self._write_position_snapshot(
+            PositionSnapshot(
+                positions=list(reco.adopted_positions),
+                valid=True,
+                source=position_snapshot.source,
+                fetched_at=position_snapshot.fetched_at,
+            ),
+            previous_positions=[],
+            phase="startup_recovery",
+        )
         self._journal_recovery_self_heals(
             journal_tail,
             since=narrow_lookback_start,
@@ -1054,6 +1408,23 @@ class Engine:
         await self._shutdown(reason="journal_durability_failure")
         return self.state
 
+    def _request_journal_durability_shutdown(
+        self,
+        exc: Exception,
+        *,
+        context: str,
+    ) -> None:
+        error = (
+            exc
+            if isinstance(exc, JournalDurabilityError)
+            else JournalDurabilityError(f"{context}: {exc}")
+        )
+        LOG.error("engine: journal durability failure during %s: %s", context, error)
+        self._stop_external_fill_handoff()
+        self._disable_external_fill_connector_observer()
+        self._shutdown_requested = True
+        self.state = EngineState.SHUTDOWN
+
     async def _attempt_reconnect(self, result: TickResult) -> None:
         delay = _reconnect_delay(self._reconnect_attempts)
         # The runner lives on a single event loop: asyncio.sleep is the
@@ -1062,6 +1433,7 @@ class Engine:
 
         try:
             await self.connector.connect()
+            self._reset_external_fill_handoff_epoch()
         except AuthRequiredError as exc:
             self._reconnect_attempts += 1
             prior = self._last_error_class
@@ -1884,6 +2256,297 @@ class Engine:
         validate_position_visibility_lost_payload(payload)
         self.journal.append("position_visibility_lost", payload=payload)
 
+    async def _write_position_snapshot(
+        self,
+        snapshot: PositionSnapshot,
+        *,
+        previous_positions: list[BrokerPosition] | None = None,
+        phase: str = "position_cache_write",
+    ) -> None:
+        positions = _require_valid_position_snapshot(snapshot, phase=phase)
+        async with self._positions_lock:
+            self._positions_prev = (
+                list(previous_positions)
+                if previous_positions is not None
+                else list(self._positions)
+            )
+            self._positions = list(positions)
+            self._positions_refreshed_at = snapshot.fetched_at
+            self._position_source = snapshot.source
+            self._position_visibility_valid = True
+
+    def _observe_external_fill(
+        self,
+        observation: object,
+        *,
+        handoff_sequence: int | None = None,
+        observer_epoch: int | None = None,
+    ) -> None:
+        """Journal live fill observations without mutating position state.
+
+        P4-1B hands broker-thread callbacks to this method through the
+        engine loop. Keep it observability-only: never call
+        _write_position_snapshot and never mutate _positions here.
+        """
+        if not isinstance(observation, BrokerFillObservation):
+            exc = TypeError(
+                f"expected BrokerFillObservation, got {type(observation).__name__}"
+            )
+            LOG.warning("external_fill_observed payload malformed: %s", exc)
+            self._journal_external_fill_malformed_type(
+                observation,
+                exc,
+                handoff_sequence=handoff_sequence,
+                observer_epoch=observer_epoch,
+            )
+            return
+        if observation.source == "fill_event_unavailable":
+            self._journal_external_fill_event_unavailable(
+                observation,
+                unavailable_reason="trade_fill_event_missing",
+                handoff_sequence=handoff_sequence,
+                observer_epoch=observer_epoch,
+            )
+            return
+        try:
+            strategy_id, trade_id, is_stop_child = parse_client_tag(
+                observation.client_tag
+            )
+            if strategy_id is None or trade_id is None:
+                raise ValueError(
+                    f"external fill client_tag not K2Bi-shaped: "
+                    f"{observation.client_tag!r}"
+                )
+            payload = {
+                "ticker": observation.ticker,
+                "side": observation.side,
+                "qty": observation.qty,
+                "price": str(observation.price),
+                "filled_at": observation.filled_at.isoformat(),
+                "observed_at": observation.observed_at.isoformat(),
+                "broker_order_id": observation.broker_order_id,
+                "broker_perm_id": observation.broker_perm_id,
+                "exec_id": observation.exec_id,
+                "client_tag": observation.client_tag,
+                "source": observation.source,
+                "strategy_id": strategy_id,
+                "trade_id": trade_id,
+                "is_stop_child": is_stop_child,
+            }
+            if handoff_sequence is not None:
+                payload["handoff_sequence"] = handoff_sequence
+            if observer_epoch is not None:
+                payload["observer_epoch"] = observer_epoch
+            validate_external_fill_observed_payload(payload)
+        except Exception as exc:
+            LOG.warning("external_fill_observed payload malformed: %s", exc)
+            self._journal_external_fill_malformed(
+                observation,
+                exc,
+                handoff_sequence=handoff_sequence,
+                observer_epoch=observer_epoch,
+            )
+            return
+        try:
+            self.journal.append(
+                "external_fill_observed",
+                payload=payload,
+                strategy=strategy_id,
+                trade_id=trade_id,
+                ticker=observation.ticker,
+                side=observation.side,
+                qty=observation.qty,
+                broker_order_id=observation.broker_order_id,
+                broker_perm_id=observation.broker_perm_id,
+            )
+        except Exception as exc:
+            self._request_journal_durability_shutdown(
+                exc,
+                context="external_fill_observed",
+            )
+
+    def _journal_external_fill_event_unavailable(
+        self,
+        observation: BrokerFillObservation,
+        *,
+        unavailable_reason: str,
+        handoff_sequence: int | None = None,
+        observer_epoch: int | None = None,
+    ) -> None:
+        def _non_empty(value: object) -> str:
+            text = "" if value is None else str(value).strip()
+            return text or "<empty>"
+
+        def _iso(value: object) -> str:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return _non_empty(value)
+
+        payload = {
+            "ticker": _non_empty(observation.ticker),
+            "side": _non_empty(observation.side),
+            "broker_order_id": _non_empty(observation.broker_order_id),
+            "broker_perm_id": _non_empty(observation.broker_perm_id),
+            "client_tag": _non_empty(observation.client_tag),
+            "observed_at": _iso(observation.observed_at),
+            "unavailable_reason": _non_empty(unavailable_reason),
+            "source": _non_empty(observation.source),
+        }
+        if handoff_sequence is not None:
+            payload["handoff_sequence"] = handoff_sequence
+        if observer_epoch is not None:
+            payload["observer_epoch"] = observer_epoch
+        try:
+            validate_external_fill_event_unavailable_payload(payload)
+        except Exception as exc:
+            LOG.warning(
+                "external_fill_event_unavailable payload malformed: %s",
+                exc,
+            )
+            return
+        try:
+            self.journal.append(
+                "external_fill_event_unavailable",
+                payload=payload,
+                ticker=payload["ticker"],
+                side=payload["side"],
+                broker_order_id=payload["broker_order_id"],
+                broker_perm_id=payload["broker_perm_id"],
+            )
+        except Exception as journal_exc:
+            LOG.error(
+                "external_fill_event_unavailable raw observation after "
+                "journal failure: %r",
+                observation,
+            )
+            self._request_journal_durability_shutdown(
+                journal_exc,
+                context="external_fill_event_unavailable",
+            )
+
+    def _journal_external_fill_malformed(
+        self,
+        observation: BrokerFillObservation,
+        exc: Exception,
+        *,
+        handoff_sequence: int | None = None,
+        observer_epoch: int | None = None,
+    ) -> None:
+        def _non_empty(value: object) -> str:
+            text = "" if value is None else str(value).strip()
+            return text or "<empty>"
+
+        def _iso(value: object) -> str:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return _non_empty(value)
+
+        raw_qty = getattr(observation, "qty", 0)
+        payload = {
+            "ticker": _non_empty(getattr(observation, "ticker", "")),
+            "side": _non_empty(getattr(observation, "side", "")),
+            "qty": raw_qty if type(raw_qty) is int else 0,
+            "price": _non_empty(getattr(observation, "price", "0")),
+            "filled_at": _iso(getattr(observation, "filled_at", "")),
+            "observed_at": _iso(getattr(observation, "observed_at", "")),
+            "broker_order_id": _non_empty(
+                getattr(observation, "broker_order_id", "")
+            ),
+            "broker_perm_id": _non_empty(
+                getattr(observation, "broker_perm_id", "")
+            ),
+            "exec_id": _non_empty(getattr(observation, "exec_id", "")),
+            "client_tag": _non_empty(getattr(observation, "client_tag", "")),
+            "source": _non_empty(getattr(observation, "source", "")),
+            "exception_type": exc.__class__.__name__,
+            "exception_message": _non_empty(exc),
+        }
+        if handoff_sequence is not None:
+            payload["handoff_sequence"] = handoff_sequence
+        if observer_epoch is not None:
+            payload["observer_epoch"] = observer_epoch
+        try:
+            validate_external_fill_malformed_payload(payload)
+        except Exception as journal_exc:
+            LOG.warning(
+                "external_fill_malformed payload audit invalid: %s",
+                journal_exc,
+            )
+            return
+        try:
+            self.journal.append(
+                "external_fill_malformed",
+                payload=payload,
+                ticker=payload["ticker"],
+                broker_order_id=payload["broker_order_id"],
+                broker_perm_id=payload["broker_perm_id"],
+            )
+        except Exception as journal_exc:
+            LOG.error(
+                "external_fill_malformed raw observation after journal failure: %r",
+                observation,
+            )
+            self._request_journal_durability_shutdown(
+                journal_exc,
+                context="external_fill_malformed",
+            )
+
+    def _journal_external_fill_malformed_type(
+        self,
+        observation: object,
+        exc: Exception,
+        *,
+        handoff_sequence: int | None = None,
+        observer_epoch: int | None = None,
+    ) -> None:
+        payload = {
+            "observation_type": type(observation).__name__,
+            "expected_type": "BrokerFillObservation",
+            "exception_type": exc.__class__.__name__,
+            "exception_message": str(exc),
+        }
+        if handoff_sequence is not None:
+            payload["handoff_sequence"] = handoff_sequence
+        if observer_epoch is not None:
+            payload["observer_epoch"] = observer_epoch
+        try:
+            validate_external_fill_malformed_type_payload(payload)
+        except Exception as journal_exc:
+            LOG.warning(
+                "external_fill_malformed_type payload audit invalid: %s",
+                journal_exc,
+            )
+            return
+        try:
+            self.journal.append("external_fill_malformed_type", payload=payload)
+        except Exception as journal_exc:
+            LOG.error(
+                "external_fill_malformed_type raw observation after "
+                "journal failure: %r",
+                observation,
+            )
+            self._request_journal_durability_shutdown(
+                journal_exc,
+                context="external_fill_malformed_type",
+            )
+
+    def _journal_external_fill_handoff_dropped(self, payload: dict[str, Any]) -> None:
+        try:
+            validate_external_fill_handoff_dropped_payload(payload)
+        except Exception as exc:
+            LOG.warning("external_fill_handoff_dropped payload invalid: %s", exc)
+            return
+        try:
+            self.journal.append(
+                "external_fill_handoff_dropped",
+                payload=payload,
+            )
+        except Exception as journal_exc:
+            self._request_journal_durability_shutdown(
+                journal_exc,
+                context="external_fill_handoff_dropped",
+            )
+
     async def _refresh_positions_at_cycle_top(self, result: TickResult) -> bool:
         now = datetime.now(timezone.utc)
         cycle_id = new_ulid()
@@ -1937,11 +2600,10 @@ class Engine:
             )
             return False
 
-        self._positions_prev = list(self._positions)
-        self._positions = list(snapshot.positions)
-        self._positions_refreshed_at = fetched_at
-        self._position_source = snapshot.source
-        self._position_visibility_valid = True
+        await self._write_position_snapshot(
+            snapshot,
+            phase="cycle_top_refresh",
+        )
         return True
 
     @staticmethod
@@ -3024,7 +3686,7 @@ class Engine:
         self.state = EngineState.RECONCILING
         # Refresh positions from broker (broker is authoritative).
         try:
-            self._positions = _require_valid_position_snapshot(
+            await self._write_position_snapshot(
                 await self.connector.get_positions(),
                 phase="reconcile_fill",
             )
@@ -3241,7 +3903,7 @@ class Engine:
         CONNECTED_IDLE; the next tick's own broker read will catch up
         (engine is tick-driven, not event-driven for recovery)."""
         try:
-            self._positions = _require_valid_position_snapshot(
+            await self._write_position_snapshot(
                 await self.connector.get_positions(),
                 phase="refresh_positions_after_terminal",
             )
@@ -3416,6 +4078,9 @@ class Engine:
                 pass  # pragma: no cover
 
     async def _shutdown(self, *, reason: str = "graceful_shutdown") -> None:
+        self._begin_external_fill_handoff_draining()
+        self._drain_external_fill_handoff()
+        self._stop_external_fill_handoff()
         # Don't overwrite HALTED with SHUTDOWN -- the distinction
         # matters for invest-execute status reporting. HALTED means
         # engine refused to operate (needs investigation); SHUTDOWN
@@ -3731,6 +4396,12 @@ def _engine_config_from_dict(raw: dict[str, Any]) -> EngineConfig:
         # config cannot hang --once indefinitely.
         once_exit_wait_seconds=float(
             raw.get("once_exit_wait_seconds", 10.0)
+        ),
+        external_fill_handoff_limit=int(
+            raw.get(
+                "external_fill_handoff_limit",
+                DEFAULT_EXTERNAL_FILL_HANDOFF_LIMIT,
+            )
         ),
         # Codex round-13 P2: deployments that remap the regime file
         # now flow through to the engine instead of silently reverting

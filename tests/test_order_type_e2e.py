@@ -35,6 +35,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from execution.connectors.mock import MockIBKRConnector, SubmittedOrderRecord
+from execution.connectors.types import BrokerRejectionError
 from execution.engine.main import (
     DEFAULT_TICK_SECONDS,
     Engine,
@@ -160,6 +161,22 @@ class MockConnectorOrderTypeTests(unittest.IsolatedAsyncioTestCase):
                 client_tag="k2bi:test:abc",
                 order_type="LMT",
             )
+
+    async def test_unknown_order_type_rejects_with_live_connector_reason(self):
+        with self.assertRaises(BrokerRejectionError) as cm:
+            await self.connector.submit_order(
+                ticker="SPY",
+                side="buy",
+                qty=10,
+                limit_price=Decimal("500.00"),
+                stop_loss=None,
+                time_in_force="DAY",
+                client_tag="k2bi:test:abc",
+                order_type="STP",
+            )
+
+        self.assertEqual(cm.exception.broker_reason, "unknown_order_type")
+        self.assertEqual(self.connector.submitted_orders, [])
 
     async def test_lmt_with_decimal_limit_round_trips(self):
         ack = await self.connector.submit_order(

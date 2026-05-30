@@ -21,6 +21,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from execution.journal import schema as journal_schema
 from execution.journal.schema import EVENT_TYPES, SCHEMA_VERSION, JournalSchemaError, validate
 from execution.journal.ulid import new_ulid
 from execution.journal.writer import JournalWriter
@@ -65,6 +66,221 @@ class SchemaTests(unittest.TestCase):
     def test_event_type_enum_includes_architect_additions(self):
         self.assertIn("recovery_truncated", EVENT_TYPES)
         self.assertIn("kill_switch_cleared", EVENT_TYPES)
+
+    def test_external_fill_observed_event_type_and_payload_validator(self):
+        self.assertIn("external_fill_observed", EVENT_TYPES)
+        validator = getattr(journal_schema, "validate_external_fill_observed_payload")
+        validator(
+            {
+                "ticker": "G",
+                "side": "sell",
+                "qty": 71,
+                "price": "29.93",
+                "filled_at": "2026-05-13T14:26:23+00:00",
+                "observed_at": "2026-05-13T14:26:24+00:00",
+                "broker_order_id": "96",
+                "broker_perm_id": "1677427049",
+                "exec_id": "0001.abc",
+                "client_tag": "k2bi:g-2026-05_2nd-wave-paper-trade:T1:stop",
+                "source": "trade_fill_event",
+                "strategy_id": "g-2026-05_2nd-wave-paper-trade",
+                "trade_id": "T1",
+                "is_stop_child": True,
+                "handoff_sequence": 1,
+                "observer_epoch": 1,
+            }
+        )
+
+    def test_external_fill_observed_rejects_malformed_payload(self):
+        validator = getattr(journal_schema, "validate_external_fill_observed_payload")
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "ticker": "G",
+                    "side": "hold",
+                    "qty": 0,
+                    "price": "0",
+                    "filled_at": "2026-05-13T14:26:23",
+                    "observed_at": "2026-05-13T14:26:24+00:00",
+                    "broker_order_id": "",
+                    "broker_perm_id": "1677427049",
+                    "exec_id": "0001.abc",
+                    "client_tag": "not-k2bi",
+                    "source": "trade_fill_event",
+                    "strategy_id": "",
+                    "trade_id": "T1",
+                    "is_stop_child": False,
+                }
+            )
+
+    def test_external_fill_event_unavailable_event_type_and_payload_validator(self):
+        self.assertIn("external_fill_event_unavailable", EVENT_TYPES)
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_event_unavailable_payload",
+        )
+        validator(
+            {
+                "ticker": "G",
+                "side": "sell",
+                "broker_order_id": "95",
+                "broker_perm_id": "1677427048",
+                "client_tag": "k2bi:g-2026-05_2nd-wave-paper-trade:repair:stop",
+                "observed_at": "2026-05-28T14:30:00+00:00",
+                "unavailable_reason": "trade_fill_event_missing",
+                "source": "fill_event_unavailable",
+            }
+        )
+
+    def test_external_fill_event_unavailable_rejects_malformed_payload(self):
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_event_unavailable_payload",
+        )
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "ticker": "",
+                    "side": "",
+                    "broker_order_id": "",
+                    "broker_perm_id": "1677427048",
+                    "client_tag": "",
+                    "observed_at": "2026-05-28T14:30:00",
+                    "unavailable_reason": "",
+                    "source": "trade_fill_event",
+                }
+            )
+
+    def test_external_fill_malformed_event_type_and_payload_validator(self):
+        self.assertIn("external_fill_malformed", EVENT_TYPES)
+        validator = getattr(journal_schema, "validate_external_fill_malformed_payload")
+        validator(
+            {
+                "ticker": "G",
+                "side": "sell",
+                "qty": 0,
+                "price": "29.93",
+                "filled_at": "2026-05-13T14:26:23+00:00",
+                "observed_at": "2026-05-13T14:26:24+00:00",
+                "broker_order_id": "96",
+                "broker_perm_id": "1677427049",
+                "exec_id": "0001.abc",
+                "client_tag": "not-k2bi",
+                "source": "trade_fill_event",
+                "exception_type": "ValueError",
+                "exception_message": "external fill client_tag not K2Bi-shaped",
+                }
+            )
+
+    def test_external_fill_malformed_rejects_fill_event_unavailable_source(self):
+        validator = getattr(journal_schema, "validate_external_fill_malformed_payload")
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "ticker": "G",
+                    "side": "sell",
+                    "qty": 0,
+                    "price": "0",
+                    "filled_at": "2026-05-13T14:26:23+00:00",
+                    "observed_at": "2026-05-13T14:26:24+00:00",
+                    "broker_order_id": "96",
+                    "broker_perm_id": "1677427049",
+                    "exec_id": "fill_event_unavailable",
+                    "client_tag": "k2bi:g-2026-05_2nd-wave-paper-trade:T1:stop",
+                    "source": "fill_event_unavailable",
+                    "exception_type": "JournalSchemaError",
+                    "exception_message": "missing fillEvent",
+                }
+            )
+
+    def test_external_fill_malformed_rejects_malformed_payload(self):
+        validator = getattr(journal_schema, "validate_external_fill_malformed_payload")
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "ticker": "",
+                    "side": "hold",
+                    "qty": False,
+                    "price": "nan",
+                    "filled_at": "2026-05-13T14:26:23",
+                    "observed_at": "2026-05-13T14:26:24+00:00",
+                    "broker_order_id": "",
+                    "broker_perm_id": "1677427049",
+                    "exec_id": "0001.abc",
+                    "client_tag": "",
+                    "source": "unknown",
+                    "exception_type": "",
+                    "exception_message": "",
+                }
+            )
+
+    def test_external_fill_malformed_type_event_type_and_payload_validator(self):
+        self.assertIn("external_fill_malformed_type", EVENT_TYPES)
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_malformed_type_payload",
+        )
+        validator(
+            {
+                "observation_type": "dict",
+                "expected_type": "BrokerFillObservation",
+                "exception_type": "TypeError",
+                "exception_message": "expected BrokerFillObservation",
+            }
+        )
+
+    def test_external_fill_malformed_type_rejects_malformed_payload(self):
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_malformed_type_payload",
+        )
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "observation_type": "",
+                    "expected_type": "",
+                    "exception_type": "",
+                    "exception_message": "",
+                }
+            )
+
+    def test_external_fill_handoff_dropped_event_type_and_payload_validator(self):
+        self.assertIn("external_fill_handoff_dropped", EVENT_TYPES)
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_handoff_dropped_payload",
+        )
+        validator(
+            {
+                "observer_epoch": 1,
+                "dropped_count": 3,
+                "first_dropped_sequence": 9,
+                "last_dropped_sequence": 11,
+                "buffer_depth": 128,
+                "oldest_pending_age_seconds": 0.125,
+                "cumulative_dropped": 3,
+                "last_dropped_at": "2026-05-29T16:00:00+00:00",
+            }
+        )
+
+    def test_external_fill_handoff_dropped_rejects_malformed_payload(self):
+        validator = getattr(
+            journal_schema,
+            "validate_external_fill_handoff_dropped_payload",
+        )
+        with self.assertRaises(JournalSchemaError):
+            validator(
+                {
+                    "observer_epoch": 0,
+                    "dropped_count": 0,
+                    "first_dropped_sequence": 11,
+                    "last_dropped_sequence": 9,
+                    "buffer_depth": -1,
+                    "oldest_pending_age_seconds": -0.1,
+                    "cumulative_dropped": 0,
+                    "last_dropped_at": "2026-05-29T16:00:00",
+                }
+            )
 
 
 class WriterBasicsTests(unittest.TestCase):

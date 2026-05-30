@@ -11,6 +11,8 @@ inputs.
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -20,6 +22,7 @@ from .types import (
     AccountSummary,
     AuthRequiredError,
     BrokerExecution,
+    BrokerFillObservation,
     BrokerOpenOrder,
     BrokerOrderAck,
     BrokerOrderStatusEvent,
@@ -30,6 +33,9 @@ from .types import (
     POSITION_SOURCE_LIVE_REQ_POSITIONS,
     PositionSnapshot,
 )
+
+
+LOG = logging.getLogger("k2bi.connector.mock")
 
 
 @dataclass
@@ -115,6 +121,7 @@ class MockIBKRConnector:
     _next_order_id: int = 1000
     _next_perm_id: int = 2_000_000
     submit_hook: Callable[[SubmittedOrderRecord], BrokerOrderAck] | None = None
+    _external_fill_observer: Callable[[BrokerFillObservation], None] | None = None
 
     # ---------- connection ----------
 
@@ -142,6 +149,31 @@ class MockIBKRConnector:
             auth_required=self._auth_required,
             last_error=self._last_error,
         )
+
+    def set_external_fill_observer(
+        self,
+        callback: Callable[[BrokerFillObservation], None] | None,
+    ) -> None:
+        if callback is not None:
+            if not callable(callback):
+                raise TypeError("external fill observer must be callable")
+            if inspect.iscoroutinefunction(callback):
+                raise TypeError("external fill observer must be synchronous")
+            try:
+                inspect.signature(callback).bind(object())
+            except TypeError as exc:
+                raise TypeError(
+                    "external fill observer must accept one observation argument"
+                ) from exc
+        self._external_fill_observer = callback
+
+    def emit_external_fill_observed(self, observation: BrokerFillObservation) -> None:
+        if self._external_fill_observer is None:
+            return
+        try:
+            self._external_fill_observer(observation)
+        except Exception as exc:
+            LOG.warning("external fill observer raised: %s", exc)
 
     # ---------- reads ----------
 
@@ -200,7 +232,14 @@ class MockIBKRConnector:
         # Round-6 (2026-05-08): MKT requires limit_price=None or non-null
         # reference; LMT requires Decimal. Mirror the broker contract
         # so tests catch shape mismatches.
-        if order_type == "LMT" and limit_price is None:
+        order_type_norm = (order_type or "LMT").strip().upper()
+        if order_type_norm not in {"LMT", "MKT"}:
+            raise BrokerRejectionError(
+                f"MockIBKRConnector.submit_order: unknown order_type "
+                f"{order_type!r}; expected one of {{'LMT', 'MKT'}}",
+                broker_reason="unknown_order_type",
+            )
+        if order_type_norm == "LMT" and limit_price is None:
             raise ValueError(
                 "MockIBKRConnector.submit_order: LMT requires a Decimal "
                 "limit_price; got None"
@@ -230,7 +269,7 @@ class MockIBKRConnector:
             broker_perm_id=broker_perm_id,
             stop_broker_order_id=stop_broker_order_id,
             stop_broker_perm_id=stop_broker_perm_id,
-            order_type=order_type,
+            order_type=order_type_norm,
         )
         self.submitted_orders.append(record)
 

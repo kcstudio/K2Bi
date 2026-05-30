@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Protocol, runtime_checkable
+from typing import Callable, Literal, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,12 @@ class BrokerOrderAck:
     filled, leaving the position unprotected). Engine journals these
     and can escalate to KILLED if the situation demands human action.
     An empty tuple means the submit was fully clean.
+
+    `submitted_at` is the engine-local timestamp captured immediately
+    before the connector attempts `placeOrder`. It is not a broker fill
+    timestamp. Timeout and recovery accounting use it as "when K2Bi first
+    tried to hand this order to the broker", including the rare case where
+    a fill arrives before IBKR exposes orderId or permId.
     """
 
     broker_order_id: str
@@ -244,6 +250,28 @@ class BrokerExecution:
 
 
 @dataclass(frozen=True)
+class BrokerFillObservation:
+    """Best-effort live fill observation from a broker event callback.
+
+    This is observability-only. The engine still uses broker position
+    snapshots as authoritative state before changing strategy lifecycle
+    or submitting another order.
+    """
+
+    ticker: str
+    side: str
+    qty: int
+    price: Decimal
+    filled_at: datetime
+    observed_at: datetime
+    broker_order_id: str
+    broker_perm_id: str
+    exec_id: str
+    client_tag: str
+    source: Literal["trade_fill_event", "fill_event_unavailable"]
+
+
+@dataclass(frozen=True)
 class ConnectionStatus:
     """What the engine sees when it asks the connector 'are we up'."""
 
@@ -269,6 +297,10 @@ class IBKRConnectorProtocol(Protocol):
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
     def connection_status(self) -> ConnectionStatus: ...
+    def set_external_fill_observer(
+        self,
+        callback: Callable[[BrokerFillObservation], None] | None,
+    ) -> None: ...
 
     async def get_account_summary(self) -> AccountSummary: ...
     async def get_positions(self) -> PositionSnapshot: ...

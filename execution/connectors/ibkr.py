@@ -31,8 +31,12 @@ this in for Phase 3 paper trading is a construction-site change only.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -41,6 +45,7 @@ from .types import (
     AccountSummary,
     AuthRequiredError,
     BrokerExecution,
+    BrokerFillObservation,
     BrokerOpenOrder,
     BrokerOrderAck,
     BrokerOrderStatusEvent,
@@ -81,6 +86,14 @@ def _broker_id_str(value: Any) -> str:
 _AUTH_ERROR_CODES = {502, 1100, 2110}       # login / cold-connect / connectivity
 _DISCONNECT_ERROR_CODES = {504, 1102, 2103} # socket-level / market-data farm
 _ORDER_REJECT_CODES = {201, 202, 203, 399}  # broker order rejection
+_MAX_FILL_OBSERVATION_CACHE = 128
+
+
+@dataclass(frozen=True)
+class _FillObservationCacheEntry:
+    epoch: int
+    trade: Any
+    observation: BrokerFillObservation
 
 
 # Q34 (2026-04-21) bounded broker-API calls. Session F's run 3 hung
@@ -221,10 +234,19 @@ class IBKRConnector:
         self._connected = False
         self._auth_required = False
         self._last_error: str | None = None
+        self._external_fill_observer: Any = None
+        self._fill_observations_by_trade_id: OrderedDict[
+            tuple[int, int], _FillObservationCacheEntry
+        ] = OrderedDict()
+        self._fill_observation_cache_epoch = 0
+        # fillEvent callbacks are synchronous; this protects the tiny
+        # in-memory cache without awaiting inside the broker callback.
+        self._fill_observations_lock = threading.Lock()
 
     # ---------- connection lifecycle ----------
 
     async def connect(self) -> None:
+        self._clear_fill_observation_cache()
         try:
             import ib_async  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -267,6 +289,7 @@ class IBKRConnector:
         self._connected = True
         self._auth_required = False
         self._last_error = None
+        self._clear_fill_observation_cache()
 
     async def disconnect(self) -> None:
         if self._ib is not None and self._connected:
@@ -275,6 +298,7 @@ class IBKRConnector:
             except Exception as exc:  # pragma: no cover - shutdown path
                 LOG.warning("ib_async disconnect raised: %s", exc)
         self._connected = False
+        self._clear_fill_observation_cache()
 
     def connection_status(self) -> ConnectionStatus:
         return ConnectionStatus(
@@ -282,6 +306,28 @@ class IBKRConnector:
             auth_required=self._auth_required,
             last_error=self._last_error,
         )
+
+    def set_external_fill_observer(self, callback: Any) -> None:
+        if callback is not None:
+            if not callable(callback):
+                raise TypeError("external fill observer must be callable")
+            if inspect.iscoroutinefunction(callback):
+                raise TypeError("external fill observer must be synchronous")
+            try:
+                inspect.signature(callback).bind(object())
+            except TypeError as exc:
+                raise TypeError(
+                    "external fill observer must accept one observation argument"
+                ) from exc
+        self._external_fill_observer = callback
+
+    def _clear_fill_observation_cache(self) -> None:
+        with self._fill_observations_lock:
+            self._fill_observations_by_trade_id.clear()
+            self._fill_observation_cache_epoch += 1
+
+    def _fill_observation_cache_key(self, trade: Any) -> tuple[int, int]:
+        return (self._fill_observation_cache_epoch, id(trade))
 
     # ---------- reads ----------
 
@@ -818,6 +864,10 @@ class IBKRConnector:
 
         try:
             parent_trade = self._ib.placeOrder(contract, parent)
+            # ib_async only exposes the per-trade fillEvent after placeOrder()
+            # returns the Trade. Attach before the first await so event-loop
+            # delivered fills during orderId/permId waits are still observed.
+            self._attach_external_fill_observer(parent_trade)
             # Wait for orderId assignment so the stop-child can
             # reference parentId. permId is not required yet; we wait
             # again after both orders transmit. Codex round-5 P1:
@@ -849,6 +899,8 @@ class IBKRConnector:
                 if client_tag is not None:
                     child.orderRef = f"{client_tag}:stop"
                 child_trade = self._ib.placeOrder(contract, child)
+                # Same zero-await attach contract as the parent order.
+                self._attach_external_fill_observer(child_trade)
 
             # Wait for permId on parent now that both orders are live.
             for _ in range(50):
@@ -987,6 +1039,256 @@ class IBKRConnector:
             warnings=tuple(warnings),
         )
 
+    def _attach_external_fill_observer(self, trade: Any) -> None:
+        fill_event = getattr(trade, "fillEvent", None)
+        if fill_event is None:
+            LOG.warning("trade fillEvent unavailable; external-fill observation skipped")
+            self._emit_fill_event_unavailable_observation(trade)
+            return
+        try:
+            fill_event += self._on_trade_fill_event
+        except Exception as exc:  # pragma: no cover - broker edge
+            LOG.warning("trade fillEvent subscription failed: %s", exc)
+
+    def _emit_fill_event_unavailable_observation(self, trade: Any) -> None:
+        if self._external_fill_observer is None:
+            return
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        now = datetime.now(timezone.utc)
+        observation = BrokerFillObservation(
+            ticker=str(getattr(contract, "symbol", "") or ""),
+            side=_normalize_execution_side(str(getattr(order, "action", "") or "")),
+            qty=0,
+            price=Decimal("0"),
+            filled_at=now,
+            observed_at=now,
+            broker_order_id=_broker_id_str(getattr(order, "orderId", 0)),
+            broker_perm_id=_broker_id_str(getattr(order, "permId", 0)),
+            exec_id="fill_event_unavailable",
+            client_tag=str(getattr(order, "orderRef", "") or ""),
+            source="fill_event_unavailable",
+        )
+        try:
+            self._external_fill_observer(observation)
+        except Exception as exc:  # pragma: no cover - observer owns details
+            LOG.warning("external fill observer raised: %s", exc)
+
+    def _on_trade_fill_event(self, trade: Any, fill: Any) -> None:
+        if self._external_fill_observer is None:
+            return
+        with self._fill_observations_lock:
+            cache_epoch = self._fill_observation_cache_epoch
+        try:
+            observation = self._build_fill_observation(trade, fill)
+        except Exception as exc:
+            LOG.warning("external fill observation conversion failed: %s", exc)
+            observation = self._build_malformed_fill_observation(trade, fill)
+            try:
+                self._external_fill_observer(observation)
+            except Exception as observer_exc:  # pragma: no cover - observer owns details
+                LOG.warning("external fill observer raised: %s", observer_exc)
+            return
+        with self._fill_observations_lock:
+            if cache_epoch != self._fill_observation_cache_epoch:
+                LOG.warning(
+                    "discarding fill observation: cache epoch changed "
+                    "during callback"
+                )
+                return
+            cache_key = (cache_epoch, id(trade))
+            self._fill_observations_by_trade_id[cache_key] = _FillObservationCacheEntry(
+                epoch=cache_epoch,
+                trade=trade,
+                observation=observation,
+            )
+            while len(self._fill_observations_by_trade_id) > _MAX_FILL_OBSERVATION_CACHE:
+                self._fill_observations_by_trade_id.popitem(last=False)
+        # Observer may journal to disk. Keep it outside the cache lock so
+        # the broker callback thread only holds the lock for dict mutation.
+        try:
+            self._external_fill_observer(observation)
+        except Exception as exc:  # pragma: no cover - observer owns details
+            LOG.warning("external fill observer raised: %s", exc)
+
+    def _filled_ack_if_trade_filled(
+        self,
+        trade: Any,
+        *,
+        submitted_at: datetime,
+    ) -> BrokerOrderAck | None:
+        status = str(getattr(getattr(trade, "orderStatus", None), "status", ""))
+        if status != "Filled":
+            return None
+        with self._fill_observations_lock:
+            cache_key = self._fill_observation_cache_key(trade)
+            entry = self._fill_observations_by_trade_id.pop(cache_key, None)
+            if entry is None:
+                stale_keys = [
+                    key
+                    for key in self._fill_observations_by_trade_id
+                    if key[1] == id(trade)
+                ]
+                if stale_keys:
+                    entry = self._fill_observations_by_trade_id.pop(stale_keys[-1])
+        observation = self._validated_cached_fill_observation(trade, entry)
+        if observation is None:
+            if entry is None:
+                LOG.warning(
+                    "filled trade has no cached fill observation; no safe ack"
+                )
+            return None
+        if not observation.broker_order_id or not observation.broker_perm_id:
+            LOG.warning(
+                "cached fill observation lacks broker ids; no safe ack "
+                "order_id=%r perm_id=%r",
+                observation.broker_order_id,
+                observation.broker_perm_id,
+            )
+            return None
+        return BrokerOrderAck(
+            broker_order_id=observation.broker_order_id,
+            broker_perm_id=observation.broker_perm_id,
+            submitted_at=submitted_at,
+            status=status,
+        )
+
+    def _validated_cached_fill_observation(
+        self,
+        trade: Any,
+        entry: _FillObservationCacheEntry | None,
+    ) -> BrokerFillObservation | None:
+        if entry is None:
+            return None
+        if entry.epoch != self._fill_observation_cache_epoch:
+            LOG.warning(
+                "discarding cached fill observation: cache epoch mismatch "
+                "entry=%s current=%s",
+                entry.epoch,
+                self._fill_observation_cache_epoch,
+            )
+            return None
+        if entry.trade is not trade:
+            LOG.warning("discarding cached fill observation: trade object mismatch")
+            return None
+        observation = entry.observation
+        reason = self._fill_observation_mismatch_reason(trade, observation)
+        if reason is not None:
+            LOG.warning("discarding cached fill observation: %s", reason)
+            return None
+        return observation
+
+    def _fill_observation_mismatch_reason(
+        self,
+        trade: Any,
+        observation: BrokerFillObservation,
+    ) -> str | None:
+        current_tickers = _trade_tickers(trade)
+        observation_ticker = observation.ticker.upper()
+        if current_tickers and observation_ticker not in current_tickers:
+            return (
+                f"ticker mismatch observation={observation.ticker!r} "
+                f"current={sorted(current_tickers)!r}"
+            )
+
+        order_ids = _trade_broker_ids(trade, "orderId")
+        if order_ids and observation.broker_order_id not in order_ids:
+            return (
+                f"broker_order_id mismatch observation={observation.broker_order_id!r} "
+                f"current={sorted(order_ids)!r}"
+            )
+
+        perm_ids = _trade_broker_ids(trade, "permId")
+        if perm_ids and observation.broker_perm_id not in perm_ids:
+            return (
+                f"broker_perm_id mismatch observation={observation.broker_perm_id!r} "
+                f"current={sorted(perm_ids)!r}"
+            )
+
+        exec_ids = _trade_exec_ids(trade)
+        if exec_ids and observation.exec_id not in exec_ids:
+            return (
+                f"exec_id mismatch observation={observation.exec_id!r} "
+                f"current={sorted(exec_ids)!r}"
+            )
+        return None
+
+    def _build_fill_observation(self, trade: Any, fill: Any) -> BrokerFillObservation:
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            raise ValueError("fill has no execution")
+        contract = getattr(trade, "contract", None) or getattr(fill, "contract", None)
+        order = getattr(trade, "order", None)
+        ticker = str(getattr(contract, "symbol", "") or "")
+        side = _normalize_execution_side(str(getattr(execution, "side", "") or ""))
+        qty = int(Decimal(str(getattr(execution, "shares", 0))))
+        price = Decimal(str(getattr(execution, "price", "0")))
+        order_id = _broker_id_str(
+            getattr(execution, "orderId", None)
+            or getattr(order, "orderId", 0)
+        )
+        perm_id = _broker_id_str(
+            getattr(execution, "permId", None)
+            or getattr(order, "permId", 0)
+        )
+        return BrokerFillObservation(
+            ticker=ticker,
+            side=side,
+            qty=qty,
+            price=price,
+            filled_at=_parse_ib_time(getattr(execution, "time", None)),
+            observed_at=datetime.now(timezone.utc),
+            broker_order_id=order_id,
+            broker_perm_id=perm_id,
+            exec_id=str(getattr(execution, "execId", "") or ""),
+            client_tag=str(getattr(order, "orderRef", "") or ""),
+            source="trade_fill_event",
+        )
+
+    def _build_malformed_fill_observation(
+        self,
+        trade: Any,
+        fill: Any,
+    ) -> BrokerFillObservation:
+        execution = getattr(fill, "execution", None)
+        contract = getattr(trade, "contract", None) or getattr(fill, "contract", None)
+        order = getattr(trade, "order", None)
+        now = datetime.now(timezone.utc)
+        side = _normalize_execution_side(
+            str(
+                getattr(execution, "side", None)
+                or getattr(order, "action", "")
+                or ""
+            )
+        )
+        filled_at = now
+        if execution is not None:
+            try:
+                filled_at = _parse_ib_time(getattr(execution, "time", None))
+            except Exception:
+                filled_at = now
+        return BrokerFillObservation(
+            ticker=str(getattr(contract, "symbol", "") or ""),
+            side=side or "unknown",
+            qty=0,
+            price=Decimal("0"),
+            filled_at=filled_at,
+            observed_at=now,
+            broker_order_id=_broker_id_str(
+                getattr(execution, "orderId", None)
+                or getattr(order, "orderId", 0)
+            ),
+            broker_perm_id=_broker_id_str(
+                getattr(execution, "permId", None)
+                or getattr(order, "permId", 0)
+            ),
+            exec_id=str(
+                getattr(execution, "execId", "") or "fill_event_conversion_failed"
+            ),
+            client_tag=str(getattr(order, "orderRef", "") or ""),
+            source="trade_fill_event",
+        )
+
     async def submit_standalone_stop_order(
         self,
         *,
@@ -1022,12 +1324,23 @@ class IBKRConnector:
             stop.orderRef = client_tag
 
         try:
+            # Local placeOrder-call time. IBKR may fill before orderId/permId
+            # assignment, so the broker has no separate submit timestamp here.
+            submitted_at = datetime.now(timezone.utc)
             trade = self._ib.placeOrder(contract, stop)
+            # ib_async returns the Trade synchronously; attach before any await.
+            self._attach_external_fill_observer(trade)
             for _ in range(50):
                 if getattr(trade.order, "orderId", 0):
                     break
                 await asyncio.sleep(0.1)
             if not getattr(trade.order, "orderId", 0):
+                filled_ack = self._filled_ack_if_trade_filled(
+                    trade,
+                    submitted_at=submitted_at,
+                )
+                if filled_ack is not None:
+                    return filled_ack
                 try:
                     self._ib.cancelOrder(trade.order)
                 except Exception as cancel_exc:  # pragma: no cover
@@ -1038,6 +1351,12 @@ class IBKRConnector:
                 await self._await_parent_terminal(
                     trade, reason="standalone_stop_orderid_timeout"
                 )
+                filled_ack = self._filled_ack_if_trade_filled(
+                    trade,
+                    submitted_at=submitted_at,
+                )
+                if filled_ack is not None:
+                    return filled_ack
                 raise BrokerRejectionError(
                     "IB Gateway did not assign orderId within 5s of standalone stop",
                     broker_reason="standalone_stop_orderid_timeout",
@@ -1047,6 +1366,12 @@ class IBKRConnector:
                     break
                 await asyncio.sleep(0.1)
             if not getattr(trade.order, "permId", 0):
+                filled_ack = self._filled_ack_if_trade_filled(
+                    trade,
+                    submitted_at=submitted_at,
+                )
+                if filled_ack is not None:
+                    return filled_ack
                 try:
                     self._ib.cancelOrder(trade.order)
                 except Exception as cancel_exc:  # pragma: no cover
@@ -1057,6 +1382,12 @@ class IBKRConnector:
                 await self._await_parent_terminal(
                     trade, reason="standalone_stop_permid_timeout"
                 )
+                filled_ack = self._filled_ack_if_trade_filled(
+                    trade,
+                    submitted_at=submitted_at,
+                )
+                if filled_ack is not None:
+                    return filled_ack
                 raise BrokerRejectionError(
                     "IB Gateway did not assign permId within 5s of standalone stop",
                     broker_reason="standalone_stop_permid_timeout",
@@ -1069,7 +1400,7 @@ class IBKRConnector:
         return BrokerOrderAck(
             broker_order_id=str(trade.order.orderId),
             broker_perm_id=str(trade.order.permId),
-            submitted_at=datetime.now(timezone.utc),
+            submitted_at=submitted_at,
             status=status,
         )
 
@@ -1140,9 +1471,11 @@ class IBKRConnector:
         if code in _AUTH_ERROR_CODES:
             self._connected = False
             self._auth_required = True
+            self._clear_fill_observation_cache()
             raise AuthRequiredError(message) from exc
         if code in _DISCONNECT_ERROR_CODES:
             self._connected = False
+            self._clear_fill_observation_cache()
             raise DisconnectedError(message) from exc
         if code in _ORDER_REJECT_CODES:
             raise BrokerRejectionError(
@@ -1152,6 +1485,7 @@ class IBKRConnector:
         # Unknown code: treat as disconnect so the engine pauses + reconnects
         # instead of auto-retrying a busted session.
         self._connected = False
+        self._clear_fill_observation_cache()
         raise DisconnectedError(message) from exc
 
     def _require_connected(self) -> None:
@@ -1194,6 +1528,65 @@ def _extract_error_code(exc: Exception) -> int | None:
     return None
 
 
+def _iter_trade_execution_objects(trade: Any):
+    for attr_name in ("fills", "executions"):
+        rows = getattr(trade, attr_name, None)
+        if rows is None or isinstance(rows, (str, bytes)):
+            continue
+        try:
+            iterator = iter(rows)
+        except TypeError:
+            continue
+        for row in iterator:
+            execution = getattr(row, "execution", row)
+            if execution is not None:
+                yield execution
+
+
+def _trade_tickers(trade: Any) -> set[str]:
+    out: set[str] = set()
+    contract = getattr(trade, "contract", None)
+    symbol = str(getattr(contract, "symbol", "") or "").upper()
+    if symbol:
+        out.add(symbol)
+    for attr_name in ("fills", "executions"):
+        rows = getattr(trade, attr_name, None)
+        if rows is None or isinstance(rows, (str, bytes)):
+            continue
+        try:
+            iterator = iter(rows)
+        except TypeError:
+            continue
+        for row in iterator:
+            row_contract = getattr(row, "contract", None)
+            row_symbol = str(getattr(row_contract, "symbol", "") or "").upper()
+            if row_symbol:
+                out.add(row_symbol)
+    return out
+
+
+def _trade_broker_ids(trade: Any, field: str) -> set[str]:
+    out: set[str] = set()
+    order = getattr(trade, "order", None)
+    order_id = _broker_id_str(getattr(order, field, 0))
+    if order_id:
+        out.add(order_id)
+    for execution in _iter_trade_execution_objects(trade):
+        execution_id = _broker_id_str(getattr(execution, field, 0))
+        if execution_id:
+            out.add(execution_id)
+    return out
+
+
+def _trade_exec_ids(trade: Any) -> set[str]:
+    out: set[str] = set()
+    for execution in _iter_trade_execution_objects(trade):
+        exec_id = str(getattr(execution, "execId", "") or "")
+        if exec_id:
+            out.add(exec_id)
+    return out
+
+
 def _parse_ib_time(value: Any) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
@@ -1207,6 +1600,15 @@ def _parse_ib_time(value: Any) -> datetime:
         except ValueError:
             continue
     return datetime.now(timezone.utc)
+
+
+def _normalize_execution_side(value: str) -> str:
+    side = value.strip().upper()
+    if side in {"BOT", "BUY", "BOUGHT"}:
+        return "buy"
+    if side in {"SLD", "SELL", "SOLD"}:
+        return "sell"
+    return side.lower()
 
 
 def _last_log_time(trade: Any) -> datetime | None:
