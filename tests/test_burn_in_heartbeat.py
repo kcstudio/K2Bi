@@ -59,6 +59,41 @@ def _seed_journal(vault_root: Path, date_str: str, events: list[dict[str, Any]])
             f.write(json.dumps(event) + "\n")
 
 
+def _write_strategy_status(vault_root: Path, symbol: str, status: str) -> None:
+    strategy_dir = vault_root / "wiki" / "strategies"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    path = strategy_dir / f"strategy_{symbol.lower()}-test.md"
+    path.write_text(
+        "\n".join(
+            (
+                [
+                    "---",
+                    f"name: {symbol.lower()}-test",
+                    f"slug: {symbol.lower()}-test",
+                    f"ticker: {symbol}",
+                    f"status: {status}",
+                ]
+                + (
+                    [
+                        "stopped_out_at: '2026-05-13T14:26:23+00:00'",
+                        "stopped_out_fill_perm_id: 1677427049",
+                        "stopped_out_fill_price: '29.93'",
+                    ]
+                    if status == "stopped_out"
+                    else []
+                )
+                + [
+                    "---",
+                    "",
+                    "# Test Strategy",
+                ]
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 class FakeIB:
     def __init__(self, connect_exc: Exception | None = None) -> None:
         self.connect_exc = connect_exc
@@ -187,6 +222,149 @@ class BurnInHeartbeatTests(unittest.TestCase):
         self.assertIn("G: 71 @ avg $31.33, STP $30 Submitted", out)
         self.assertIn("SPY: 2 @ avg $707.72, STP $697.13 PreSubmitted", out)
         self.assertNotIn("Anomalies:", out)
+
+    def test_p4_4_bug_flat_stopped_out_renders_as_stop_missing(self) -> None:
+        """P4-4-BUG-FLAT-STOPPED-OUT-RENDERS-AS-STOP-MISSING."""
+        module = _load_module()
+
+        class FlatStoppedOutIB(FakeIB):
+            def positions(self) -> list[Any]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="SPY"),
+                        position=2,
+                        avgCost="707.72",
+                    )
+                ]
+
+            def reqAllOpenOrders(self) -> list[Any]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="SPY"),
+                        order=SimpleNamespace(
+                            action="SELL",
+                            orderType="STP",
+                            auxPrice="697.13",
+                            totalQuantity=2,
+                        ),
+                        orderStatus=SimpleNamespace(status="PreSubmitted"),
+                    )
+                ]
+
+        class HeldMissingStopIB(FakeIB):
+            def reqAllOpenOrders(self) -> list[Any]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="SPY"),
+                        order=SimpleNamespace(
+                            action="SELL",
+                            orderType="STP",
+                            auxPrice="697.13",
+                            totalQuantity=2,
+                        ),
+                        orderStatus=SimpleNamespace(status="PreSubmitted"),
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td)
+            _write_strategy_status(vault_root, "G", "stopped_out")
+            _seed_journal(
+                vault_root,
+                "2026-05-14",
+                [_event("cycle_evaluated_skip_position_held", "id1")],
+            )
+
+            code, flat_out = self._run(module, vault_root, FlatStoppedOutIB())
+
+        self.assertEqual(code, 0)
+        self.assertIn("G: intentionally flat (stopped out)", flat_out)
+        self.assertNotIn("G: ? @ avg $?", flat_out)
+        self.assertNotIn("G: ? @ avg $?, STP $?", flat_out)
+        self.assertNotIn("G: ? @ avg $?, STP $? STP missing", flat_out)
+
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td)
+            _write_strategy_status(vault_root, "G", "approved")
+            _seed_journal(
+                vault_root,
+                "2026-05-14",
+                [_event("cycle_evaluated_skip_position_held", "id1")],
+            )
+
+            code, held_out = self._run(module, vault_root, HeldMissingStopIB())
+
+        self.assertEqual(code, 0)
+        self.assertIn("G: 71 @ avg $31.33, STP $? STP missing", held_out)
+        self.assertNotIn("intentionally flat", held_out)
+
+    def test_malformed_stopped_out_quantity_stays_loud(self) -> None:
+        module = _load_module()
+
+        class MalformedQuantityIB(FakeIB):
+            def positions(self) -> list[Any]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="G"),
+                        position="N/A",
+                        avgCost="31.3340875",
+                    ),
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="SPY"),
+                        position=2,
+                        avgCost="707.72",
+                    ),
+                ]
+
+            def reqAllOpenOrders(self) -> list[Any]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(symbol="SPY"),
+                        order=SimpleNamespace(
+                            action="SELL",
+                            orderType="STP",
+                            auxPrice="697.13",
+                            totalQuantity=2,
+                        ),
+                        orderStatus=SimpleNamespace(status="PreSubmitted"),
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td)
+            _write_strategy_status(vault_root, "G", "stopped_out")
+            _seed_journal(
+                vault_root,
+                "2026-05-14",
+                [_event("cycle_evaluated_skip_position_held", "id1")],
+            )
+
+            code, out = self._run(module, vault_root, MalformedQuantityIB())
+
+        self.assertEqual(code, 0)
+        self.assertIn("G: ? @ avg $31.33, STP $? STP missing", out)
+        self.assertNotIn("G: intentionally flat (stopped out)", out)
+
+    def test_broker_unreachable_suppresses_stopped_out_calm_label(self) -> None:
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td)
+            _write_strategy_status(vault_root, "G", "stopped_out")
+            _seed_journal(
+                vault_root,
+                "2026-05-14",
+                [_event("cycle_evaluated_skip_position_held", "id1")],
+            )
+
+            code, out = self._run(
+                module,
+                vault_root,
+                FakeIB(connect_exc=ConnectorError("connection refused")),
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("G: ? @ avg $?, STP $? broker-unreachable", out)
+        self.assertNotIn("intentionally flat", out)
 
     def test_engine_bounced_counts_both_engine_started_events(self) -> None:
         module = _load_module()

@@ -24,6 +24,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover - PyYAML is a runtime dependency
+    yaml = None  # type: ignore[assignment]
+
 
 if __name__ == "__main__" and __package__ is None:
     _project_root = Path(__file__).resolve().parent.parent
@@ -44,6 +49,7 @@ except Exception:  # pragma: no cover - fail-open for message generation only
 DEFAULT_VAULT_ROOT = Path.home() / "Projects" / "K2Bi-Vault"
 JOURNAL_DIR = Path("raw") / "journal"
 BURN_IN_STATE_REL = Path("System") / "burn-in-start.json"
+STRATEGIES_REL = Path("wiki") / "strategies"
 ENGINE_SERVICE = "k2bi-engine.service"
 IB_HOST = "127.0.0.1"
 IB_PORT = 4002
@@ -243,6 +249,13 @@ def _format_stop(value: Any) -> str:
     rounded = decimal.quantize(Decimal("0.01"))
     text = format(rounded, "f")
     return text.rstrip("0").rstrip(".")
+
+
+def _is_flat_position(line: PositionLine) -> bool:
+    if line.qty is None:
+        return True
+    qty = _as_decimal(line.qty)
+    return qty == 0
 
 
 def _position_rows(ib: Any) -> dict[str, tuple[Any, Any]]:
@@ -594,7 +607,56 @@ def burn_in_line(vault_root: Path, now: datetime) -> str:
     return f"Burn-in: day {day} of 5"
 
 
-def _format_position(line: PositionLine) -> str:
+def _frontmatter_for(path: Path) -> dict[str, Any]:
+    if yaml is None:
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    if not lines or lines[0].strip() != "---":
+        return {}
+    frontmatter: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        frontmatter.append(line)
+    else:
+        return {}
+    try:
+        parsed = yaml.safe_load("\n".join(frontmatter)) or {}
+    except Exception:  # noqa: BLE001 - display context must fail loud, not crash
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _stopped_out_symbols(vault_root: Path) -> set[str]:
+    """Return ticker symbols whose existing strategy lifecycle is stopped_out."""
+    strategy_dir = vault_root / STRATEGIES_REL
+    if not strategy_dir.exists():
+        return set()
+    symbols: set[str] = set()
+    try:
+        paths = sorted(strategy_dir.glob("*.md"))
+    except OSError:
+        return set()
+    for path in paths:
+        frontmatter = _frontmatter_for(path)
+        if str(frontmatter.get("status", "")).strip() != "stopped_out":
+            continue
+        symbol = str(
+            frontmatter.get("ticker") or frontmatter.get("symbol") or ""
+        ).strip().upper()
+        if symbol in {"G", "SPY"}:
+            symbols.add(symbol)
+    return symbols
+
+
+def _format_position(line: PositionLine, lifecycle_stopped_out: set[str]) -> str:
+    if line.symbol in lifecycle_stopped_out and _is_flat_position(line):
+        return f"  {line.symbol}: intentionally flat (stopped out)"
     return (
         f"  {line.symbol}: {_format_qty(line.qty)} @ avg ${_format_avg(line.avg_cost)}, "
         f"STP ${_format_stop(line.stop_price)} {line.stop_status}"
@@ -627,13 +689,19 @@ def build_message(
         )
 
     day_str = now.astimezone(HKT).date().isoformat()
+    lifecycle_stopped_out = (
+        _stopped_out_symbols(vault_root) if broker.error is None else set()
+    )
     lines = [
         f"🤖 K2Bi heartbeat {day_str}",
         "",
         f"Engine: {engine_state.status} {engine_state.uptime}",
         "Positions:",
     ]
-    lines.extend(_format_position(position) for position in broker.positions)
+    lines.extend(
+        _format_position(position, lifecycle_stopped_out)
+        for position in broker.positions
+    )
     lines.extend(
         [
             "",
