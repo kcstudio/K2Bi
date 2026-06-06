@@ -48,6 +48,7 @@ logs/
 # Codex/agent runtime artifacts (local-only state, never committed)
 .agents/
 .codex/
+.k2bi-orchestrator/
 
 # MiniMax review archive (local-only -- raw responses, prompts, usage log)
 .minimax-reviews/
