@@ -39,6 +39,7 @@ _REVIEW_VERDICT_RE = re.compile(
     r"^#\s+.+\breview\s+--\s+(APPROVE|NEEDS-ATTENTION)\s*$"
 )
 _SHIP_LEASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,127}$")
+_SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
 _ALLOWED_GIT_SUBCOMMANDS = frozenset(
     {"add", "commit", "restore", "status", "diff", "reset"}
 )
@@ -47,6 +48,7 @@ GIT_TIMEOUT_S = 30
 REPO_ROOT_TIMEOUT_S = 5
 REVIEW_TIMEOUT_S = 420
 MAX_REVIEW_FOCUS_LEN = 2_000
+CANONICAL_CONFIG_REL = "execution/validators/config.yaml"
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,8 @@ class RollbackResult:
     working_tree_restored: bool
     marker_cleared: bool
     events: tuple[dict[str, Any], ...]
+    restored_paths: tuple[str, ...] = ()
+    adapter_kind: str = "strategy"
 
 
 class OrchestratorGateError(ValueError):
@@ -141,6 +145,16 @@ class FullShipApproval:
 
 
 @dataclass(frozen=True)
+class LimitsApproval:
+    """Human final approval captured by the orchestrator limits gate."""
+
+    final_approval_token: str
+    approved_by: str
+    approved_at: str
+    apply_lease_id: str
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     kind: str
     path: Path
@@ -174,8 +188,19 @@ class FullShipResult:
     events: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class LimitsApplyResult:
+    slug: str
+    commit_message: str
+    commit_hints: iss.LimitsCommitHints
+    plan_review: ReviewGateResult
+    diff_review: ReviewGateResult
+    events: list[dict[str, Any]]
+
+
 GenerateThesisFunc = Callable[..., it.ThesisResult]
 ApproveStrategyFunc = Callable[..., iss.StrategyCommitHints]
+ApproveLimitsFunc = Callable[..., iss.LimitsCommitHints]
 ReviewRunner = Callable[[ReviewRequest], ReviewGateResult]
 GitRunner = Callable[[list[str], Path], CommandResult]
 
@@ -448,6 +473,794 @@ def run_full_ship(
         )
 
 
+def apply_approved_limits(
+    proposal_path: Path,
+    *,
+    approval: LimitsApproval,
+    review_runner: ReviewRunner | None = None,
+    approve_handler: ApproveLimitsFunc = iss.handle_approve_limits,
+    git_runner: GitRunner | None = None,
+    config_path: Path | None = None,
+    now_utc: _dt.datetime | None = None,
+    required_primary: str = "minimax",
+) -> LimitsApplyResult:
+    """Apply an operator-approved limits proposal through the ship helper."""
+
+    review_runner = review_runner or run_review_with_script
+    git_runner = git_runner or run_git_command
+    repo_root = _repo_root_for(proposal_path)
+    proposal_path = proposal_path if proposal_path.is_absolute() else repo_root / proposal_path
+    proposal_rel = _repo_relative(proposal_path, repo_root)
+    resolved_config = config_path or (repo_root / CANONICAL_CONFIG_REL)
+    config_rel = _assert_config_path_canonical(resolved_config, repo_root)
+    config_path = repo_root / config_rel
+    slug = _limits_slug_from_proposal_path(proposal_path)
+    allowed_paths = {proposal_rel, config_rel}
+    events: list[dict[str, Any]] = []
+
+    with _limits_apply_lock(slug, repo_root):
+        marker_path = _limits_rollback_marker_path_for(slug, repo_root)
+        _refuse_if_incomplete_rollback_marker(
+            marker_path,
+            repo_root,
+            default_adapter_kind="limits",
+            default_path_label=proposal_rel,
+        )
+        _assert_single_link_regular_file(proposal_path, "limits proposal")
+        _assert_single_link_regular_file(config_path, "config file")
+        original_proposal = proposal_path.read_bytes()
+        original_config = config_path.read_bytes()
+        original_shas = {
+            proposal_rel: _sha256_bytes(original_proposal),
+            config_rel: _sha256_bytes(original_config),
+        }
+        approved_at = _validate_limits_approval(
+            approval,
+            slug,
+            original_shas[proposal_rel],
+            original_shas[config_rel],
+            now_utc=now_utc,
+        )
+        before_excerpt, after_excerpt = _limits_patch_blocks_for_expected_apply(
+            proposal_path
+        )
+        expected_config_after = _expected_config_after_apply(
+            original_config,
+            before_excerpt,
+            after_excerpt,
+        )
+        _assert_ship_clean_preflight(git_runner, repo_root, allowed_paths)
+        _assert_no_staged_target_changes(git_runner, repo_root, allowed_paths)
+        _assert_no_unstaged_target_changes(git_runner, repo_root, allowed_paths)
+        events.append(
+            {
+                "event": "limits_apply_start",
+                "slug": slug,
+                "proposal_path": proposal_rel,
+                "config_path": config_rel,
+                "proposal_sha256": original_shas[proposal_rel],
+                "config_sha256": original_shas[config_rel],
+                "approved_at": approval.approved_at,
+                "apply_lease_id": approval.apply_lease_id,
+            }
+        )
+
+        staged = False
+        mutation_started = False
+        plan_review = _run_scoped_review(
+            review_runner,
+            _make_limits_plan_review_request(
+                proposal_path,
+                proposal_rel=proposal_rel,
+                required_primary=required_primary,
+            ),
+            expected_kind="plan",
+            expected_files=[proposal_rel],
+        )
+        events.append(_review_event("plan_review_completed", plan_review))
+        _require_review_approved(plan_review, "plan review", required_primary)
+
+        originals = {
+            proposal_rel: (proposal_path, original_proposal, original_shas[proposal_rel]),
+            config_rel: (config_path, original_config, original_shas[config_rel]),
+        }
+
+        try:
+            mutation_started = True
+            try:
+                hints = approve_handler(
+                    proposal_path,
+                    config_path=config_path,
+                    parent_sha=None,
+                    now=approved_at,
+                )
+            except iss.ValidationError as exc:
+                raise OrchestratorGateError(str(exc)) from exc
+            if not isinstance(hints, iss.LimitsCommitHints):
+                raise OrchestratorGateError(
+                    "approve_handler must return scripts.lib.invest_ship_strategy.LimitsCommitHints"
+                )
+            events.append(
+                {
+                    "event": "approve_limits_handler_completed",
+                    "slug": hints.slug,
+                    "transition": hints.transition,
+                    "rule": hints.rule,
+                    "change_type": hints.change_type,
+                }
+            )
+            expected_proposal_after = _expected_limits_proposal_after_apply(
+                original_proposal,
+                hints,
+            )
+            if proposal_path.read_bytes() != expected_proposal_after:
+                raise OrchestratorGateError(
+                    "proposal bytes after handle_approve_limits did not match the approved frontmatter rewrite"
+                )
+            if config_path.read_bytes() != expected_config_after:
+                raise OrchestratorGateError(
+                    "config bytes after handle_approve_limits did not match the approved before-block replacement"
+                )
+
+            diff_review = _run_scoped_review(
+                review_runner,
+                _make_limits_diff_review_request(
+                    proposal_path,
+                    proposal_rel=proposal_rel,
+                    config_rel=config_rel,
+                    required_primary=required_primary,
+                ),
+                expected_kind="diff",
+                expected_files=[proposal_rel, config_rel],
+            )
+            events.append(_review_event("diff_review_completed", diff_review))
+            _require_review_approved(diff_review, "diff review", required_primary)
+
+            commit_message = _build_limits_commit_message(
+                hints,
+                approval=approval,
+                plan_review=plan_review,
+                diff_review=diff_review,
+            )
+            _run_git_checked(
+                git_runner,
+                ["git", "add", proposal_rel, config_rel],
+                repo_root,
+            )
+            staged = True
+            events.append(
+                {
+                    "event": "git_add_succeeded",
+                    "paths": [proposal_rel, config_rel],
+                }
+            )
+            _assert_cached_diff_exactly(git_runner, repo_root, allowed_paths)
+            events.append(
+                {
+                    "event": "cached_diff_verified",
+                    "paths": sorted(allowed_paths),
+                }
+            )
+            _run_git_checked(
+                git_runner,
+                [
+                    "git",
+                    "commit",
+                    "--only",
+                    proposal_rel,
+                    config_rel,
+                    "-m",
+                    commit_message,
+                ],
+                repo_root,
+            )
+            events.append(
+                {
+                    "event": "commit_succeeded",
+                    "paths": [proposal_rel, config_rel],
+                }
+            )
+        except Exception as exc:
+            if not mutation_started and not staged:
+                raise
+            rollback_result = _rollback_files_failure(
+                git_runner=git_runner,
+                repo_root=repo_root,
+                marker_path=marker_path,
+                originals=originals,
+                prior_exc=exc,
+                staged=staged,
+                events=events,
+                adapter_kind="limits",
+            )
+            if isinstance(exc, OrchestratorGateError):
+                exc.rollback_result = rollback_result
+            raise
+
+        return LimitsApplyResult(
+            slug=slug,
+            commit_message=commit_message,
+            commit_hints=hints,
+            plan_review=plan_review,
+            diff_review=diff_review,
+            events=events,
+        )
+
+
+def _validate_limits_approval(
+    approval: LimitsApproval,
+    slug: str,
+    proposal_sha256: str,
+    config_sha256: str,
+    *,
+    now_utc: _dt.datetime | None = None,
+    max_clock_skew_s: int = 300,
+) -> _dt.datetime:
+    _validate_slug(slug)
+    _validate_sha256_hex("proposal_sha256", proposal_sha256)
+    _validate_sha256_hex("config_sha256", config_sha256)
+    _require_text("approved_at", approval.approved_at)
+    approved_at = _parse_utc_datetime("approved_at", approval.approved_at)
+    _require_recent_utc_timestamp(
+        "approved_at",
+        approved_at,
+        now_utc=now_utc,
+        max_clock_skew_s=max_clock_skew_s,
+    )
+    _validate_ship_lease_id(approval.apply_lease_id)
+    _require_text("approved_by", approval.approved_by)
+    _require_text("final approval token", approval.final_approval_token)
+    expected = (
+        f"APPROVE_LIMITS:{slug}:{proposal_sha256}:{config_sha256}:"
+        f"{approval.approved_at}:{approval.apply_lease_id}"
+    )
+    if approval.final_approval_token != expected:
+        if f":{proposal_sha256}:" not in approval.final_approval_token:
+            detail = "proposal hash"
+        elif f":{config_sha256}:" not in approval.final_approval_token:
+            detail = "config hash"
+        else:
+            detail = "slug, approved_at, or apply_lease_id"
+        raise OrchestratorGateError(
+            "final approval token must bind "
+            f"{detail} as {expected!r}; got {approval.final_approval_token!r}"
+        )
+    return approved_at
+
+
+def _validate_sha256_hex(label: str, value: str) -> None:
+    if not isinstance(value, str) or not _SHA256_HEX_RE.match(value):
+        raise OrchestratorGateError(
+            f"{label} must be 64 lowercase hex chars, got {value!r}"
+        )
+
+
+def _parse_utc_datetime(label: str, value: str) -> _dt.datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise OrchestratorGateError(f"{label} must be a non-empty string")
+    if any(ch in value for ch in "\r\n\x00"):
+        raise OrchestratorGateError(f"{label} contains unsafe control characters")
+    if any(ord(ch) < 32 for ch in value):
+        raise OrchestratorGateError(f"{label} contains unsafe control characters")
+    try:
+        parsed = _dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise OrchestratorGateError(
+            f"{label} must be ISO-8601 datetime, got {value!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise OrchestratorGateError(f"{label} must include an explicit timezone offset")
+    if parsed.utcoffset() != _dt.timedelta(0):
+        raise OrchestratorGateError(f"{label} must be UTC")
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def _require_recent_utc_timestamp(
+    label: str,
+    value: _dt.datetime,
+    *,
+    now_utc: _dt.datetime | None,
+    max_clock_skew_s: int,
+) -> None:
+    if max_clock_skew_s < 0:
+        raise OrchestratorGateError("max_clock_skew_s must be non-negative")
+    now = now_utc or _dt.datetime.now(_dt.timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise OrchestratorGateError("now_utc must include an explicit timezone offset")
+    now = now.astimezone(_dt.timezone.utc)
+    skew = abs((value - now).total_seconds())
+    if skew > max_clock_skew_s:
+        raise OrchestratorGateError(
+            f"{label} is outside allowed UTC clock skew of {max_clock_skew_s}s"
+        )
+
+
+def _limits_slug_from_proposal_path(path: Path) -> str:
+    try:
+        slug = iss._derive_limits_slug(path)
+    except iss.ValidationError as exc:
+        raise OrchestratorGateError(str(exc)) from exc
+    _validate_slug(slug)
+    return slug
+
+
+def _limits_patch_blocks_for_expected_apply(path: Path) -> tuple[bytes, bytes]:
+    try:
+        _, _, body = iss._parse_limits(path)
+        before_text, after_text = iss._extract_yaml_patch(body, path)
+    except iss.ValidationError as exc:
+        raise OrchestratorGateError(str(exc)) from exc
+    return before_text.encode("utf-8"), after_text.encode("utf-8")
+
+
+def _expected_config_after_apply(
+    original_config: bytes,
+    before_excerpt: bytes,
+    after_excerpt: bytes,
+) -> bytes:
+    count = original_config.count(before_excerpt)
+    if count != 1:
+        raise OrchestratorGateError(
+            f"approved config before-block must occur exactly once, got {count}"
+        )
+    return original_config.replace(before_excerpt, after_excerpt, 1)
+
+
+def _expected_limits_proposal_after_apply(
+    original_proposal: bytes,
+    hints: iss.LimitsCommitHints,
+) -> bytes:
+    try:
+        return iss._edit_frontmatter(
+            original_proposal,
+            new_status="approved",
+            added_fields=[
+                ("approved_at", hints.approved_at),
+                ("approved_commit_sha", hints.parent_commit_sha),
+            ],
+        )
+    except ValueError as exc:
+        raise OrchestratorGateError(
+            "could not derive expected approved limits proposal bytes"
+        ) from exc
+
+
+def _make_limits_plan_review_request(
+    proposal_path: Path,
+    *,
+    proposal_rel: str,
+    required_primary: str,
+) -> ReviewRequest:
+    return ReviewRequest(
+        kind="plan",
+        path=proposal_path,
+        files=[proposal_rel],
+        focus=(
+            "Review this operator-approved limits proposal for safety impact, "
+            "stale patch risk, validator weakening, and config gate bypass."
+        ),
+        required_primary=required_primary,
+    )
+
+
+def _make_limits_diff_review_request(
+    proposal_path: Path,
+    *,
+    proposal_rel: str,
+    config_rel: str,
+    required_primary: str,
+) -> ReviewRequest:
+    return ReviewRequest(
+        kind="diff",
+        path=proposal_path,
+        files=[proposal_rel, config_rel],
+        focus=(
+            "Review the approved limits diff for token binding, config_sha "
+            "binding, rollback correctness, staging boundaries, and any "
+            "weakening of handle_approve_limits or validators."
+        ),
+        required_primary=required_primary,
+    )
+
+
+def _run_scoped_review(
+    review_runner: ReviewRunner,
+    request: ReviewRequest,
+    *,
+    expected_kind: str,
+    expected_files: list[str],
+) -> ReviewGateResult:
+    _assert_review_request_scope(
+        request,
+        expected_kind=expected_kind,
+        expected_files=expected_files,
+    )
+    result = review_runner(request)
+    if not isinstance(result, ReviewGateResult):
+        raise OrchestratorGateError(
+            f"{expected_kind} review runner must return ReviewGateResult"
+        )
+    return result
+
+
+def _assert_review_request_scope(
+    request: ReviewRequest,
+    *,
+    expected_kind: str,
+    expected_files: list[str],
+) -> None:
+    if request.kind != expected_kind or request.files != expected_files:
+        raise OrchestratorGateError(
+            f"{expected_kind} review scope drift: files={request.files!r}"
+        )
+
+
+def _assert_cached_diff_exactly(
+    git_runner: GitRunner,
+    repo_root: Path,
+    expected_paths: set[str],
+) -> None:
+    result = git_runner(["git", "diff", "--cached", "--name-only"], repo_root)
+    if not isinstance(result, CommandResult):
+        raise OrchestratorGateError(
+            "git runner must return CommandResult for cached diff verification"
+        )
+    if result.returncode != 0:
+        raise OrchestratorGateError(
+            "git diff --cached --name-only failed with exit "
+            f"{result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    cached = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    if cached != expected_paths:
+        raise OrchestratorGateError(
+            f"cached diff must contain exactly {sorted(expected_paths)}, got {sorted(cached)}"
+        )
+
+
+def _assert_no_staged_target_changes(
+    git_runner: GitRunner,
+    repo_root: Path,
+    rel_paths: set[str],
+) -> None:
+    result = git_runner(
+        ["git", "diff", "--cached", "--quiet", "--", *sorted(rel_paths)],
+        repo_root,
+    )
+    if not isinstance(result, CommandResult):
+        raise OrchestratorGateError(
+            "git runner must return CommandResult for staged target preflight"
+        )
+    if result.returncode == 0:
+        return
+    if result.returncode == 1:
+        raise OrchestratorGateError(
+            "staged changes exist for limits apply target paths; unstage before "
+            f"running apply_approved_limits: {sorted(rel_paths)}"
+        )
+    raise OrchestratorGateError(
+        "git diff --cached --quiet target preflight failed with exit "
+        f"{result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+    )
+
+
+def _assert_no_unstaged_target_changes(
+    git_runner: GitRunner,
+    repo_root: Path,
+    rel_paths: set[str],
+) -> None:
+    result = git_runner(
+        ["git", "diff", "--quiet", "--", *sorted(rel_paths)],
+        repo_root,
+    )
+    if not isinstance(result, CommandResult):
+        raise OrchestratorGateError(
+            "git runner must return CommandResult for unstaged target preflight"
+        )
+    if result.returncode == 0:
+        return
+    if result.returncode == 1:
+        raise OrchestratorGateError(
+            "unstaged working-tree changes exist for limits apply target paths; "
+            "restore them before running apply_approved_limits: "
+            f"{sorted(rel_paths)}"
+        )
+    raise OrchestratorGateError(
+        "git diff --quiet target preflight failed with exit "
+        f"{result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+    )
+
+
+def _assert_config_path_canonical(config_path: Path, repo_root: Path) -> str:
+    raw_path = config_path if config_path.is_absolute() else repo_root / config_path
+    if any(part == ".." for part in raw_path.parts):
+        raise OrchestratorGateError(
+            f"config_path must be {CANONICAL_CONFIG_REL}, got {config_path!s}"
+        )
+    try:
+        rel_path = raw_path.relative_to(repo_root)
+    except ValueError:
+        try:
+            rel_path = raw_path.resolve(strict=False).relative_to(
+                repo_root.resolve(strict=False)
+            )
+        except ValueError as exc:
+            raise OrchestratorGateError(
+                f"config_path must be {CANONICAL_CONFIG_REL}, got {config_path!s}"
+            ) from exc
+    rel = rel_path.as_posix()
+    if rel != CANONICAL_CONFIG_REL:
+        raise OrchestratorGateError(
+            f"config_path must be {CANONICAL_CONFIG_REL}, got {rel}"
+        )
+    return rel
+
+
+def _build_limits_commit_message(
+    hints: iss.LimitsCommitHints,
+    *,
+    approval: LimitsApproval,
+    plan_review: ReviewGateResult,
+    diff_review: ReviewGateResult,
+) -> str:
+    lines = [
+        hints.commit_subject,
+        "",
+        f"Approved-By: {_safe_commit_field('approved_by', approval.approved_by)}",
+        f"Approval-Captured-At: {_safe_commit_field('approved_at', approval.approved_at)}",
+        f"Plan-Review-Log: {_safe_commit_field('plan_review.log_path', plan_review.log_path)}",
+        f"Diff-Review-Log: {_safe_commit_field('diff_review.log_path', diff_review.log_path)}",
+        "",
+    ]
+    lines.extend(_safe_trailer_line(line) for line in hints.trailers)
+    return "\n".join(lines)
+
+
+@contextmanager
+def _limits_apply_lock(slug: str, repo_root: Path) -> Iterator[None]:
+    _validate_slug(slug)
+    lock_dir = _orchestrator_state_path(repo_root, "locks")
+    lock_path = _contained_child_path(
+        lock_dir / f"limits_{slug}.lock",
+        lock_dir,
+        "limits lock path",
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise OrchestratorGateError(
+                f"limits proposal {slug!r} is already locked for apply"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _limits_rollback_marker_path_for(slug: str, repo_root: Path) -> Path:
+    _validate_slug(slug)
+    marker_dir = _orchestrator_state_path(repo_root, "rollback")
+    return _contained_child_path(
+        marker_dir / f"limits_{slug}.json",
+        marker_dir,
+        "limits rollback marker",
+    )
+
+
+def _rollback_files_failure(
+    *,
+    git_runner: GitRunner,
+    repo_root: Path,
+    marker_path: Path,
+    originals: dict[str, tuple[Path, bytes, str]],
+    prior_exc: Exception,
+    staged: bool,
+    events: list[dict[str, Any]],
+    adapter_kind: str,
+) -> RollbackResult:
+    paths = tuple(originals.keys())
+    sha_map = {rel_path: original_sha for rel_path, (_, _, original_sha) in originals.items()}
+    _write_rollback_marker_v2(
+        marker_path,
+        adapter_kind=adapter_kind,
+        paths=sha_map,
+        phase="started",
+    )
+    unstage_exc: Exception | None = None
+    restore_exc: Exception | None = None
+    index_exc: Exception | None = None
+    index_restored = not staged
+    working_tree_restored = False
+    marker_cleared = False
+
+    if staged:
+        _write_rollback_marker_v2(
+            marker_path,
+            adapter_kind=adapter_kind,
+            paths=sha_map,
+            phase="index_cleanup",
+        )
+        try:
+            _run_git_checked(
+                git_runner,
+                ["git", "restore", "--staged", *paths],
+                repo_root,
+            )
+            events.append({"event": "git_restore_staged_succeeded", "paths": list(paths)})
+            index_restored = True
+        except Exception as caught:
+            unstage_exc = caught
+            events.append(
+                {
+                    "event": "git_restore_staged_failed",
+                    "paths": list(paths),
+                    "error": str(caught),
+                }
+            )
+            try:
+                _run_git_checked(
+                    git_runner,
+                    ["git", "reset", "HEAD", "--", *paths],
+                    repo_root,
+                )
+                events.append({"event": "git_reset_head_succeeded", "paths": list(paths)})
+                index_restored = True
+            except Exception as reset_caught:
+                index_exc = reset_caught
+                events.append(
+                    {
+                        "event": "git_reset_head_failed",
+                        "paths": list(paths),
+                        "error": str(reset_caught),
+                    }
+                )
+            if index_exc is None:
+                try:
+                    for rel_path in paths:
+                        if not _is_index_clean(git_runner, repo_root, rel_path):
+                            index_exc = OrchestratorGateError(
+                                f"index still contains staged content for {rel_path}"
+                            )
+                            break
+                except Exception as diff_caught:
+                    index_exc = diff_caught
+                if index_exc is not None:
+                    events.append(
+                        {
+                            "event": "index_clean_check_failed",
+                            "paths": list(paths),
+                            "error": str(index_exc),
+                        }
+                    )
+                    index_restored = False
+
+    try:
+        _write_rollback_marker_v2(
+            marker_path,
+            adapter_kind=adapter_kind,
+            paths=sha_map,
+            phase="working_tree_restore",
+        )
+        for rel_path, (path, original, original_sha) in originals.items():
+            _restore_original_or_raise(path, original, original_sha, prior_exc)
+            events.append({"event": "working_tree_restore_succeeded", "path": rel_path})
+        working_tree_restored = True
+    except Exception as caught:
+        restore_exc = caught
+        events.append(
+            {
+                "event": "working_tree_restore_failed",
+                "paths": list(paths),
+                "error": str(caught),
+            }
+        )
+
+    rollback_result = _files_rollback_result(
+        paths=paths,
+        sha_map=sha_map,
+        marker_path=marker_path,
+        index_restored=index_restored,
+        working_tree_restored=working_tree_restored,
+        marker_cleared=False,
+        events=events,
+        restored_paths=paths if working_tree_restored else (),
+        adapter_kind=adapter_kind,
+    )
+
+    if unstage_exc is not None or index_exc is not None or restore_exc is not None:
+        details = [f"original {adapter_kind} error: {prior_exc!r}"]
+        if unstage_exc is not None:
+            details.append(f"git restore --staged error: {unstage_exc!r}")
+        if index_exc is not None:
+            details.append(f"index cleanup error: {index_exc!r}")
+        if restore_exc is not None:
+            details.append(f"working-tree restore error: {restore_exc!r}")
+        raise OrchestratorGateError(
+            "; ".join(details),
+            rollback_result=rollback_result,
+        ) from (restore_exc or index_exc or unstage_exc)
+
+    try:
+        marker_path.unlink()
+        marker_cleared = True
+    except FileNotFoundError:
+        marker_cleared = True
+    except OSError as exc:
+        failed_result = _files_rollback_result(
+            paths=paths,
+            sha_map=sha_map,
+            marker_path=marker_path,
+            index_restored=index_restored,
+            working_tree_restored=working_tree_restored,
+            marker_cleared=False,
+            events=events,
+            restored_paths=paths if working_tree_restored else (),
+            adapter_kind=adapter_kind,
+        )
+        raise OrchestratorGateError(
+            f"rollback marker cleanup failed for {marker_path!s}",
+            rollback_result=failed_result,
+        ) from exc
+
+    return _files_rollback_result(
+        paths=paths,
+        sha_map=sha_map,
+        marker_path=marker_path,
+        index_restored=index_restored,
+        working_tree_restored=working_tree_restored,
+        marker_cleared=marker_cleared,
+        events=events,
+        restored_paths=paths if working_tree_restored else (),
+        adapter_kind=adapter_kind,
+    )
+
+
+def _files_rollback_result(
+    *,
+    paths: tuple[str, ...],
+    sha_map: dict[str, str],
+    marker_path: Path,
+    index_restored: bool,
+    working_tree_restored: bool,
+    marker_cleared: bool,
+    events: list[dict[str, Any]],
+    restored_paths: tuple[str, ...],
+    adapter_kind: str,
+) -> RollbackResult:
+    return RollbackResult(
+        strategy_path=paths[0] if paths else "",
+        original_sha256=sha_map.get(paths[0], "") if paths else "",
+        marker_path=str(marker_path),
+        index_restored=index_restored,
+        working_tree_restored=working_tree_restored,
+        marker_cleared=marker_cleared,
+        events=tuple(events),
+        restored_paths=restored_paths,
+        adapter_kind=adapter_kind,
+    )
+
+
+def _write_rollback_marker_v2(
+    marker_path: Path,
+    *,
+    adapter_kind: str,
+    paths: dict[str, str],
+    phase: str,
+) -> None:
+    payload = {
+        "version": 2,
+        "adapter_kind": adapter_kind,
+        "paths": paths,
+        "phase": phase,
+        "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+    sf.atomic_write_bytes(
+        marker_path,
+        (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+
 def _rollback_ship_failure(
     *,
     git_runner: GitRunner,
@@ -633,8 +1446,9 @@ def _is_index_clean(git_runner: GitRunner, repo_root: Path, rel_path: str) -> bo
 def _assert_ship_clean_preflight(
     git_runner: GitRunner,
     repo_root: Path,
-    rel_path: str,
+    rel_path: str | set[str],
 ) -> None:
+    allowed_rel_paths = _normalize_allowed_rel_paths(rel_path)
     result = git_runner(
         [
             "git",
@@ -647,7 +1461,8 @@ def _assert_ship_clean_preflight(
     )
     if not isinstance(result, CommandResult):
         raise OrchestratorGateError(
-            f"git runner must return CommandResult for clean-tree preflight on {rel_path}"
+            "git runner must return CommandResult for clean-tree preflight on "
+            f"{sorted(allowed_rel_paths)}"
         )
     if result.returncode != 0:
         raise OrchestratorGateError(
@@ -659,7 +1474,7 @@ def _assert_ship_clean_preflight(
     for raw_line in result.stdout.splitlines():
         if not raw_line:
             continue
-        if _status_line_is_allowed_target_change(raw_line, rel_path):
+        if _status_line_is_allowed_target_change(raw_line, allowed_rel_paths):
             continue
         dirty.append(raw_line)
 
@@ -671,14 +1486,32 @@ def _assert_ship_clean_preflight(
         )
 
 
-def _status_line_is_allowed_target_change(raw_line: str, rel_path: str) -> bool:
+def _normalize_allowed_rel_paths(value: str | set[str]) -> set[str]:
+    if isinstance(value, str):
+        allowed = {value}
+    else:
+        allowed = set(value)
+    if not allowed:
+        raise OrchestratorGateError("clean-tree allowed path set must not be empty")
+    for rel_path in allowed:
+        _safe_review_file(rel_path, Path("/"))
+    return allowed
+
+
+def _status_line_is_allowed_target_change(
+    raw_line: str,
+    rel_path: str | set[str],
+) -> bool:
+    allowed_rel_paths = _normalize_allowed_rel_paths(rel_path)
     if len(raw_line) < 4:
         return False
-    status = raw_line[:2]
-    paths = _status_line_paths(raw_line)
-    if paths != [rel_path]:
+    if " -> " in raw_line:
         return False
-    if "U" in status:
+    status = raw_line[:2]
+    if any(ch in status for ch in "DRU"):
+        return False
+    paths = _status_line_paths(raw_line)
+    if set(paths) - allowed_rel_paths:
         return False
     return status in {" M", "M ", "MM", "A ", "AM"}
 
@@ -760,6 +1593,21 @@ def _write_rollback_marker(
 
 def _refuse_if_incomplete_rollback(strategy_path: Path, repo_root: Path) -> None:
     marker_path = _rollback_marker_path_for(strategy_path, repo_root)
+    _refuse_if_incomplete_rollback_marker(
+        marker_path,
+        repo_root,
+        default_adapter_kind="strategy",
+        default_path_label=_repo_relative(strategy_path, repo_root),
+    )
+
+
+def _refuse_if_incomplete_rollback_marker(
+    marker_path: Path,
+    repo_root: Path,
+    *,
+    default_adapter_kind: str,
+    default_path_label: str,
+) -> None:
     if not marker_path.exists():
         return
     rel_marker = _repo_relative(marker_path, repo_root)
@@ -769,11 +1617,21 @@ def _refuse_if_incomplete_rollback(strategy_path: Path, repo_root: Path) -> None
         raise OrchestratorGateError(
             f"incomplete rollback marker exists and is unreadable: {rel_marker}"
         ) from exc
-    marker_strategy = payload.get("strategy_path")
+    version = payload.get("version", 1)
     phase = payload.get("phase", "unknown")
+    if version == 2:
+        adapter_kind = payload.get("adapter_kind") or default_adapter_kind
+        raw_paths = payload.get("paths")
+        paths = sorted(raw_paths.keys()) if isinstance(raw_paths, dict) else [default_path_label]
+        raise OrchestratorGateError(
+            "incomplete rollback marker exists for "
+            f"adapter_kind={adapter_kind!r} at phase {phase!r}: "
+            f"{rel_marker}; paths={paths}"
+        )
+    marker_strategy = payload.get("strategy_path")
     raise OrchestratorGateError(
         "incomplete rollback marker exists for "
-        f"{marker_strategy or strategy_path.name} at phase {phase!r}: {rel_marker}"
+        f"{marker_strategy or default_path_label} at phase {phase!r}: {rel_marker}"
     )
 
 

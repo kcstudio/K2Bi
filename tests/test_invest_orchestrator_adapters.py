@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from unittest.mock import patch
+import datetime as _dt
 from datetime import date
 from pathlib import Path
 
@@ -17,7 +18,12 @@ from scripts.lib import invest_orchestrator_adapters as ioa
 from scripts.lib import invest_ship_strategy as iss
 from scripts.lib import invest_thesis as it
 from scripts.lib import strategy_frontmatter as sf
-from tests.test_invest_ship_strategy import _make_tmp_repo, _write_strategy
+from tests.test_invest_ship_strategy import (
+    _make_tmp_repo,
+    _write_config_yaml,
+    _write_limits_proposal,
+    _write_strategy,
+)
 from tests.test_invest_thesis import _make_default_input, _seed_vault
 
 
@@ -224,6 +230,666 @@ class StrategySpecWriterAdapterTests(unittest.TestCase):
 
         self.assertIn("How This Works", str(cm.exception))
         self.assertFalse((self.repo / "wiki/strategies/strategy_spy.md").exists())
+
+
+class ApplyApprovedLimitsAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo, self.parent_sha = _make_tmp_repo()
+        self.config_path = _write_config_yaml(self.repo)
+        self.proposal_path = _write_limits_proposal(self.repo)
+        self.now_utc = _dt.datetime(2026, 6, 8, 8, 0, 30, tzinfo=_dt.timezone.utc)
+        self.review_files_seen: list[list[str]] = []
+
+    def tearDown(self) -> None:
+        subprocess.run(["rm", "-rf", str(self.repo)], check=False)
+
+    def _limits_approval(self, **overrides) -> ioa.LimitsApproval:
+        approved_at = overrides.pop("approved_at", "2026-06-08T08:00:00.000000+00:00")
+        lease_id = overrides.pop("apply_lease_id", "lease-limits-cdns-20260608")
+        proposal_digest = ioa.strategy_file_sha256(self.proposal_path)
+        config_digest = ioa.strategy_file_sha256(self.config_path)
+        data = {
+            "final_approval_token": (
+                f"APPROVE_LIMITS:widen-size:{proposal_digest}:{config_digest}:"
+                f"{approved_at}:{lease_id}"
+            ),
+            "approved_by": "Keith",
+            "approved_at": approved_at,
+            "apply_lease_id": lease_id,
+        }
+        data.update(overrides)
+        return ioa.LimitsApproval(**data)
+
+    def _approve_handler(self, path: Path, **kwargs) -> iss.LimitsCommitHints:
+        kwargs["parent_sha"] = self.parent_sha
+        return iss.handle_approve_limits(path, **kwargs)
+
+    def _approve_review(self, request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+        self.review_files_seen.append(list(request.files))
+        return ioa.ReviewGateResult(
+            verdict="APPROVE",
+            primary_used="minimax",
+            fallback_used=False,
+            log_path=f".code-reviews/{request.kind}.log",
+        )
+
+    def _fake_success_git(self, calls: list[list[str]] | None = None) -> ioa.GitRunner:
+        expected_cached = (
+            "execution/validators/config.yaml\n"
+            "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md\n"
+        )
+
+        def git_runner(cmd, cwd):
+            if calls is not None:
+                calls.append(cmd)
+            if cmd[:3] == ["git", "diff", "--cached"] and "--name-only" in cmd:
+                return ioa.CommandResult(0, expected_cached, "")
+            return ioa.CommandResult(0, "", "")
+
+        return git_runner
+
+    def test_limits_approval_token_binds_exact_proposal_bytes(self):
+        approval = self._limits_approval()
+        self.proposal_path.write_text(
+            self.proposal_path.read_text(encoding="utf-8") + "\nchanged\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=approval,
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("proposal hash", str(cm.exception).lower())
+
+    def test_limits_approval_token_binds_exact_config_bytes(self):
+        approval = self._limits_approval()
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8") + "# drift\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=approval,
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("config hash", str(cm.exception).lower())
+
+    def test_limits_approval_rejects_malformed_hash_and_token_fields(self):
+        cases = [
+            ("", "final approval"),
+            ("APPROVE_LIMITS:widen-size:ABC", "final approval"),
+            (
+                self._limits_approval().final_approval_token.replace(
+                    "APPROVE_LIMITS:widen-size", "APPROVE_LIMITS:other"
+                ),
+                "final approval",
+            ),
+        ]
+        for token, expected in cases:
+            with self.subTest(token=token):
+                with self.assertRaises(ioa.OrchestratorGateError) as cm:
+                    ioa.apply_approved_limits(
+                        self.proposal_path,
+                        approval=self._limits_approval(final_approval_token=token),
+                        review_runner=lambda request: self.fail("review must not run"),
+                        approve_handler=self._approve_handler,
+                        config_path=self.config_path,
+                        now_utc=self.now_utc,
+                    )
+                self.assertIn(expected, str(cm.exception).lower())
+
+    def test_limits_approval_rejects_naive_non_utc_and_stale_timestamps(self):
+        cases = [
+            ("2026-06-08T08:00:00", "timezone"),
+            ("2026-06-08T16:00:00.000000+08:00", "utc"),
+            ("2026-06-08T07:00:00.000000+00:00", "clock"),
+            ("2026-06-08T08:10:00.000000+00:00", "clock"),
+        ]
+        for approved_at, expected in cases:
+            with self.subTest(approved_at=approved_at):
+                with self.assertRaises(ioa.OrchestratorGateError) as cm:
+                    ioa.apply_approved_limits(
+                        self.proposal_path,
+                        approval=self._limits_approval(approved_at=approved_at),
+                        review_runner=lambda request: self.fail("review must not run"),
+                        approve_handler=self._approve_handler,
+                        config_path=self.config_path,
+                        now_utc=self.now_utc,
+                    )
+                self.assertIn(expected, str(cm.exception).lower())
+
+    def test_success_reviews_applies_stages_both_files_and_commits(self):
+        review_kinds = []
+        review_files = []
+        git_calls: list[list[str]] = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
+            review_files.append(list(request.files))
+            return ioa.ReviewGateResult(
+                verdict="APPROVE",
+                primary_used="minimax",
+                fallback_used=False,
+                log_path=f".code-reviews/{request.kind}.log",
+            )
+
+        result = ioa.apply_approved_limits(
+            self.proposal_path,
+            approval=self._limits_approval(),
+            review_runner=review_runner,
+            approve_handler=self._approve_handler,
+            git_runner=self._fake_success_git(git_calls),
+            config_path=self.config_path,
+            now_utc=self.now_utc,
+        )
+
+        proposal_rel = "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md"
+        self.assertEqual(result.slug, "widen-size")
+        self.assertEqual(review_kinds, ["plan", "diff"])
+        self.assertEqual(review_files, [[proposal_rel], [proposal_rel, "execution/validators/config.yaml"]])
+        self.assertIn("status: approved", self.proposal_path.read_text(encoding="utf-8"))
+        self.assertIn("max_trade_risk_pct: 0.02", self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(git_calls[0][:2], ["git", "status"])
+        self.assertEqual(git_calls[1][:4], ["git", "diff", "--cached", "--quiet"])
+        self.assertEqual(git_calls[2][:3], ["git", "diff", "--quiet"])
+        self.assertEqual(git_calls[3][:2], ["git", "add"])
+        self.assertIn(proposal_rel, git_calls[3])
+        self.assertIn("execution/validators/config.yaml", git_calls[3])
+        self.assertEqual(git_calls[4][:3], ["git", "diff", "--cached"])
+        self.assertEqual(git_calls[5][:2], ["git", "commit"])
+        self.assertIn("--only", git_calls[5])
+        self.assertIn("Approved-Limits: widen-size", result.commit_message)
+        self.assertIn("Approval-Captured-At: 2026-06-08T08:00:00.000000+00:00", result.commit_message)
+
+    def test_untracked_strategy_file_does_not_block_limits_apply(self):
+        untracked = self.repo / "wiki" / "strategies" / "strategy_cdns.md"
+        untracked.parent.mkdir(parents=True, exist_ok=True)
+        untracked.write_text("draft\n", encoding="utf-8")
+
+        result = ioa.apply_approved_limits(
+            self.proposal_path,
+            approval=self._limits_approval(),
+            review_runner=self._approve_review,
+            approve_handler=self._approve_handler,
+            git_runner=self._fake_success_git(),
+            config_path=self.config_path,
+            now_utc=self.now_utc,
+        )
+
+        self.assertEqual(result.slug, "widen-size")
+        self.assertEqual(
+            self.review_files_seen,
+            [
+                ["review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md"],
+                [
+                    "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md",
+                    "execution/validators/config.yaml",
+                ],
+            ],
+        )
+
+    def test_unrelated_tracked_file_refuses_before_review(self):
+        note = self.repo / "notes.md"
+        note.write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "add", "notes.md"], cwd=str(self.repo), check=True)
+        subprocess.run(["git", "commit", "-m", "add note", "-q"], cwd=str(self.repo), check=True)
+        note.write_text("dirty\n", encoding="utf-8")
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("clean-tree", str(cm.exception).lower())
+        self.assertIn("notes.md", str(cm.exception))
+
+    def test_preexisting_staged_target_change_refuses_before_review(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        subprocess.run(
+            [
+                "git",
+                "add",
+                "execution/validators/config.yaml",
+                "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md",
+            ],
+            cwd=str(self.repo),
+            check=True,
+        )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        msg = str(cm.exception)
+        self.assertIn("staged changes", msg)
+        self.assertIn("execution/validators/config.yaml", msg)
+        self.assertIn(
+            "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md",
+            msg,
+        )
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+
+    def test_preexisting_unstaged_target_change_refuses_before_review(self):
+        # A tracked target file carrying a pre-existing UNSTAGED working-tree edit
+        # must be refused before the handler mutates anything; otherwise the stray
+        # edit would be folded into the committed validator change by the later
+        # `git add`. Symmetric companion to the staged-target preflight gate.
+        subprocess.run(
+            ["git", "add", "execution/validators/config.yaml"],
+            cwd=str(self.repo),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "seed config", "-q"],
+            cwd=str(self.repo),
+            check=True,
+        )
+        # Stray, unrelated working-tree edit to the now-tracked target.
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8") + "# stray unstaged edit\n",
+            encoding="utf-8",
+        )
+        dirty_config = self.config_path.read_bytes()
+        # Build the approval AFTER the edit so the config sha binds the on-disk
+        # (dirty) bytes and the token gate passes, isolating the preflight gate.
+        approval = self._limits_approval()
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=approval,
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        msg = str(cm.exception)
+        self.assertIn("unstaged", msg)
+        self.assertIn("execution/validators/config.yaml", msg)
+        self.assertEqual(self.config_path.read_bytes(), dirty_config)
+
+    def test_status_rename_and_delete_refuse(self):
+        allowed = {
+            "execution/validators/config.yaml",
+            "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md",
+        }
+        for raw in [
+            "D  execution/validators/config.yaml",
+            " D execution/validators/config.yaml",
+            "R  execution/validators/config.yaml -> execution/validators/config.yaml.bak",
+            "R  execution/validators/config.yaml -> review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md",
+        ]:
+            with self.subTest(raw=raw):
+                self.assertFalse(ioa._status_line_is_allowed_target_change(raw, allowed))
+
+    def test_failed_diff_review_restores_proposal_and_config(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+
+        def review_runner(request):
+            verdict = "APPROVE" if request.kind == "plan" else "NEEDS-ATTENTION"
+            return ioa.ReviewGateResult(
+                verdict=verdict,
+                primary_used="minimax",
+                fallback_used=False,
+                log_path=f".code-reviews/{request.kind}.log",
+            )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=review_runner,
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("diff review", str(cm.exception).lower())
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+        self.assertIsNotNone(cm.exception.rollback_result)
+        self.assertTrue(cm.exception.rollback_result.working_tree_restored)
+
+    def test_commit_failure_restores_both_files_and_unstages(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        git_calls: list[list[str]] = []
+        expected_cached = (
+            "execution/validators/config.yaml\n"
+            "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md\n"
+        )
+
+        def git_runner(cmd, cwd):
+            git_calls.append(cmd)
+            if cmd[:2] == ["git", "commit"]:
+                return ioa.CommandResult(1, "", "commit failed")
+            if cmd[:3] == ["git", "diff", "--cached"] and "--name-only" in cmd:
+                return ioa.CommandResult(0, expected_cached, "")
+            if cmd[:4] == ["git", "diff", "--cached", "--quiet"]:
+                return ioa.CommandResult(0, "", "")
+            return ioa.CommandResult(0, "", "")
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=self._approve_review,
+                approve_handler=self._approve_handler,
+                git_runner=git_runner,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("commit failed", str(cm.exception))
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+        self.assertTrue(any(cmd[:3] == ["git", "restore", "--staged"] for cmd in git_calls))
+
+    def test_failed_rollback_leaves_v2_marker_and_structured_result(self):
+        def git_runner(cmd, cwd):
+            if cmd[:2] == ["git", "commit"]:
+                return ioa.CommandResult(1, "", "commit failed")
+            if cmd[:3] == ["git", "diff", "--cached"] and "--name-only" in cmd:
+                return ioa.CommandResult(
+                    0,
+                    "execution/validators/config.yaml\n"
+                    "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md\n",
+                    "",
+                )
+            return ioa.CommandResult(0, "", "")
+
+        with patch(
+            "scripts.lib.invest_orchestrator_adapters._restore_original_or_raise",
+            side_effect=ioa.OrchestratorGateError("restore failed"),
+        ):
+            with self.assertRaises(ioa.OrchestratorGateError) as cm:
+                ioa.apply_approved_limits(
+                    self.proposal_path,
+                    approval=self._limits_approval(),
+                    review_runner=self._approve_review,
+                    approve_handler=self._approve_handler,
+                    git_runner=git_runner,
+                    config_path=self.config_path,
+                    now_utc=self.now_utc,
+                )
+
+        result = cm.exception.rollback_result
+        self.assertIsNotNone(result)
+        self.assertEqual(result.adapter_kind, "limits")
+        self.assertFalse(result.working_tree_restored)
+        marker_path = Path(result.marker_path)
+        self.assertTrue(marker_path.exists())
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(marker["version"], 2)
+        self.assertEqual(marker["adapter_kind"], "limits")
+        self.assertIn("execution/validators/config.yaml", marker["paths"])
+
+    def test_incomplete_v2_rollback_marker_refuses_before_review(self):
+        marker_path = self.repo / ".k2bi-orchestrator" / "rollback" / "limits_widen-size.json"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "adapter_kind": "limits",
+                    "paths": {
+                        "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md": "0" * 64,
+                        "execution/validators/config.yaml": "1" * 64,
+                    },
+                    "phase": "working_tree_restore",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        msg = str(cm.exception)
+        self.assertIn("limits", msg)
+        self.assertIn("working_tree_restore", msg)
+        self.assertIn("execution/validators/config.yaml", msg)
+        self.assertIn("review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md", msg)
+
+    def test_commit_message_rejects_review_log_path_with_newline(self):
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            return ioa.ReviewGateResult(
+                verdict="APPROVE",
+                primary_used="minimax",
+                fallback_used=False,
+                log_path=".code-reviews/x.log\nInjected-Trailer: yes",
+            )
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=review_runner,
+                approve_handler=self._approve_handler,
+                git_runner=self._fake_success_git(),
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("unsafe commit field", str(cm.exception).lower())
+        self.assertIn("status: proposed", self.proposal_path.read_text(encoding="utf-8"))
+
+    def test_rejects_diff_review_fallback_or_wrong_primary(self):
+        cases = [
+            ("minimax", True, "fallback"),
+            ("codex", False, "primary_used"),
+        ]
+        for primary_used, fallback_used, expected in cases:
+            with self.subTest(primary_used=primary_used, fallback_used=fallback_used):
+                self.tearDown()
+                self.setUp()
+
+                def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+                    if request.kind == "plan":
+                        return ioa.ReviewGateResult("APPROVE", "minimax", False, ".code-reviews/plan.log")
+                    return ioa.ReviewGateResult("APPROVE", primary_used, fallback_used, ".code-reviews/diff.log")
+
+                with self.assertRaises(ioa.OrchestratorGateError) as cm:
+                    ioa.apply_approved_limits(
+                        self.proposal_path,
+                        approval=self._limits_approval(),
+                        review_runner=review_runner,
+                        approve_handler=self._approve_handler,
+                        config_path=self.config_path,
+                        now_utc=self.now_utc,
+                    )
+                self.assertIn(expected, str(cm.exception))
+                self.assertIn("status: proposed", self.proposal_path.read_text(encoding="utf-8"))
+
+    def test_handler_receives_approval_timestamp(self):
+        approval = self._limits_approval(approved_at="2026-06-08T08:00:34.000000+00:00")
+        ioa.apply_approved_limits(
+            self.proposal_path,
+            approval=approval,
+            review_runner=self._approve_review,
+            approve_handler=iss.handle_approve_limits,
+            git_runner=self._fake_success_git(),
+            config_path=self.config_path,
+            now_utc=_dt.datetime(2026, 6, 8, 8, 0, 35, tzinfo=_dt.timezone.utc),
+        )
+
+        fm = sf.parse(self.proposal_path.read_bytes())
+        self.assertEqual(
+            str(fm["approved_at"]),
+            "2026-06-08T08:00:34.000000+00:00",
+        )
+
+    def test_non_canonical_config_path_refuses_before_review(self):
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=lambda request: self.fail("review must not run"),
+                approve_handler=self._approve_handler,
+                config_path=self.repo / "execution" / "validators" / ".." / "validators" / "config.yaml",
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("config_path must be execution/validators/config.yaml", str(cm.exception))
+
+    def test_partial_staging_refuses_before_commit_and_rolls_back(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        git_calls: list[list[str]] = []
+
+        def git_runner(cmd, cwd):
+            git_calls.append(cmd)
+            if cmd[:3] == ["git", "diff", "--cached"] and "--name-only" in cmd:
+                return ioa.CommandResult(0, "execution/validators/config.yaml\n", "")
+            return ioa.CommandResult(0, "", "")
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=self._approve_review,
+                approve_handler=self._approve_handler,
+                git_runner=git_runner,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("cached diff", str(cm.exception).lower())
+        self.assertFalse(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+
+    def test_post_handler_unexpected_config_mutation_refuses_before_diff_review(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        review_kinds = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
+            return ioa.ReviewGateResult("APPROVE", "minimax", False, f".code-reviews/{request.kind}.log")
+
+        def bad_handler(path: Path, **kwargs) -> iss.LimitsCommitHints:
+            hints = self._approve_handler(path, **kwargs)
+            self.config_path.write_text(
+                self.config_path.read_text(encoding="utf-8") + "# unexpected\n",
+                encoding="utf-8",
+            )
+            return hints
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=review_runner,
+                approve_handler=bad_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("config bytes", str(cm.exception).lower())
+        self.assertEqual(review_kinds, ["plan"])
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+
+    def test_post_handler_unexpected_proposal_mutation_refuses_before_diff_review(self):
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        review_kinds = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
+            return ioa.ReviewGateResult("APPROVE", "minimax", False, f".code-reviews/{request.kind}.log")
+
+        def bad_handler(path: Path, **kwargs) -> iss.LimitsCommitHints:
+            hints = self._approve_handler(path, **kwargs)
+            path.write_text(
+                path.read_text(encoding="utf-8") + "\n# unexpected\n",
+                encoding="utf-8",
+            )
+            return hints
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=review_runner,
+                approve_handler=bad_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("proposal bytes", str(cm.exception).lower())
+        self.assertEqual(review_kinds, ["plan"])
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
+
+    def test_rollback_marker_cleanup_failure_preserves_result(self):
+        def git_runner(cmd, cwd):
+            if cmd[:2] == ["git", "commit"]:
+                return ioa.CommandResult(1, "", "commit failed")
+            if cmd[:3] == ["git", "diff", "--cached"] and "--name-only" in cmd:
+                return ioa.CommandResult(
+                    0,
+                    "execution/validators/config.yaml\n"
+                    "review/strategy-approvals/2026-04-19_limits-proposal_widen-size.md\n",
+                    "",
+                )
+            if cmd[:4] == ["git", "diff", "--cached", "--quiet"]:
+                return ioa.CommandResult(0, "", "")
+            return ioa.CommandResult(0, "", "")
+
+        with patch("pathlib.Path.unlink", side_effect=OSError("unlink failed")):
+            with self.assertRaises(ioa.OrchestratorGateError) as cm:
+                ioa.apply_approved_limits(
+                    self.proposal_path,
+                    approval=self._limits_approval(),
+                    review_runner=self._approve_review,
+                    approve_handler=self._approve_handler,
+                    git_runner=git_runner,
+                    config_path=self.config_path,
+                    now_utc=self.now_utc,
+                )
+
+        result = cm.exception.rollback_result
+        self.assertIsNotNone(result)
+        self.assertTrue(result.index_restored)
+        self.assertTrue(result.working_tree_restored)
+        self.assertFalse(result.marker_cleared)
+        self.assertIn("rollback marker cleanup failed", str(cm.exception).lower())
 
 
 class FullShipWrapperAdapterTests(unittest.TestCase):
