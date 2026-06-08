@@ -1,3 +1,20 @@
+## 2026-06-08 -- apply_approved_limits orchestrator adapter shipped (A4 builder increment)
+
+**Scope:** Shipped `apply_approved_limits(...)` in `scripts/lib/invest_orchestrator_adapters.py` (commit `d424b62`), the limits analog of `run_full_ship`. It is an orchestrator-callable adapter that applies an operator-approved limits proposal (e.g. an `instrument_whitelist` add) under a bound approval token, owning its own review gates, commit, and outer rollback, and wrapping the existing `handle_approve_limits(...)` without weakening it or the validators. This lets the K2B orchestrator (a separate increment) land a validator change after Keith's green light instead of Keith hand-running `/invest-ship --approve-limits`.
+
+**Key shipped changes:**
+- `LimitsApproval` / `LimitsApplyResult` dataclasses + `_validate_limits_approval(...)`.
+- Locked token `APPROVE_LIMITS:<slug>:<proposal_sha256>:<config_sha256>:<approved_at>:<apply_lease_id>` (colon-delimited, A3 `APPROVE_STRATEGY` style), binding BOTH the proposal bytes and the canonical config bytes; fields independently validated (slug regex, 64-hex shas, UTC ISO-8601 `approved_at`, lease regex) then equality-compared. No base64url/JSON.
+- Canonical config-path enforcement (`execution/validators/config.yaml` only).
+- Clean-tree preflight (`--untracked-files=no`) plus staged AND unstaged target-path preflights so no pre-staged or pre-edited target content can fold into the committed validator change.
+- Post-handler byte-bound verification of both proposal and config against the expected before->after replacement; review-scope assertions before each gate; two-file outer rollback with a versioned fail-closed rollback marker.
+
+**Review loop:** Plan review terminated by architect disposition after 3 rounds. Checkpoint-2 diff review run with MiniMax primary (`primary_used=minimax`, `fallback_used=false`) across four rounds. Material findings fixed each round (token/config binding, canonical path, rename/delete rejection, replay/clock-skew, `rollback_result` preservation, proposal-bytes verification, staged-target preflight, and this session's unstaged-target preflight). Material count converged 4 -> 1 -> 1 -> 0; the final round's 8 findings were fine-grained / out-of-threat-model (two would have weakened the design: `--no-verify` would bypass pre-commit Check C, and rejecting untracked targets contradicts the locked `--untracked-files=no` requirement). AR7-terminated per disposition discipline. Review logs in `.code-reviews/2026-06-08T15-16-10Z_c6bad5.log` and `.code-reviews/2026-06-08T15-40-25Z_958977.log`.
+
+**Verification:** full suite `pytest -q` returned `1830 passed, 1 skipped, 2 warnings, 66 subtests passed`. The new unstaged-target gate was added red-test-first (`test_preexisting_unstaged_target_change_refuses_before_review`).
+
+**Out of scope (preserved untouched):** `.codex/job.md` (local handoff state), `proposals/2026-06-08_apply-approved-limits-adapter-plan.md` (untracked plan artifact), `wiki/strategies/strategy_cdns.md` (dormant A3 artifact). No validator config edits, no engine/broker/vault changes. Next increment (orchestrator wiring that dispatches this adapter) is a separate K2B session.
+
 ## 2026-05-13 -- Spec B live regression PASS and Section 0 baseline refreshed
 
 **Scope:** Recorded the PASS outcome from the post-Spec-B live regression rerun and re-anchored the Section 0 broker baseline after the planned G round-trip changed cost basis and created a fresh broker-held stop.
