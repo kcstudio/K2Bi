@@ -421,7 +421,7 @@ def run_full_ship(
                     kind="diff",
                     path=strategy_path,
                     files=[rel_path],
-                    focus="Review the strategy approval diff for gate bypass, missing trailers, or safety regression.",
+                    focus=_strategy_diff_review_focus(),
                     required_primary=required_primary,
                 )
             )
@@ -871,9 +871,21 @@ def _make_limits_diff_review_request(
         path=proposal_path,
         files=[proposal_rel, config_rel],
         focus=(
-            "Review the approved limits diff for token binding, config_sha "
-            "binding, rollback correctness, staging boundaries, and any "
-            "weakening of handle_approve_limits or validators."
+            "Deployment context: K2Bi is a SINGLE-OPERATOR PAPER-TRADING system. "
+            "The apply_approved_limits adapter ALREADY enforces token binding, "
+            "config-sha binding (a dual-sha operator-approval token over the "
+            "proposal AND on-disk config bytes), atomic write, and rollback on "
+            "any failed gate -- so those, plus replay protection, staging/canary, "
+            "and approval-metadata SHA schemes (e.g. approved_commit_sha), are OUT "
+            "OF SCOPE. Review the diff ONLY for IN-SCOPE defects: it must contain "
+            "EXACTLY the proposal's proposed->approved frontmatter transition and "
+            "the config.yaml patch matching the proposal's approved after-list, "
+            "and NOTHING else (no unrelated files); no change that WEAKENS a "
+            "validator (loosens a threshold, removes a guard, widens a limit, "
+            "disables a check); and correct commit trailers. Do NOT raise binding "
+            "/ replay / staging / drift / config-version / CI / two-person-rule "
+            "concerns -- the adapter owns them. Return NEEDS-ATTENTION ONLY for an "
+            "in-scope diff defect; otherwise APPROVE."
         ),
         required_primary=required_primary,
     )
@@ -2043,6 +2055,19 @@ def _strategy_plan_review_focus() -> str:
         "concerns (CI, two-person rule, deployment tooling, monitoring/alerting, "
         "per-ticker infra) -- out of scope for a single-operator paper strategy. "
         "NEEDS-ATTENTION ONLY for an in-scope strategy defect."
+    )
+
+
+def _strategy_diff_review_focus() -> str:
+    return (
+        "Deployment context: K2Bi is a SINGLE-OPERATOR PAPER-TRADING system; the "
+        "run_full_ship adapter owns token binding, atomic write, commit, and "
+        "rollback (OUT OF SCOPE). Review the strategy approval diff ONLY for "
+        "IN-SCOPE defects: a real safety-gate bypass, a missing or incorrect "
+        "commit trailer, or a change that weakens a validator or the strategy's "
+        "own gates. Do NOT raise binding / replay / staging / drift / CI / "
+        "process concerns. NEEDS-ATTENTION ONLY for an in-scope diff defect; "
+        "otherwise APPROVE."
     )
 
 
