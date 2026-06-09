@@ -548,14 +548,60 @@ class ApplyApprovedLimitsAdapterTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertFalse(ioa._status_line_is_allowed_target_change(raw, allowed))
 
-    def test_failed_diff_review_restores_proposal_and_config(self):
-        original_proposal = self.proposal_path.read_bytes()
-        original_config = self.config_path.read_bytes()
+    def test_change5_needs_attention_diff_review_is_advisory_and_commits(self):
+        # Change 5 (2026-06-09): the limits-apply diff review is ADVISORY. The diff
+        # is deterministic and already byte-verified before commit, so a
+        # NEEDS-ATTENTION diff verdict must be recorded for audit but must NOT block
+        # or roll back. The apply still commits.
+        review_kinds: list[str] = []
+        git_calls: list[list[str]] = []
 
         def review_runner(request):
+            review_kinds.append(request.kind)
             verdict = "APPROVE" if request.kind == "plan" else "NEEDS-ATTENTION"
             return ioa.ReviewGateResult(
                 verdict=verdict,
+                primary_used="minimax",
+                fallback_used=False,
+                log_path=f".code-reviews/{request.kind}.log",
+            )
+
+        result = ioa.apply_approved_limits(
+            self.proposal_path,
+            approval=self._limits_approval(),
+            review_runner=review_runner,
+            approve_handler=self._approve_handler,
+            git_runner=self._fake_success_git(git_calls),
+            config_path=self.config_path,
+            now_utc=self.now_utc,
+        )
+
+        # The change LANDED: both reviews ran, the diff verdict was NEEDS-ATTENTION,
+        # yet the apply committed and the files carry the approved change.
+        self.assertEqual(review_kinds, ["plan", "diff"])
+        self.assertEqual(result.diff_review.verdict, "NEEDS-ATTENTION")
+        self.assertIn("status: approved", self.proposal_path.read_text(encoding="utf-8"))
+        self.assertIn("max_trade_risk_pct: 0.02", self.config_path.read_text(encoding="utf-8"))
+        self.assertTrue(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
+        # The advisory verdict is recorded in the event log for audit.
+        advisory = [e for e in result.events if e.get("event") == "diff_review_advisory"]
+        self.assertEqual(len(advisory), 1)
+        self.assertEqual(advisory[0]["verdict"], "NEEDS-ATTENTION")
+        self.assertEqual(advisory[0]["log_path"], ".code-reviews/diff.log")
+
+    def test_change5_needs_attention_plan_review_still_blocks_and_rolls_back(self):
+        # Part (a) of the Change 5 proof: the PLAN gate stays intact. A
+        # NEEDS-ATTENTION plan verdict refuses before the handler mutates anything,
+        # the diff review never runs, and nothing commits.
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        review_kinds: list[str] = []
+        git_calls: list[list[str]] = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
+            return ioa.ReviewGateResult(
+                verdict="NEEDS-ATTENTION",
                 primary_used="minimax",
                 fallback_used=False,
                 log_path=f".code-reviews/{request.kind}.log",
@@ -567,15 +613,56 @@ class ApplyApprovedLimitsAdapterTests(unittest.TestCase):
                 approval=self._limits_approval(),
                 review_runner=review_runner,
                 approve_handler=self._approve_handler,
+                git_runner=self._fake_success_git(git_calls),
                 config_path=self.config_path,
                 now_utc=self.now_utc,
             )
 
-        self.assertIn("diff review", str(cm.exception).lower())
+        self.assertIn("plan review", str(cm.exception).lower())
+        self.assertEqual(review_kinds, ["plan"])  # plan refused before the diff review
+        self.assertFalse(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
         self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
         self.assertEqual(self.config_path.read_bytes(), original_config)
+
+    def test_change5_post_handler_byte_mismatch_still_blocks_despite_advisory_diff(self):
+        # Part (b) of the Change 5 proof: the deterministic byte-check is the real
+        # mechanical gate. Even with the diff review downgraded to advisory, a
+        # handler that mutates config bytes off the expected patch must raise and
+        # roll back BEFORE the diff review even runs.
+        original_proposal = self.proposal_path.read_bytes()
+        original_config = self.config_path.read_bytes()
+        review_kinds: list[str] = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
+            # A NEEDS-ATTENTION diff would be advisory if it ran -- it must not.
+            verdict = "APPROVE" if request.kind == "plan" else "NEEDS-ATTENTION"
+            return ioa.ReviewGateResult(verdict, "minimax", False, f".code-reviews/{request.kind}.log")
+
+        def bad_handler(path: Path, **kwargs) -> iss.LimitsCommitHints:
+            hints = self._approve_handler(path, **kwargs)
+            self.config_path.write_text(
+                self.config_path.read_text(encoding="utf-8") + "# unexpected\n",
+                encoding="utf-8",
+            )
+            return hints
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.apply_approved_limits(
+                self.proposal_path,
+                approval=self._limits_approval(),
+                review_runner=review_runner,
+                approve_handler=bad_handler,
+                config_path=self.config_path,
+                now_utc=self.now_utc,
+            )
+
+        self.assertIn("config bytes", str(cm.exception).lower())
+        self.assertEqual(review_kinds, ["plan"])  # byte gate raised before the diff review
         self.assertIsNotNone(cm.exception.rollback_result)
         self.assertTrue(cm.exception.rollback_result.working_tree_restored)
+        self.assertEqual(self.proposal_path.read_bytes(), original_proposal)
+        self.assertEqual(self.config_path.read_bytes(), original_config)
 
     def test_commit_failure_restores_both_files_and_unstages(self):
         original_proposal = self.proposal_path.read_bytes()
@@ -708,7 +795,10 @@ class ApplyApprovedLimitsAdapterTests(unittest.TestCase):
         self.assertIn("unsafe commit field", str(cm.exception).lower())
         self.assertIn("status: proposed", self.proposal_path.read_text(encoding="utf-8"))
 
-    def test_rejects_diff_review_fallback_or_wrong_primary(self):
+    def test_rejects_plan_review_fallback_or_wrong_primary(self):
+        # The PLAN review stays blocking (Change 5 only downgraded the diff review),
+        # so a fallback-used or wrong-primary plan verdict must still refuse before
+        # any mutation. The diff review's primary/fallback is no longer enforced.
         cases = [
             ("minimax", True, "fallback"),
             ("codex", False, "primary_used"),
@@ -719,9 +809,8 @@ class ApplyApprovedLimitsAdapterTests(unittest.TestCase):
                 self.setUp()
 
                 def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
-                    if request.kind == "plan":
-                        return ioa.ReviewGateResult("APPROVE", "minimax", False, ".code-reviews/plan.log")
-                    return ioa.ReviewGateResult("APPROVE", primary_used, fallback_used, ".code-reviews/diff.log")
+                    self.assertEqual(request.kind, "plan")  # diff review must never run
+                    return ioa.ReviewGateResult("APPROVE", primary_used, fallback_used, ".code-reviews/plan.log")
 
                 with self.assertRaises(ioa.OrchestratorGateError) as cm:
                     ioa.apply_approved_limits(
