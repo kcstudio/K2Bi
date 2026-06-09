@@ -1570,15 +1570,18 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
             ioa._repo_relative(Path("/tmp/outside_strategy.md"), self.repo)
 
 
-class PlanReviewFocusCalibrationTests(unittest.TestCase):
-    """Lock the single-operator-paper calibration into both plan-review focuses.
+class ReviewFocusCalibrationTests(unittest.TestCase):
+    """Lock the single-operator-paper calibration into all FOUR review focuses.
 
-    The orchestrator plan reviews block legitimate, minimal proposals when their
-    focus prompt lets the reviewer treat a single-operator PAPER proposal as
-    production infrastructure. These asserts are a cheap regression so the
-    calibration (deployment context + an explicit out-of-scope boundary) cannot
-    silently revert. They do NOT assert the gate is weakened: the genuine
-    strategy-quality checks must stay present.
+    There are exactly four orchestrator review focuses: limits-plan, limits-diff,
+    strategy-plan, strategy-diff. Each blocks legitimate, minimal proposals when
+    its focus prompt lets the reviewer treat a single-operator PAPER proposal as
+    production infrastructure -- the diff focuses additionally asked the reviewer
+    to verify adapter-provided guarantees (token/config-sha binding, staging)
+    that are invisible in the diff, so it reported them missing. These asserts
+    are a cheap regression so the calibration (deployment context + an explicit
+    out-of-scope boundary) cannot silently revert. They do NOT assert the gate is
+    weakened: the genuine defect checks must stay present.
     """
 
     DEPLOYMENT_CONTEXT_MARKER = "SINGLE-OPERATOR PAPER-TRADING"
@@ -1602,4 +1605,28 @@ class PlanReviewFocusCalibrationTests(unittest.TestCase):
         self.assertIn(self.OUT_OF_SCOPE_MARKER, focus)
         # Existing strategy-quality checks must survive the calibration.
         self.assertIn("look-ahead", focus)
+        self.assertLessEqual(len(focus), ioa.MAX_REVIEW_FOCUS_LEN)
+
+    def test_limits_diff_review_focus_carries_context_and_scope_boundary(self):
+        focus = ioa._make_limits_diff_review_request(
+            Path("review/strategy-approvals/limits_x.md"),
+            proposal_rel="review/strategy-approvals/limits_x.md",
+            config_rel="execution/validators/config.yaml",
+            required_primary="minimax",
+        ).focus
+        self.assertIn(self.DEPLOYMENT_CONTEXT_MARKER, focus)
+        self.assertIn(self.OUT_OF_SCOPE_MARKER, focus)
+        # Calibration keeps the real in-scope diff checks, does not weaken the gate.
+        self.assertIn("WEAKENS a validator", focus)
+        self.assertIn("commit trailers", focus)
+        self.assertLessEqual(len(focus), ioa.MAX_REVIEW_FOCUS_LEN)
+
+    def test_strategy_diff_review_focus_carries_context_and_scope_boundary(self):
+        focus = ioa._strategy_diff_review_focus()
+        self.assertIn(self.DEPLOYMENT_CONTEXT_MARKER, focus)
+        self.assertIn(self.OUT_OF_SCOPE_MARKER, focus)
+        # Gate-bypass / trailer / weakening checks must survive the calibration.
+        self.assertIn("safety-gate bypass", focus)
+        self.assertIn("commit trailer", focus)
+        self.assertIn("weakens a validator", focus)
         self.assertLessEqual(len(focus), ioa.MAX_REVIEW_FOCUS_LEN)
