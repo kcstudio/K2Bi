@@ -2457,3 +2457,21 @@ distilled-rule: "When verification gates include an operator-override escape hat
 **Follow-ups:** Two `/request` items filed: make `scripts/review.sh` tolerate pre-existing unrelated untracked directories, and investigate Kimi reviewer unparseable / `NEEDS-ATTENTION` output on this iteration.
 
 **Key decisions:** Piece B Tier 1 engine snapshots remain deferred. PID-based stale-lock recovery replaced the initial mtime fallback; `is_ssh_token()` closes PATH-explicit `/usr/bin/ssh`; `past_dashdash` closes the `ssh -- hostinger` bypass.
+
+## 2026-06-09 -- orchestrator plan-review focus calibrated for single-operator paper MVP
+
+**Commit:** `f92cfb1` fix(orchestrator): calibrate plan-review focus for single-operator paper MVP
+
+**PR:** https://github.com/kcstudio/K2Bi/pull/11 (open, not yet merged)
+
+**What shipped:** Calibrated the two internal Kimi plan-review FOCUS PROMPTS in `scripts/lib/invest_orchestrator_adapters.py` so a single-operator PAPER-trading proposal is no longer reviewed as production infrastructure. `_make_limits_plan_review_request` and `_strategy_plan_review_focus()` now carry the deployment context (atomic-write + dual-sha + rollback + strategy-ship gate are adapter-enforced, so config drift / stale-patch / atomic-write / rollback / strategy-to-ticker coupling are OUT OF SCOPE) and an explicit IN-SCOPE/OUT-OF-SCOPE boundary. The strategy focus keeps every existing quality check (look-ahead, unrealistic orders, regime mismatch, weak How-This-Works, safety-gate bypass). The gate logic (`_require_review_approved`) and both diff-review focuses are unchanged. Added `PlanReviewFocusCalibrationTests` (2 tests) locking the calibration in. Source: `K2Bi-Vault/proposals/2026-06-09_proposal_calibrate-orchestrator-review-focus.md`.
+
+**Codex review:** APPROVE, no material findings (job `2026-06-09T08-44-34Z_0d187c`). Confirmed the gate still fails closed on non-APPROVE, diff-review focuses unchanged, both new focus strings retain their defect checks, strings under MAX_REVIEW_FOCUS_LEN with no control chars.
+
+**Tests:** `tests/test_invest_orchestrator_adapters.py` -- 64 passed (incl. 2 new calibration tests).
+
+**Feature status change:** none (K2Bi vault has no wiki/concepts roadmap; this is an infrastructure calibration of already-shipped adapters).
+
+**Follow-ups:** After PR #11 merges to main, /sync the `scripts` category to the VPS, then re-run K2B's parked A4 (`retry-limits 2026-06-09-001` -> re-dispatch `k2bi-apply-limits` -> verify -> terminal_limits_applied, CDNS whitelisted) and A3 (address CDNS strategy findings -> `retry-ship 2026-06-07-001` -> terminal_shipped).
+
+**Key decisions:** Calibrated the focus PROMPT, not the gate logic or severity threshold -- smallest, most auditable, most reversible lever for a capital path. Shipped as a PR (not direct-to-main) per Keith's explicit request; branched from origin/main to keep the PR free of the unrelated unpushed build-plan docs commit (6d648f7).

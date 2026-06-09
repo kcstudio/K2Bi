@@ -1568,3 +1568,38 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
     def test_repo_relative_refuses_path_outside_repo(self):
         with self.assertRaises(ioa.OrchestratorGateError):
             ioa._repo_relative(Path("/tmp/outside_strategy.md"), self.repo)
+
+
+class PlanReviewFocusCalibrationTests(unittest.TestCase):
+    """Lock the single-operator-paper calibration into both plan-review focuses.
+
+    The orchestrator plan reviews block legitimate, minimal proposals when their
+    focus prompt lets the reviewer treat a single-operator PAPER proposal as
+    production infrastructure. These asserts are a cheap regression so the
+    calibration (deployment context + an explicit out-of-scope boundary) cannot
+    silently revert. They do NOT assert the gate is weakened: the genuine
+    strategy-quality checks must stay present.
+    """
+
+    DEPLOYMENT_CONTEXT_MARKER = "SINGLE-OPERATOR PAPER-TRADING"
+    OUT_OF_SCOPE_MARKER = "OUT OF SCOPE"
+
+    def test_limits_plan_review_focus_carries_context_and_scope_boundary(self):
+        focus = ioa._make_limits_plan_review_request(
+            Path("review/strategy-approvals/limits_x.md"),
+            proposal_rel="review/strategy-approvals/limits_x.md",
+            required_primary="minimax",
+        ).focus
+        self.assertIn(self.DEPLOYMENT_CONTEXT_MARKER, focus)
+        self.assertIn(self.OUT_OF_SCOPE_MARKER, focus)
+        # Calibration keeps the real defect checks, does not weaken the gate.
+        self.assertIn("WEAKENS a validator", focus)
+        self.assertLessEqual(len(focus), ioa.MAX_REVIEW_FOCUS_LEN)
+
+    def test_strategy_plan_review_focus_carries_context_and_scope_boundary(self):
+        focus = ioa._strategy_plan_review_focus()
+        self.assertIn(self.DEPLOYMENT_CONTEXT_MARKER, focus)
+        self.assertIn(self.OUT_OF_SCOPE_MARKER, focus)
+        # Existing strategy-quality checks must survive the calibration.
+        self.assertIn("look-ahead", focus)
+        self.assertLessEqual(len(focus), ioa.MAX_REVIEW_FOCUS_LEN)
