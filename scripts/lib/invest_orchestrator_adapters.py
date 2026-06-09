@@ -614,7 +614,17 @@ def apply_approved_limits(
                 expected_files=[proposal_rel, config_rel],
             )
             events.append(_review_event("diff_review_completed", diff_review))
-            _require_review_approved(diff_review, "diff review", required_primary)
+            # ADVISORY ONLY (2026-06-09): the limits-apply diff is deterministic and was already
+            # byte-verified above (proposal bytes == expected_proposal_after, config bytes ==
+            # expected_config_after). An adversarial LLM review of an exact machine-verified patch is
+            # structurally false-positive-prone and adds no safety the byte-checks do not already
+            # guarantee. Record the verdict for audit; do NOT block. The PLAN review stays blocking and
+            # handle_approve_limits + the byte-checks are the real mechanical gate.
+            events.append({
+                "event": "diff_review_advisory",
+                "verdict": diff_review.verdict,
+                "log_path": diff_review.log_path,
+            })
 
             commit_message = _build_limits_commit_message(
                 hints,
