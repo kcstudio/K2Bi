@@ -836,8 +836,24 @@ def _make_limits_plan_review_request(
         path=proposal_path,
         files=[proposal_rel],
         focus=(
-            "Review this operator-approved limits proposal for safety impact, "
-            "stale patch risk, validator weakening, and config gate bypass."
+            "Deployment context: K2Bi is a SINGLE-OPERATOR PAPER-TRADING system. "
+            "This limits proposal is applied by the apply_approved_limits adapter, "
+            "which atomically writes and sha-verifies both files, binds a dual-sha "
+            "operator-approval token to the config bytes, and rolls back on any "
+            "failed gate -- so config drift, stale-patch detection, atomic write, "
+            "and rollback are ALREADY enforced by the adapter and are OUT OF SCOPE. "
+            "A whitelisted ticker is tradeable ONLY by a strategy that itself "
+            "passed the separate strategy-ship gate, so strategy-to-ticker coupling "
+            "is OUT OF SCOPE here. Review ONLY for IN-SCOPE proposal defects: the "
+            "`## YAML Patch` not matching the stated `## Change` before/after; a "
+            "wrong rule / change_type / ticker / field; a patch that WEAKENS a "
+            "validator (loosens a threshold, removes a guard, widens a limit); "
+            "malformed frontmatter; or a real config-gate bypass. Do NOT raise "
+            "production-infrastructure or process concerns (CI, two-person rule, "
+            "per-ticker validator calibration, emergency-removal tooling, "
+            "/invest-ship internals, feature flags, canary/shadow mode) -- those "
+            "are out of scope for a single-operator paper limits proposal. Return "
+            "NEEDS-ATTENTION ONLY for an in-scope defect; otherwise APPROVE."
         ),
         required_primary=required_primary,
     )
@@ -2018,9 +2034,15 @@ def _build_strategy_commit_message(
 
 def _strategy_plan_review_focus() -> str:
     return (
-        "Review this proposed strategy spec for look-ahead bias, unrealistic "
-        "order assumptions, regime_filter mismatch, weak How This Works clarity, "
-        "and any K2Bi safety gate bypass."
+        "Deployment context: K2Bi is a SINGLE-OPERATOR PAPER-TRADING system; the "
+        "run_full_ship adapter owns atomic write, sha-binding, commit, and "
+        "rollback (OUT OF SCOPE). Review this proposed strategy spec for IN-SCOPE "
+        "defects ONLY: look-ahead bias, unrealistic order assumptions, "
+        "regime_filter mismatch, weak How-This-Works clarity, and any real K2Bi "
+        "safety-gate bypass. Do NOT raise production-infrastructure or process "
+        "concerns (CI, two-person rule, deployment tooling, monitoring/alerting, "
+        "per-ticker infra) -- out of scope for a single-operator paper strategy. "
+        "NEEDS-ATTENTION ONLY for an in-scope strategy defect."
     )
 
 
