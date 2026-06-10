@@ -3,9 +3,11 @@ tags: [review, strategy-approvals, limits-proposal]
 date: 2026-06-09
 type: limits-proposal
 origin: keith
-status: proposed
+status: approved
 applies-to: execution/validators/config.yaml
 up: "[[index]]"
+approved_at: '2026-06-10T14:07:25.271029+00:00'
+approved_commit_sha: 43e7655
 ---
 
 # Limits Proposal: add CDNS to symbols
