@@ -2475,3 +2475,19 @@ distilled-rule: "When verification gates include an operator-override escape hat
 **Follow-ups:** After PR #11 merges to main, /sync the `scripts` category to the VPS, then re-run K2B's parked A4 (`retry-limits 2026-06-09-001` -> re-dispatch `k2bi-apply-limits` -> verify -> terminal_limits_applied, CDNS whitelisted) and A3 (address CDNS strategy findings -> `retry-ship 2026-06-07-001` -> terminal_shipped).
 
 **Key decisions:** Calibrated the focus PROMPT, not the gate logic or severity threshold -- smallest, most auditable, most reversible lever for a capital path. Shipped as a PR (not direct-to-main) per Keith's explicit request; branched from origin/main to keep the PR free of the unrelated unpushed build-plan docs commit (6d648f7).
+
+## 2026-06-10 -- limits-apply plan review made advisory (Change 6)
+
+**Commit:** `61d26ab` refactor(orchestrator): make limits-apply plan review advisory (Change 6)
+
+**What shipped:** `apply_approved_limits`'s internal PLAN review went from a blocking gate (`_require_review_approved`) to ADVISORY, mirroring Change 5's diff-review downgrade (#13). The plan review still runs and now records a `plan_review_advisory` event (verdict + log_path); a NEEDS-ATTENTION verdict no longer raises. Motivation (Round 4 addendum): the plan review is non-deterministic as a hard gate -- on the identical operator-approved, byte-verified CDNS proposal it APPROVE'd twice, then emitted a NEEDS-ATTENTION header while its body concluded "No findings, verdict should be APPROVE", blocking a clean change. The limits apply is already protected by 8 deterministic/human gates (operator approval, dual-sha token, kill-switch, clean-tree, scope guard, deterministic byte-checks, atomic write + rollback, independent K2B inspector); the LLM plan review was a redundant 9th. Left unchanged: byte-checks, `handle_approve_limits`, commit/rollback, and the `run_full_ship` strategy reviews (still blocking).
+
+**Codex review:** NEEDS-ATTENTION, 1 HIGH (job `2026-06-10T08-01-12Z_97c52b`). HIGH: "advisory plan review leaves Change-vs-YAML-Patch semantic mismatches as an accepted path." Valid observation, DEFERRED (not a Change-6 defect): it is the exact redundant-LLM-review trade-off Keith decided in the Round 4 addendum -- the operator approves the exact proposal bytes (which contain the real YAML Patch, not just the prose) and the byte-check binds committed config to that patch. The recommended fix (a deterministic `## Change`-vs-`## YAML Patch` validator) is a new hardening feature touching `handle_approve_limits`, which this change is instructed to leave unchanged. Filed as a follow-up.
+
+**Tests:** reworked `test_change5_needs_attention_plan_review_still_blocks_and_rolls_back` -> `test_change6_needs_attention_plan_review_is_advisory_byte_check_binds` (NEEDS-ATTENTION plan now COMMITS + advisory event; forced post-handler byte mismatch STILL raises + rolls back) and `test_rejects_plan_review_fallback_or_wrong_primary` -> `test_plan_review_fallback_or_wrong_primary_is_advisory_and_commits`. Kept the byte-mismatch + diff-advisory tests. 68 passed (adapter suite); 141 passed with `test_invest_ship_strategy`. Verified the reworked tests fail under the pre-Change-6 blocking code (non-tautological).
+
+**Feature status change:** none (K2Bi vault has no wiki/concepts roadmap; infrastructure calibration of already-shipped adapters).
+
+**Follow-ups:** Deferred Codex HIGH -- add a deterministic `## Change`-prose vs `## YAML-Patch` semantic-consistency validator to `apply_approved_limits`. After merge, both limits reviews (plan + diff) are advisory live; the deterministic byte-check is the binding mechanical gate.
+
+**Key decisions:** Scoped strictly to the limits apply per the Round 4 addendum -- the strategy/`run_full_ship` reviews stay blocking. Shipped as a PR (not direct-to-main) per Keith's pattern; the untracked CDNS proposal was left alone.
