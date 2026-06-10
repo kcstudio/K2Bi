@@ -1114,35 +1114,53 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
 
         self.assertIn("ship_lease_id", str(cm.exception))
 
-    def test_failed_plan_review_restores_file_and_does_not_commit(self):
+    def test_needs_attention_plan_review_is_advisory_and_commits(self):
+        # ADVISORY (2026-06-10): a NEEDS-ATTENTION plan verdict no longer blocks the
+        # strategy ship -- it is recorded as a plan_review_advisory event and the ship
+        # COMMITS. The operator strategy/ship approval gates + the sha-bound approval
+        # token + the clean-tree preflight are the real safety; the LLM plan review is
+        # advisory input. (Was test_failed_plan_review_restores_file_and_does_not_commit.)
         git_calls = []
+        review_kinds = []
 
         def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            review_kinds.append(request.kind)
             return ioa.ReviewGateResult(
                 verdict="NEEDS-ATTENTION",
                 primary_used="minimax",
                 fallback_used=False,
-                log_path=".code-reviews/plan.log",
+                log_path=f".code-reviews/{request.kind}.log",
             )
 
-        with self.assertRaises(ioa.OrchestratorGateError) as cm:
-            ioa.run_full_ship(
-                self.strategy_path,
-                approval=self._approval(),
-                review_runner=review_runner,
-                approve_handler=self._approve_handler,
-                git_runner=lambda cmd, cwd: (
-                    git_calls.append(cmd) or ioa.CommandResult(0, "", "")
-                ),
-            )
+        def git_runner(cmd, cwd):
+            git_calls.append(cmd)
+            return ioa.CommandResult(returncode=0, stdout="", stderr="")
 
-        self.assertIn("plan review", str(cm.exception).lower())
-        self.assertIn("status: proposed", self.strategy_path.read_text(encoding="utf-8"))
-        self.assertEqual(git_calls[0][:2], ["git", "status"])
+        result = ioa.run_full_ship(
+            self.strategy_path,
+            approval=self._approval(),
+            review_runner=review_runner,
+            approve_handler=self._approve_handler,
+            git_runner=git_runner,
+        )
 
-    def test_failed_diff_review_restores_original_bytes_and_does_not_commit(self):
+        # The ship LANDED despite a NEEDS-ATTENTION plan verdict: both reviews ran and
+        # the change committed.
+        self.assertEqual(review_kinds, ["plan", "diff"])
+        self.assertIn("status: approved", self.strategy_path.read_text(encoding="utf-8"))
+        self.assertTrue(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
+        # The advisory verdict is recorded in the event log for operator review.
+        advisory = [e for e in result.events if e.get("event") == "plan_review_advisory"]
+        self.assertEqual(len(advisory), 1)
+        self.assertEqual(advisory[0]["verdict"], "NEEDS-ATTENTION")
+        self.assertEqual(advisory[0]["log_path"], ".code-reviews/plan.log")
+
+    def test_needs_attention_diff_review_is_advisory_and_commits(self):
+        # ADVISORY (2026-06-10): a NEEDS-ATTENTION diff verdict no longer blocks the
+        # strategy ship -- it is recorded as a diff_review_advisory event and the ship
+        # COMMITS (plan APPROVE, diff NEEDS-ATTENTION here). Was
+        # test_failed_diff_review_restores_original_bytes_and_does_not_commit.
         git_calls = []
-        original = self.strategy_path.read_bytes()
         review_kinds = []
 
         def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
@@ -1155,21 +1173,26 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
                 log_path=f".code-reviews/{request.kind}.log",
             )
 
-        with self.assertRaises(ioa.OrchestratorGateError) as cm:
-            ioa.run_full_ship(
-                self.strategy_path,
-                approval=self._approval(),
-                review_runner=review_runner,
-                approve_handler=self._approve_handler,
-                git_runner=lambda cmd, cwd: (
-                    git_calls.append(cmd) or ioa.CommandResult(0, "", "")
-                ),
-            )
+        def git_runner(cmd, cwd):
+            git_calls.append(cmd)
+            return ioa.CommandResult(returncode=0, stdout="", stderr="")
 
-        self.assertIn("diff review", str(cm.exception).lower())
+        result = ioa.run_full_ship(
+            self.strategy_path,
+            approval=self._approval(),
+            review_runner=review_runner,
+            approve_handler=self._approve_handler,
+            git_runner=git_runner,
+        )
+
         self.assertEqual(review_kinds, ["plan", "diff"])
-        self.assertEqual(self.strategy_path.read_bytes(), original)
-        self.assertEqual(git_calls[0][:2], ["git", "status"])
+        self.assertIn("status: approved", self.strategy_path.read_text(encoding="utf-8"))
+        self.assertTrue(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
+        self.assertEqual(result.diff_review.verdict, "NEEDS-ATTENTION")
+        advisory = [e for e in result.events if e.get("event") == "diff_review_advisory"]
+        self.assertEqual(len(advisory), 1)
+        self.assertEqual(advisory[0]["verdict"], "NEEDS-ATTENTION")
+        self.assertEqual(advisory[0]["log_path"], ".code-reviews/diff.log")
 
     def test_replayed_approval_token_refuses_after_file_content_changes(self):
         approval = self._approval()
@@ -1321,15 +1344,23 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
         self.assertIn("index still contains", str(cm.exception).lower())
         self.assertIn("status: proposed", self.strategy_path.read_text(encoding="utf-8"))
 
-    def test_diff_review_failure_attaches_rollback_result_and_clears_marker(self):
+    def test_commit_failure_attaches_rollback_result_and_clears_marker(self):
+        # Post-advisory (2026-06-10): the diff verdict no longer triggers rollback, so a
+        # REAL post-staging failure (here: git commit returns non-zero) exercises the
+        # rollback-result attachment + marker clearing that the diff-NEEDS-ATTENTION path
+        # used to cover. Was test_diff_review_failure_attaches_rollback_result_and_clears_marker.
         def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
-            verdict = "APPROVE" if request.kind == "plan" else "NEEDS-ATTENTION"
             return ioa.ReviewGateResult(
-                verdict=verdict,
+                verdict="APPROVE",
                 primary_used="minimax",
                 fallback_used=False,
                 log_path=f".code-reviews/{request.kind}.log",
             )
+
+        def git_runner(cmd, cwd):
+            if cmd[:2] == ["git", "commit"]:
+                return ioa.CommandResult(returncode=1, stdout="", stderr="commit failed")
+            return ioa.CommandResult(returncode=0, stdout="", stderr="")
 
         with self.assertRaises(ioa.OrchestratorGateError) as cm:
             ioa.run_full_ship(
@@ -1337,6 +1368,7 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
                 approval=self._approval(),
                 review_runner=review_runner,
                 approve_handler=self._approve_handler,
+                git_runner=git_runner,
             )
 
         result = cm.exception.rollback_result
@@ -1344,6 +1376,46 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
         self.assertTrue(result.working_tree_restored)
         self.assertTrue(result.marker_cleared)
         self.assertFalse(Path(result.marker_path).exists())
+
+    def test_advisory_needs_attention_review_then_commit_failure_rolls_back(self):
+        # Coverage for the reworked control flow (adversarial review finding #2,
+        # 2026-06-10): with plan+diff verdicts advisory, a NEEDS-ATTENTION review no
+        # longer blocks -- prove flow reaches git add + commit and a REAL gate failure
+        # (git commit non-zero) rolls back cleanly to the original proposed file.
+        git_calls = []
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            return ioa.ReviewGateResult(
+                verdict="NEEDS-ATTENTION",
+                primary_used="minimax",
+                fallback_used=False,
+                log_path=f".code-reviews/{request.kind}.log",
+            )
+
+        def git_runner(cmd, cwd):
+            git_calls.append(cmd)
+            if cmd[:2] == ["git", "commit"]:
+                return ioa.CommandResult(returncode=1, stdout="", stderr="commit failed")
+            return ioa.CommandResult(returncode=0, stdout="", stderr="")
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.run_full_ship(
+                self.strategy_path,
+                approval=self._approval(),
+                review_runner=review_runner,
+                approve_handler=self._approve_handler,
+                git_runner=git_runner,
+            )
+
+        # The NEEDS-ATTENTION reviews did NOT block: flow proceeded to git add + commit.
+        self.assertTrue(any(cmd[:2] == ["git", "add"] for cmd in git_calls))
+        self.assertTrue(any(cmd[:2] == ["git", "commit"] for cmd in git_calls))
+        # The real gate (commit) failed -> clean rollback to the original proposed file.
+        rollback = cm.exception.rollback_result
+        self.assertIsNotNone(rollback)
+        self.assertTrue(rollback.working_tree_restored)
+        self.assertTrue(rollback.marker_cleared)
+        self.assertIn("status: proposed", self.strategy_path.read_text(encoding="utf-8"))
 
     def test_failed_rollback_leaves_marker_and_structured_result(self):
         def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:

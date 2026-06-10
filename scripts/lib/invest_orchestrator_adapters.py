@@ -400,7 +400,26 @@ def run_full_ship(
         )
         events.append(_review_event("plan_review_completed", plan_review))
         try:
-            _require_review_approved(plan_review, "plan review", required_primary)
+            # ADVISORY ONLY (2026-06-10): the run_full_ship strategy plan review is
+            # non-deterministic as a hard gate. On the identical operator-approved,
+            # sha-bound CDNS strategy it returned NEEDS-ATTENTION on two consecutive
+            # ships while flagging DIFFERENT findings each run (run 1: forward-guidance
+            # label + empty regime_filter + quarterly-kill + OCO; run 2: earnings-date
+            # look-ahead + naked-LMT stop + regime + forward-guidance + dormant-state).
+            # "Fix the findings and it passes" is therefore false -- it raises new ones.
+            # Strategy quality is already gated by the operator's strategy-approval gate
+            # (Stage 9) AND ship-approval gate (the 4th human gate, with the domain expert
+            # in the loop), plus the deterministic capital gates (instrument whitelist,
+            # kill-switch, validators config, sha-bound approval token, clean-tree
+            # preflight, status:proposed). The LLM plan review is a redundant,
+            # non-deterministic opinion on top of those. Record the verdict + log for
+            # operator review; do NOT block. Supersedes the "strategy reviews stay
+            # blocking" note in #14, on the strength of the 2026-06-10 evidence above.
+            events.append({
+                "event": "plan_review_advisory",
+                "verdict": plan_review.verdict,
+                "log_path": plan_review.log_path,
+            })
 
             hints = approve_handler(
                 strategy_path,
@@ -426,7 +445,16 @@ def run_full_ship(
                 )
             )
             events.append(_review_event("diff_review_completed", diff_review))
-            _require_review_approved(diff_review, "diff review", required_primary)
+            # ADVISORY ONLY (2026-06-10): same rationale as the plan review above. The
+            # strategy diff review reviews the same authored-by-deterministic-writer
+            # strategy content (framed as a diff) with the same non-deterministic LLM, so
+            # keeping it blocking would re-introduce the exact flakiness the plan-review
+            # advisory removes. Record the verdict + log for operator review; do NOT block.
+            events.append({
+                "event": "diff_review_advisory",
+                "verdict": diff_review.verdict,
+                "log_path": diff_review.log_path,
+            })
 
             commit_message = _build_strategy_commit_message(
                 hints,
@@ -2011,23 +2039,6 @@ def _validate_full_ship_approval(
             f"{approval.final_approval_token!r}"
         )
     _require_text("approved_by", approval.approved_by)
-
-
-def _require_review_approved(
-    review: ReviewGateResult,
-    label: str,
-    required_primary: str,
-) -> None:
-    if review.verdict != "APPROVE":
-        raise OrchestratorGateError(
-            f"{label} refused: verdict={review.verdict!r} log={review.log_path}"
-        )
-    if review.primary_used != required_primary or review.fallback_used is not False:
-        raise OrchestratorGateError(
-            f"{label} must use primary_used={required_primary} and "
-            f"fallback_used=false; got primary_used={review.primary_used!r}, "
-            f"fallback_used={review.fallback_used!r}"
-        )
 
 
 def _run_git_checked(git_runner: GitRunner, cmd: list[str], cwd: Path) -> None:

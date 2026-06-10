@@ -38,6 +38,7 @@ instrument_whitelist:
   symbols:
     - SPY
     - G
+    - CDNS
 
 rapid_fire_circuit_breaker:
   # Spec B §3: normal cadence is one submit about every 31 seconds per
