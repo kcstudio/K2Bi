@@ -13,7 +13,7 @@ strategy_type: hand_crafted
 risk_envelope_pct: 0.0025
 regime_filter: []
 ticker: CDNS
-status: proposed
+status: approved
 sigid: 2026-06-07-cdns-eda-compute-supply
 thesis_ref: '[[../tickers/CDNS]]'
 order:
@@ -36,6 +36,8 @@ forward_guidance_check:
       locked guide metric reconciles'
     guide_range_text: no quantitative guide
     sits_inside_guide: false
+approved_at: '2026-06-11T03:14:06.199024+00:00'
+approved_commit_sha: 0f7ff66
 ---
 
 # Strategy: cdns
