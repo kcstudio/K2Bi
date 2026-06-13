@@ -89,6 +89,9 @@ excludes:
   - wiki
   # Design docs + research workspace (MacBook dev tier only)
   - proposals
+  # Repo-tracked operator templates and deploy notes. These are copied
+  # manually during gated operator deploys, not rsync-managed payloads.
+  - deploy
   - plans
   - .claude/plans                # duplicate of above for belt-and-braces parsing
   # Agent-facing docs (operator/developer context — content references MacBook paths,

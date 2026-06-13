@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -177,6 +178,169 @@ class Tier1OtherTests(unittest.TestCase):
             "circuit_breaker_cleared_stale_sentinel_rejected",
         )
         self.assertIn("Operator review required", alerts[0].message)
+
+
+class EngineLivenessTests(unittest.TestCase):
+    def test_inactive_engine_fires_tier1_liveness_alert_with_injected_state(self):
+        now = datetime(2026, 6, 15, 14, 40, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir()
+            (state_dir / "alert-state.json").write_text(
+                json.dumps({"kill_switch_state": "clear"}),
+                encoding="utf-8",
+            )
+            alerts, state, changed = ial.run_classification(
+                vault_root=vault_root,
+                state_dir=state_dir,
+                today=date(2026, 6, 15),
+                commit_state=False,
+                now=now,
+                engine_state_reader=lambda: "inactive",
+                market_hours_reader=lambda when: True,
+            )
+        self.assertTrue(changed)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].tier, 1)
+        self.assertEqual(alerts[0].event_type, "engine_liveness")
+        self.assertIn("inactive", alerts[0].message)
+
+    def test_active_engine_with_stale_journal_fires_liveness_alert(self):
+        now = datetime(2026, 6, 15, 14, 40, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir()
+            (state_dir / "alert-state.json").write_text(
+                json.dumps(
+                    {
+                        "last_processed_entry_id": "id01",
+                        "last_processed_ts": "2026-06-15T14:30:00+00:00",
+                        "kill_switch_state": "clear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _seed_journal(
+                vault_root,
+                "2026-06-15",
+                [
+                    _event(
+                        "engine_started",
+                        "id01",
+                        ts="2026-06-15T14:30:00+00:00",
+                    )
+                ],
+            )
+            alerts, _state, changed = ial.run_classification(
+                vault_root=vault_root,
+                state_dir=state_dir,
+                today=date(2026, 6, 15),
+                commit_state=False,
+                now=now,
+                engine_state_reader=lambda: "active",
+                market_hours_reader=lambda when: True,
+                liveness_stale_after_seconds=300,
+            )
+        self.assertTrue(changed)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].tier, 1)
+        self.assertEqual(alerts[0].event_type, "engine_liveness")
+        self.assertIn("journal stale", alerts[0].message)
+
+    def test_active_engine_with_stale_journal_fires_at_exact_threshold(self):
+        now = datetime(2026, 6, 15, 14, 35, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir()
+            (state_dir / "alert-state.json").write_text(
+                json.dumps(
+                    {
+                        "last_processed_entry_id": "id01",
+                        "last_processed_ts": "2026-06-15T14:30:00+00:00",
+                        "kill_switch_state": "clear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _seed_journal(
+                vault_root,
+                "2026-06-15",
+                [
+                    _event(
+                        "engine_started",
+                        "id01",
+                        ts="2026-06-15T14:30:00+00:00",
+                    )
+                ],
+            )
+            alerts, _state, changed = ial.run_classification(
+                vault_root=vault_root,
+                state_dir=state_dir,
+                today=date(2026, 6, 15),
+                commit_state=False,
+                now=now,
+                engine_state_reader=lambda: "active",
+                market_hours_reader=lambda when: True,
+                liveness_stale_after_seconds=300,
+            )
+        self.assertTrue(changed)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].event_type, "engine_liveness")
+
+    def test_stale_journal_dedup_key_ignores_threshold_config_change(self):
+        now = datetime(2026, 6, 15, 14, 40, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td:
+            vault_root = Path(td) / "vault"
+            state_dir = Path(td) / "state"
+            state_dir.mkdir()
+            (state_dir / "alert-state.json").write_text(
+                json.dumps(
+                    {
+                        "last_processed_entry_id": "id01",
+                        "last_processed_ts": "2026-06-15T14:30:00+00:00",
+                        "kill_switch_state": "clear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _seed_journal(
+                vault_root,
+                "2026-06-15",
+                [
+                    _event(
+                        "engine_started",
+                        "id01",
+                        ts="2026-06-15T14:30:00+00:00",
+                    )
+                ],
+            )
+            first_alerts, first_state, _changed = ial.run_classification(
+                vault_root=vault_root,
+                state_dir=state_dir,
+                today=date(2026, 6, 15),
+                commit_state=True,
+                now=now,
+                engine_state_reader=lambda: "active",
+                market_hours_reader=lambda when: True,
+                liveness_stale_after_seconds=300,
+            )
+            second_alerts, _second_state, second_changed = ial.run_classification(
+                vault_root=vault_root,
+                state_dir=state_dir,
+                today=date(2026, 6, 15),
+                commit_state=False,
+                now=now,
+                engine_state_reader=lambda: "active",
+                market_hours_reader=lambda when: True,
+                liveness_stale_after_seconds=120,
+            )
+        self.assertEqual(len(first_alerts), 1)
+        self.assertIsNotNone(first_state.alerted_liveness_key)
+        self.assertEqual(second_alerts, [])
+        self.assertFalse(second_changed)
 
 
 # ---------------------------------------------------------------------------

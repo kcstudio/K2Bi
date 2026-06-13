@@ -114,6 +114,7 @@ EXTENDED_CHECKPOINT_LOOKBACK = timedelta(days=30)
 EXTENDED_CHECKPOINT_EVENT_TYPES: frozenset[str] = frozenset(
     {"engine_recovered", "orphan_stop_adopted"}
 )
+ADOPTED_ORPHAN_AVG_PRICE_EPSILON = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,20 @@ class OrphanStopAdoptionRequest:
 
     perm_id: int
     justification: str
+
+
+@dataclass(frozen=True)
+class AdoptedOrphanStop:
+    """Latest journaled human adoption state for one orphan STOP permId."""
+
+    perm_id: int
+    ticker: str
+    qty: int
+    stop_price: Decimal
+    source: str
+    adopted_at: str
+    justification: str
+    journal_entry_id: str | None = None
 
 
 def _parse_adopt_orphan_stop(raw: str | None) -> OrphanStopAdoptionRequest | None:
@@ -165,6 +180,69 @@ def _parse_adopt_orphan_stop(raw: str | None) -> OrphanStopAdoptionRequest | Non
             f"{ADOPT_ORPHAN_STOP_ENV} justification must be non-empty"
         )
     return OrphanStopAdoptionRequest(perm_id=perm_id, justification=just)
+
+
+def _adopted_orphan_stops_by_perm_id(
+    records: Iterable[dict[str, Any]],
+) -> dict[str, AdoptedOrphanStop]:
+    """Latest valid orphan STOP adoption payload per permId.
+
+    This is the capital-path version of the older permId-only helper:
+    recognition requires the broker order and held position to still
+    match the human-adopted permId, ticker, quantity, and trigger.
+    """
+    out: dict[str, AdoptedOrphanStop] = {}
+    for rec in records:
+        if rec.get("event_type") != "orphan_stop_adopted":
+            continue
+        payload = rec.get("payload") or {}
+        perm = payload.get("permId")
+        ticker = payload.get("ticker")
+        qty = payload.get("qty")
+        source = payload.get("source")
+        adopted_at = payload.get("adopted_at")
+        justification = payload.get("justification")
+        try:
+            if isinstance(perm, bool) or int(perm) <= 0:
+                continue
+            if not isinstance(ticker, str) or not ticker.strip():
+                continue
+            if isinstance(qty, bool) or int(qty) == 0:
+                continue
+            stop_price = Decimal(str(payload.get("stop_price")))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not stop_price.is_finite() or stop_price <= 0:
+            continue
+        if not isinstance(source, str) or not source:
+            continue
+        if not isinstance(adopted_at, str) or not adopted_at:
+            continue
+        if not isinstance(justification, str) or not justification.strip():
+            continue
+        out[str(int(perm))] = AdoptedOrphanStop(
+            perm_id=int(perm),
+            ticker=ticker,
+            qty=int(qty),
+            stop_price=stop_price,
+            source=source,
+            adopted_at=adopted_at,
+            justification=justification,
+            journal_entry_id=(
+                str(rec.get("journal_entry_id"))
+                if rec.get("journal_entry_id") is not None
+                else None
+            ),
+        )
+    return out
+
+
+def _avg_prices_equivalent_for_adopted_stop(
+    left: Decimal,
+    right: Decimal,
+) -> bool:
+    """Return True when avg_price drift is cent-level rounding noise."""
+    return abs(left - right) <= ADOPTED_ORPHAN_AVG_PRICE_EPSILON
 
 
 def _adopted_orphan_perm_ids(records: Iterable[dict[str, Any]]) -> set[str]:
@@ -364,29 +442,11 @@ def reconcile(
     status_index = _index_status_events(broker_order_status)
     open_index = _index_open_orders(broker_open_orders)
     seen_broker_ids: set[str] = set()
-    # Q42: orphan_stop_adopted events from prior recovery passes pre-mark
-    # their permIds as known so the Phase B.1 orphan loop skips them.
-    # Same recognition mechanism Phase A's perm/oid matching uses.
-    # Q42 +1 week carry-forward (2026-05-03) extends the lookup window
-    # via `_read_extended_checkpoints` so multi-day engine-off gaps
-    # don't re-flag adopted orphans as phantoms. Capital-path safety
-    # gate per cross-mode adversarial review (Kimi + Codex 2026-05-03):
-    # an adopted permId only suppresses phantom_open_order when the
-    # broker STILL HOLDS a position in the order's ticker. A stale
-    # adoption whose underlying position has been closed must fall
-    # through to phantom detection -- the orphan STOP would otherwise
-    # be live at the broker without an associated long position to
-    # protect, and engine state cannot reason about it safely.
-    adopted_perm_to_ticker = _adopted_orphan_perm_id_to_ticker(journal_tail)
-    broker_position_tickers = {p.ticker for p in broker_positions}
-    for adopted_perm in _adopted_orphan_perm_ids(journal_tail):
-        ticker = adopted_perm_to_ticker.get(str(adopted_perm))
-        if ticker is not None and ticker not in broker_position_tickers:
-            # Stale orphan adoption: ticker no longer at broker.
-            # Skip the carry-forward; phantom_open_order will fire
-            # for the live STOP order and surface the divergence.
-            continue
-        seen_broker_ids.add(f"perm:{adopted_perm}")
+    # Q42/A-i: prior human adoptions are considered later, after
+    # projected positions are known. Recognition is exact-state based,
+    # not permId-only: the same stop must still protect the same held
+    # position or recovery re-refuses.
+    adopted_orphan_stops = _adopted_orphan_stops_by_perm_id(journal_tail)
     # Per-ticker (signed_qty_delta, last_broker_avg_fill_price).
     # Positive qty means the pending was a buy that filled, growing
     # inventory; negative means a sell that filled, reducing it.
@@ -610,6 +670,113 @@ def reconcile(
             else:
                 new_avg = old_avg
             projected_by_ticker[ticker] = (new_qty, new_avg)
+
+    broker_by_ticker = {p.ticker: p for p in broker_positions}
+
+    # ---- Q42/A-i: exact-state renewal for human-adopted orphan STOPs ----
+    #
+    # This preserves the human-first adoption gate: a broker orphan is
+    # recognized only if an earlier orphan_stop_adopted record exists.
+    # The renewal is automatic only while the broker still holds the
+    # same position and the same STOP identity (permId/qty/trigger).
+    # Any drift falls through to phantom detection and also emits a
+    # specific drift mismatch for operator review.
+    open_by_perm = {
+        str(o.broker_perm_id): o
+        for o in broker_open_orders
+        if o.broker_perm_id is not None
+    }
+    renewal_events: list[ReconciliationEvent] = []
+    for perm, adoption in adopted_orphan_stops.items():
+        open_order = open_by_perm.get(perm)
+        if open_order is None:
+            continue
+        broker_pos = broker_by_ticker.get(adoption.ticker)
+        projected = projected_by_ticker.get(adoption.ticker)
+        if broker_pos is None or projected is None:
+            # Do not pre-mark this permId as seen. A live adopted STOP
+            # without a matching held position is a naked stop and must
+            # fall through Phase B.1 as phantom_open_order.
+            continue
+        projected_qty, projected_avg = projected
+        order_type_norm = (open_order.order_type or "").upper().strip()
+        drift_reasons: list[str] = []
+        if open_order.ticker != adoption.ticker:
+            drift_reasons.append("ticker")
+        if open_order.qty != adoption.qty:
+            drift_reasons.append("qty")
+        if open_order.aux_price != adoption.stop_price:
+            drift_reasons.append("stop_price")
+        if open_order.side.lower() != "sell":
+            drift_reasons.append("side")
+        if order_type_norm not in ("STP", "STP LMT"):
+            drift_reasons.append("order_type")
+        if broker_pos.qty != adoption.qty or projected_qty != adoption.qty:
+            drift_reasons.append("position_qty")
+        if not _avg_prices_equivalent_for_adopted_stop(
+            broker_pos.avg_price,
+            projected_avg,
+        ):
+            drift_reasons.append("position_avg_price")
+        if drift_reasons:
+            mismatches.append(
+                {
+                    "case": "adopted_orphan_stop_drift",
+                    "broker_perm_id": open_order.broker_perm_id,
+                    "ticker": adoption.ticker,
+                    "drift_fields": drift_reasons,
+                    "adopted": {
+                        "permId": adoption.perm_id,
+                        "ticker": adoption.ticker,
+                        "qty": adoption.qty,
+                        "stop_price": str(adoption.stop_price),
+                        "adopted_at": adoption.adopted_at,
+                        "journal_entry_id": adoption.journal_entry_id,
+                    },
+                    "broker": {
+                        "ticker": open_order.ticker,
+                        "qty": open_order.qty,
+                        "stop_price": str(open_order.aux_price),
+                        "side": open_order.side,
+                        "order_type": open_order.order_type,
+                        "position_qty": broker_pos.qty,
+                        "position_avg_price": str(broker_pos.avg_price),
+                    },
+                    "reason": (
+                        "previous human adoption exists, but the broker "
+                        "stop or held position no longer matches it; "
+                        "operator must re-review before relaunching"
+                    ),
+                }
+            )
+            continue
+        seen_broker_ids.add(f"perm:{perm}")
+        if open_order.broker_order_id:
+            seen_broker_ids.add(f"oid:{open_order.broker_order_id}")
+        from ..journal.schema import validate_orphan_stop_adopted_payload
+
+        renewal_payload = {
+            "permId": adoption.perm_id,
+            "ticker": adoption.ticker,
+            "qty": adoption.qty,
+            "stop_price": str(adoption.stop_price),
+            "source": adoption.source,
+            "adopted_at": now.isoformat(),
+            "justification": (
+                "renewed unchanged human adoption"
+                f" from {adoption.journal_entry_id or adoption.adopted_at}"
+            ),
+        }
+        validate_orphan_stop_adopted_payload(renewal_payload)
+        renewal_events.append(
+            ReconciliationEvent(
+                event_type="orphan_stop_adopted",
+                payload=renewal_payload,
+                ticker=adoption.ticker,
+                broker_order_id=open_order.broker_order_id,
+                broker_perm_id=perm,
+            )
+        )
 
     # ---- Phase B.1: phantom open orders ----
 
@@ -869,8 +1036,6 @@ def reconcile(
         )
 
     # ---- Phase B.2: position diff against projected state ----
-
-    broker_by_ticker = {p.ticker: p for p in broker_positions}
 
     for ticker, broker_pos in broker_by_ticker.items():
         projected = projected_by_ticker.get(ticker)
@@ -1342,6 +1507,9 @@ def reconcile(
                 )
 
     # ---- 4. status assembly ----
+
+    if not mismatches and renewal_events:
+        events.extend(renewal_events)
 
     if not mismatches and not events and not broker_positions and not broker_open_orders:
         status = RecoveryStatus.CLEAN
