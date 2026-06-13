@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Allow importing execution.* when this file is run directly (cron path)
 if __name__ == "__main__" and __package__ is None:
@@ -31,8 +32,10 @@ if __name__ == "__main__" and __package__ is None:
 from execution.risk.kill_switch import _scan_kill_paths, is_killed
 
 DEFAULT_OUTAGE_THRESHOLD_S = 300
+DEFAULT_LIVENESS_STALE_AFTER_S = 300
 DEFAULT_VAULT_ROOT = Path.home() / "Projects" / "K2Bi-Vault"
 DEFAULT_STATE_DIR = Path.home() / ".k2bi"
+ENGINE_SERVICE = "k2bi-engine.service"
 
 # Journal files are named YYYY-MM-DD.jsonl in raw/journal/
 JOURNAL_DIR = "raw/journal"
@@ -81,6 +84,7 @@ class ClassifierState:
     last_processed_ts: str | None = None
     alerted_outage_start_ts: str | None = None  # first disconnect_status ts of current alerted outage
     kill_switch_state: str = "unknown"  # "unknown" | "clear" | "active"
+    alerted_liveness_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +92,7 @@ class ClassifierState:
             "last_processed_ts": self.last_processed_ts,
             "alerted_outage_start_ts": self.alerted_outage_start_ts,
             "kill_switch_state": self.kill_switch_state,
+            "alerted_liveness_key": self.alerted_liveness_key,
         }
 
     @classmethod
@@ -97,6 +102,7 @@ class ClassifierState:
             last_processed_ts=d.get("last_processed_ts"),
             alerted_outage_start_ts=d.get("alerted_outage_start_ts"),
             kill_switch_state=d.get("kill_switch_state", "unknown"),
+            alerted_liveness_key=d.get("alerted_liveness_key"),
         )
 
 
@@ -437,6 +443,149 @@ def _build_kill_switch_clear_alert() -> Alert:
     )
 
 
+def _read_engine_systemd_state() -> str:
+    """Return systemd is-active state for the engine service."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", ENGINE_SERVICE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _is_market_hours_utc(now: datetime) -> bool:
+    """Approximate US regular session for liveness journal-staleness checks."""
+    utc_now = now.astimezone(timezone.utc)
+    if utc_now.weekday() >= 5:
+        return False
+    minutes = utc_now.hour * 60 + utc_now.minute
+    return (13 * 60 + 30) <= minutes <= (20 * 60)
+
+
+def _build_engine_liveness_alert(
+    *,
+    now: datetime,
+    reason: str,
+    engine_state: str,
+    latest_event: dict[str, Any] | None,
+    stale_seconds: float | None = None,
+) -> Alert:
+    latest_ts = latest_event.get("ts") if latest_event else "none"
+    latest_id = latest_event.get("journal_entry_id") if latest_event else "none"
+    lines = [
+        "🔴 T1: engine_liveness",
+        f"Reason: {reason}",
+        f"systemd: {engine_state}",
+        f"Latest journal: {latest_ts}",
+    ]
+    if stale_seconds is not None:
+        lines.append(f"Stale for: {_fmt_outage(stale_seconds)}")
+    return Alert(
+        tier=1,
+        event_type="engine_liveness",
+        journal_entry_id=str(latest_id or ""),
+        ts=now.isoformat(),
+        message="\n".join(lines),
+        context={
+            "reason": reason,
+            "engine_state": engine_state,
+            "latest_journal_ts": latest_ts,
+            "stale_seconds": stale_seconds,
+        },
+    )
+
+
+def _liveness_alerts(
+    *,
+    state: ClassifierState,
+    vault_root: Path,
+    today: datetime.date | None,
+    now: datetime,
+    engine_state_reader: Callable[[], str],
+    market_hours_reader: Callable[[datetime], bool],
+    stale_after_seconds: int,
+) -> tuple[list[Alert], bool]:
+    engine_state = engine_state_reader()
+    latest_event = _find_latest_journal_event(vault_root, today)
+    alerts: list[Alert] = []
+    changed = False
+
+    if engine_state == "unknown":
+        return alerts, changed
+
+    if engine_state != "active":
+        key = f"inactive:{engine_state}"
+        if state.alerted_liveness_key != key:
+            state.alerted_liveness_key = key
+            changed = True
+            alerts.append(
+                _build_engine_liveness_alert(
+                    now=now,
+                    reason=f"engine inactive ({engine_state})",
+                    engine_state=engine_state,
+                    latest_event=latest_event,
+                )
+            )
+        return alerts, changed
+
+    if latest_event is None:
+        if not market_hours_reader(now):
+            state.alerted_liveness_key = None
+            return alerts, changed
+        key = "stale:no-journal"
+        if state.alerted_liveness_key != key:
+            state.alerted_liveness_key = key
+            changed = True
+            alerts.append(
+                _build_engine_liveness_alert(
+                    now=now,
+                    reason="journal stale: no journal event found",
+                    engine_state=engine_state,
+                    latest_event=None,
+                    stale_seconds=None,
+                )
+            )
+        return alerts, changed
+
+    latest_ts_raw = latest_event.get("ts")
+    try:
+        latest_ts = datetime.fromisoformat(
+            str(latest_ts_raw).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        latest_ts = None
+    if latest_ts is None:
+        return alerts, changed
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+    stale_seconds = (
+        now.astimezone(timezone.utc) - latest_ts.astimezone(timezone.utc)
+    ).total_seconds()
+    if stale_seconds >= stale_after_seconds and market_hours_reader(now):
+        key = f"stale:{latest_event.get('journal_entry_id')}"
+        if state.alerted_liveness_key != key:
+            state.alerted_liveness_key = key
+            changed = True
+            alerts.append(
+                _build_engine_liveness_alert(
+                    now=now,
+                    reason="journal stale",
+                    engine_state=engine_state,
+                    latest_event=latest_event,
+                    stale_seconds=stale_seconds,
+                )
+            )
+    elif state.alerted_liveness_key is not None:
+        state.alerted_liveness_key = None
+        changed = True
+    return alerts, changed
+
+
 def classify_events(
     events: list[dict[str, Any]],
     state: ClassifierState,
@@ -448,6 +597,8 @@ def classify_events(
         last_processed_entry_id=state.last_processed_entry_id,
         last_processed_ts=state.last_processed_ts,
         alerted_outage_start_ts=state.alerted_outage_start_ts,
+        kill_switch_state=state.kill_switch_state,
+        alerted_liveness_key=state.alerted_liveness_key,
     )
 
     # Track the current contiguous disconnect sequence.
@@ -525,6 +676,10 @@ def run_classification(
     threshold: int | None = None,
     today: datetime.date | None = None,
     commit_state: bool = True,
+    now: datetime | None = None,
+    engine_state_reader: Callable[[], str] | None = None,
+    market_hours_reader: Callable[[datetime], bool] | None = None,
+    liveness_stale_after_seconds: int | None = None,
 ) -> tuple[list[Alert], ClassifierState, bool]:
     """Main entry point: load state, read journal, classify, optionally save state.
 
@@ -536,6 +691,19 @@ def run_classification(
         state_dir = Path(os.environ.get("K2BI_ALERT_STATE_DIR", DEFAULT_STATE_DIR)).expanduser()
     if threshold is None:
         threshold = int(os.environ.get("K2BI_ALERT_OUTAGE_THRESHOLD_S", DEFAULT_OUTAGE_THRESHOLD_S))
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if engine_state_reader is None:
+        engine_state_reader = _read_engine_systemd_state
+    if market_hours_reader is None:
+        market_hours_reader = _is_market_hours_utc
+    if liveness_stale_after_seconds is None:
+        liveness_stale_after_seconds = int(
+            os.environ.get(
+                "K2BI_ENGINE_LIVENESS_STALE_THRESHOLD_S",
+                DEFAULT_LIVENESS_STALE_AFTER_S,
+            )
+        )
 
     state, state_file_existed = load_state(state_dir)
 
@@ -579,12 +747,26 @@ def run_classification(
 
     events = _iter_new_events(vault_root, state, today)
     alerts, new_state = classify_events(events, state, threshold)
+    liveness_alerts, liveness_changed = _liveness_alerts(
+        state=new_state,
+        vault_root=vault_root,
+        today=today,
+        now=now,
+        engine_state_reader=engine_state_reader,
+        market_hours_reader=market_hours_reader,
+        stale_after_seconds=liveness_stale_after_seconds,
+    )
 
-    # Merge kill-switch alerts at the front
-    alerts = kill_switch_alerts + alerts
+    # Merge state-derived alerts at the front
+    alerts = kill_switch_alerts + liveness_alerts + alerts
     new_state.kill_switch_state = current_kill_state
 
-    state_changed = bool(events) or bool(kill_switch_alerts) or kill_switch_state_changed
+    state_changed = (
+        bool(events)
+        or bool(kill_switch_alerts)
+        or kill_switch_state_changed
+        or liveness_changed
+    )
     if state_changed and commit_state:
         save_state(new_state, state_dir)
     return alerts, new_state, state_changed

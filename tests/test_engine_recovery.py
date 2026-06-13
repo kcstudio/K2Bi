@@ -3246,12 +3246,444 @@ class Q42OrphanStopAdoptionTests(unittest.TestCase):
             f"pass 2 should be CATCH_UP (perm in journal), got "
             f"{pass2.status} mismatches={pass2.mismatch_reasons}",
         )
-        # Pass 2 must NOT write another adoption event -- it's already
-        # in the journal.
+        # A-i self-renews the human adoption while the stop and
+        # position remain unchanged, so the next restart has a fresh
+        # orphan_stop_adopted checkpoint instead of a fixed 30-day
+        # expiry.
         new_adoptions = [
             e for e in pass2.events if e.event_type == "orphan_stop_adopted"
         ]
-        self.assertEqual(new_adoptions, [])
+        self.assertEqual(len(new_adoptions), 1)
+        self.assertEqual(new_adoptions[0].payload["permId"], 1888063981)
+        self.assertIn(
+            "renew", new_adoptions[0].payload["justification"].lower()
+        )
+
+    def test_q42_self_renews_prior_human_adoption_when_stop_and_position_unchanged(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[self._engine_recovered_journal(), old_adoption],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.22")
+                )
+            ],
+            broker_open_orders=[self._orphan_stop(perm_id="1888063981")],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status,
+            recovery.RecoveryStatus.CATCH_UP,
+            f"unchanged adopted orphan should recover; got "
+            f"{result.status} mismatches={result.mismatch_reasons}",
+        )
+        renewals = [
+            e for e in result.events if e.event_type == "orphan_stop_adopted"
+        ]
+        self.assertEqual(len(renewals), 1)
+        self.assertEqual(renewals[0].payload["permId"], 1888063981)
+        self.assertEqual(renewals[0].payload["ticker"], "SPY")
+        self.assertEqual(renewals[0].payload["qty"], 2)
+        self.assertEqual(renewals[0].payload["stop_price"], "697.13")
+        self.assertEqual(renewals[0].payload["adopted_at"], NOW.isoformat())
+        self.assertIn("renew", renewals[0].payload["justification"].lower())
+
+    def test_q42_old_expired_adoption_recovers_only_when_history_is_present(self):
+        old_adoption = {
+            "ts": "2026-04-01T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-expired-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-04-01T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        position_seed = self._engine_recovered_journal()
+        positions = [
+            BrokerPosition(
+                ticker="SPY", qty=2, avg_price=Decimal("707.22")
+            )
+        ]
+        orphan = self._orphan_stop(perm_id="1888063981")
+
+        old_window = recovery.reconcile(
+            journal_tail=[position_seed],
+            broker_positions=positions,
+            broker_open_orders=[orphan],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            old_window.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        self.assertIn(
+            "phantom_open_order",
+            [m["case"] for m in old_window.mismatch_reasons],
+        )
+
+        new_history = recovery.reconcile(
+            journal_tail=[old_adoption, position_seed],
+            broker_positions=positions,
+            broker_open_orders=[orphan],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            new_history.status,
+            recovery.RecoveryStatus.CATCH_UP,
+            f"expired but unchanged adoption should self-renew; "
+            f"mismatches={new_history.mismatch_reasons}",
+        )
+        renewals = [
+            e
+            for e in new_history.events
+            if e.event_type == "orphan_stop_adopted"
+        ]
+        self.assertEqual(len(renewals), 1)
+
+    def test_q42_self_renewal_allows_avg_price_rounding_noise(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[
+                self._engine_recovered_journal(avg_price="707.224"),
+                old_adoption,
+            ],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.22")
+                )
+            ],
+            broker_open_orders=[self._orphan_stop(perm_id="1888063981")],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status,
+            recovery.RecoveryStatus.CATCH_UP,
+            f"cent-level avg_price rounding noise must not refuse; "
+            f"mismatches={result.mismatch_reasons}",
+        )
+
+    def test_q42_self_renewal_refuses_real_avg_price_drift(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[
+                self._engine_recovered_journal(avg_price="707.22"),
+                old_adoption,
+            ],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.25")
+                )
+            ],
+            broker_open_orders=[self._orphan_stop(perm_id="1888063981")],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        drift = [
+            m
+            for m in result.mismatch_reasons
+            if m["case"] == "adopted_orphan_stop_drift"
+        ]
+        self.assertEqual(len(drift), 1)
+        self.assertIn("position_avg_price", drift[0]["drift_fields"])
+
+    def test_q42_self_renewal_refuses_when_adopted_stop_qty_drifted(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[self._engine_recovered_journal(), old_adoption],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.22")
+                )
+            ],
+            broker_open_orders=[
+                self._orphan_stop(perm_id="1888063981", qty=1)
+            ],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        cases = [m["case"] for m in result.mismatch_reasons]
+        self.assertIn("adopted_orphan_stop_drift", cases)
+        self.assertIn("phantom_open_order", cases)
+        self.assertEqual(
+            [
+                e
+                for e in result.events
+                if e.event_type == "orphan_stop_adopted"
+            ],
+            [],
+        )
+
+    def test_q42_self_renewal_refuses_when_adopted_stop_price_drifted(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[self._engine_recovered_journal(), old_adoption],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.22")
+                )
+            ],
+            broker_open_orders=[
+                self._orphan_stop(
+                    perm_id="1888063981", aux_price="650.00"
+                )
+            ],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        drift = [
+            m
+            for m in result.mismatch_reasons
+            if m["case"] == "adopted_orphan_stop_drift"
+        ]
+        self.assertEqual(len(drift), 1)
+        self.assertIn("stop_price", drift[0]["drift_fields"])
+        self.assertEqual(
+            [
+                e
+                for e in result.events
+                if e.event_type == "orphan_stop_adopted"
+            ],
+            [],
+        )
+
+    def test_q42_self_renewal_refuses_when_adopted_stop_perm_id_changed(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[self._engine_recovered_journal(), old_adoption],
+            broker_positions=[
+                BrokerPosition(
+                    ticker="SPY", qty=2, avg_price=Decimal("707.22")
+                )
+            ],
+            broker_open_orders=[
+                self._orphan_stop(
+                    perm_id="999999", order_id="10099"
+                )
+            ],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        cases = [m["case"] for m in result.mismatch_reasons]
+        self.assertIn("phantom_open_order", cases)
+        self.assertEqual(
+            [
+                e
+                for e in result.events
+                if e.event_type == "orphan_stop_adopted"
+            ],
+            [],
+        )
+
+    def test_q42_self_renewal_refuses_when_position_is_gone(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[self._engine_recovered_journal(), old_adoption],
+            broker_positions=[],
+            broker_open_orders=[self._orphan_stop(perm_id="1888063981")],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        cases = [m["case"] for m in result.mismatch_reasons]
+        self.assertIn("phantom_open_order", cases)
+        self.assertIn("journal_position_missing_at_broker", cases)
+        self.assertEqual(
+            [
+                e
+                for e in result.events
+                if e.event_type == "orphan_stop_adopted"
+            ],
+            [],
+        )
+
+    def test_q42_naked_adopted_stop_without_any_position_refuses(self):
+        old_adoption = {
+            "ts": "2026-05-03T14:30:00+00:00",
+            "event_type": "orphan_stop_adopted",
+            "trade_id": "",
+            "journal_entry_id": "J-old-adoption",
+            "strategy": "",
+            "git_sha": "abc",
+            "broker_perm_id": "1888063981",
+            "payload": {
+                "permId": 1888063981,
+                "ticker": "SPY",
+                "qty": 2,
+                "stop_price": "697.13",
+                "source": "operator-portal",
+                "adopted_at": "2026-05-03T14:30:00+00:00",
+                "justification": "original human adoption",
+            },
+        }
+        result = recovery.reconcile(
+            journal_tail=[old_adoption],
+            broker_positions=[],
+            broker_open_orders=[self._orphan_stop(perm_id="1888063981")],
+            broker_order_status=[],
+            now=NOW,
+            override_env="",
+        )
+        self.assertEqual(
+            result.status, recovery.RecoveryStatus.MISMATCH_REFUSED
+        )
+        self.assertIn(
+            "phantom_open_order",
+            [m["case"] for m in result.mismatch_reasons],
+        )
 
     def test_q42_multiple_orphans_only_one_adopted_still_refuses(self):
         # Two unknown STOPs at broker; architect adopts only permId=42.

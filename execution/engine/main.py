@@ -1109,7 +1109,15 @@ class Engine:
             ext_since=ext_lookback_start,
             narrow_since=narrow_lookback_start,
         )
-        journal_tail = extended_checkpoints + narrow_journal_tail
+        orphan_adoption_history = _read_orphan_stop_adoption_history(
+            self.journal,
+            exclude_since=ext_lookback_start,
+        )
+        journal_tail = (
+            orphan_adoption_history
+            + extended_checkpoints
+            + narrow_journal_tail
+        )
         self._refresh_pending_orders_from_journal(now=startup_now)
         self._refresh_rapid_fire_state_from_journal(now=startup_now)
 
@@ -4565,6 +4573,55 @@ def _read_extended_checkpoints(
                 continue
             if ts >= narrow_since.isoformat():
                 continue  # already covered by narrow tail
+            out.append(rec)
+    out.sort(key=lambda r: str(r.get("ts", "")))
+    return out
+
+
+def _read_orphan_stop_adoption_history(
+    journal: JournalWriter,
+    *,
+    exclude_since: datetime,
+) -> list[dict[str, Any]]:
+    """Read older orphan_stop_adopted records without extending all checkpoints.
+
+    A-i renewal needs durable proof that a human adopted the orphan
+    STOP at least once. Only that event type is scanned outside the
+    30-day checkpoint window; engine_recovered and other checkpoint
+    semantics stay bounded by the existing recovery contract.
+    """
+    out: list[dict[str, Any]] = []
+    base_dir = getattr(journal, "base_dir", None)
+    if base_dir is None:
+        return out
+    try:
+        paths = sorted(Path(base_dir).glob("*.jsonl"))
+    except OSError as exc:  # pragma: no cover - defensive FS guard
+        LOG.warning("orphan-adoption history scan failed: %s", exc)
+        return out
+    exclude_iso = exclude_since.isoformat()
+    for path in paths:
+        try:
+            when = datetime.fromisoformat(path.stem).replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        try:
+            day_records = journal.read_all(when)
+        except Exception as exc:  # pragma: no cover - shouldn't raise
+            LOG.warning(
+                "orphan-adoption history read_all(%s) raised: %s",
+                when,
+                exc,
+            )
+            continue
+        for rec in day_records:
+            if rec.get("event_type") != "orphan_stop_adopted":
+                continue
+            ts = str(rec.get("ts", ""))
+            if not ts or ts >= exclude_iso:
+                continue
             out.append(rec)
     out.sort(key=lambda r: str(r.get("ts", "")))
     return out

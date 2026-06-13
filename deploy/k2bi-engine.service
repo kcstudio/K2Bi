@@ -1,0 +1,18 @@
+[Unit]
+Description=K2Bi trading engine
+Requires=ib-gateway.service
+After=ib-gateway.service
+StartLimitIntervalSec=10
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=k2bi
+WorkingDirectory=/home/k2bi/Projects/K2Bi
+Environment=K2BI_VAULT_ROOT=/home/k2bi/Projects/K2Bi-Vault
+ExecStart=/home/k2bi/Projects/K2Bi/.venv/bin/python -m execution.engine.main --account-id DUQ220152
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
