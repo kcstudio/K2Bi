@@ -1155,6 +1155,39 @@ class FullShipWrapperAdapterTests(unittest.TestCase):
         self.assertEqual(advisory[0]["verdict"], "NEEDS-ATTENTION")
         self.assertEqual(advisory[0]["log_path"], ".code-reviews/plan.log")
 
+    def test_strategy_spec_integrity_refuses_before_plan_review(self):
+        self.strategy_path = _write_strategy(
+            self.repo,
+            slug="spy",
+            missing_fields=["risk_envelope_pct"],
+        )
+
+        def review_runner(request: ioa.ReviewRequest) -> ioa.ReviewGateResult:
+            self.fail("plan review must not run before deterministic integrity")
+
+        with self.assertRaises(ioa.OrchestratorGateError) as cm:
+            ioa.run_full_ship(
+                self.strategy_path,
+                approval=self._approval(),
+                review_runner=review_runner,
+                approve_handler=self._approve_handler,
+                git_runner=lambda cmd, cwd: ioa.CommandResult(0, "", ""),
+            )
+
+        self.assertIn("strategy spec integrity", str(cm.exception).lower())
+        rollback = cm.exception.rollback_result
+        self.assertIsNotNone(rollback)
+        events = rollback.events
+        self.assertEqual(events[0]["event"], "ship_start")
+        refused = [
+            e for e in events
+            if e.get("event") == "strategy_spec_integrity_refused"
+        ]
+        self.assertEqual(len(refused), 1)
+        self.assertTrue(
+            any(f["code"] == "loader_validation_error" for f in refused[0]["findings"])
+        )
+
     def test_needs_attention_diff_review_is_advisory_and_commits(self):
         # ADVISORY (2026-06-10): a NEEDS-ATTENTION diff verdict no longer blocks the
         # strategy ship -- it is recorded as a diff_review_advisory event and the ship

@@ -26,6 +26,7 @@ import yaml
 
 from scripts.lib import invest_coach as ic
 from scripts.lib import invest_ship_strategy as iss
+from scripts.lib import strategy_spec_integrity as ssi
 from scripts.lib import invest_thesis as it
 from scripts.lib import strategy_frontmatter as sf
 
@@ -388,6 +389,33 @@ def run_full_ship(
             }
         )
         staged = False
+
+        integrity = ssi.strategy_spec_integrity(strategy_path)
+        if not integrity.ok:
+            findings = tuple(integrity.findings)
+            events.append(
+                {
+                    "event": "strategy_spec_integrity_refused",
+                    "findings": [dict(finding) for finding in findings],
+                }
+            )
+            exc = OrchestratorGateError(
+                "strategy spec integrity refused: "
+                + "; ".join(finding["message"] for finding in findings)
+            )
+            exc.rollback_result = _rollback_ship_failure(
+                git_runner=git_runner,
+                repo_root=repo_root,
+                rel_path=rel_path,
+                strategy_path=strategy_path,
+                original=original,
+                original_sha=original_sha,
+                prior_exc=exc,
+                staged=staged,
+                events=events,
+            )
+            raise exc
+        events.append({"event": "strategy_spec_integrity_passed", "findings": []})
 
         plan_review = review_runner(
             ReviewRequest(
