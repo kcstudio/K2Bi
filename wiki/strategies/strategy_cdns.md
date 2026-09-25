@@ -13,7 +13,11 @@ strategy_type: hand_crafted
 risk_envelope_pct: 0.0025
 regime_filter: []
 ticker: CDNS
-status: approved
+status: stopped_out
+stopped_out_at: '2026-09-25T13:36:01+00:00'
+stopped_out_fill_perm_id: 1378210224
+stopped_out_fill_price: '294.77'
+re_approve_path: '/invest-ship --re-approve cdns'
 sigid: 2026-06-07-cdns-eda-compute-supply
 thesis_ref: '[[../tickers/CDNS]]'
 order:
