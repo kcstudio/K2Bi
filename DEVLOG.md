@@ -2511,3 +2511,15 @@ distilled-rule: "When verification gates include an operator-override escape hat
 ## 2026-09-25 -- protective stop accounting and restart repair
 
 Recovered K2Bi trades regain fill observers. The engine restores owned stop identities, journals exactly one verified full stop execution at the actual price before lifecycle work, and halts on missing evidence across restarts. Removed the trigger-price fallback. Includes a prepare-only historical reconciliation CLI. Kimi final review and closure passed; 493 network-denied engine, connector and journal checks passed. VPS application is a separate stop-guarded maintenance operation; no automatic paper-engine restart.
+
+## 2026-09-26 -- bounded SEC research pilot Git delivery
+
+**Commit:** `d9922a6` feat(research): preserve bounded SEC pilot and private dashboard
+
+**What shipped:** Recoverable source for the separately activated research-only pilot, eight unchanged vendor snapshots, operator docs and tests. The wrapper reserves at most five NYSE sessions and fifteen SEC requests, pauses on corruption or unprepared interruption, and provides no market prices, new fills, broker orders or runtime model calls. Local agent skills are explicitly excluded from deployment coverage.
+
+**Validation:** 13 current wrapper tests passed; eight vendor hashes verified; deployment coverage passed; post-build hook changed no files; staged contact/private-key scan passed. Earlier activation evidence contains 27 additional pipeline checks.
+
+**Independent review:** Earlier Kimi core/installer and activation closure reviews passed. The broad pre-commit retry timed out without a verdict. The focused residual review raised a missing vendor-pin assertion and an insertion-order concern; existing per-run hash verification and Python 3.12 ordering address those concerns. Final closure: Kimi accepted the documented limitation (job `2026-09-25T16-14-30Z_c71ed0`); its remaining LOW finding was an inaccurate directive name in a local review note, corrected exactly as recommended before committing. That note is not part of the shipped source. A subsequent check/import race concern is documented as a trusted-administrator limitation: the runtime cannot write the root-owned release, and administrators must stop and lock the pilot for updates.
+
+**Feature status:** Research-only pilot activated; five-session observation remains open. This Git delivery does not redeploy or restart VPS services. Personal SEC contact configuration, runtime records and unrelated edits are excluded. Follow-up: evaluate observation evidence before new research, price-data or broker-paper scope.
