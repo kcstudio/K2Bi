@@ -34,6 +34,7 @@ import asyncio
 import inspect
 import logging
 import threading
+import weakref
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from .types import (
     POSITION_SOURCE_LIVE_REQ_POSITIONS,
     POSITION_SOURCE_TIMEOUT_FALLBACK,
     PositionSnapshot,
+    parse_client_tag,
 )
 
 
@@ -242,6 +244,7 @@ class IBKRConnector:
         # fillEvent callbacks are synchronous; this protects the tiny
         # in-memory cache without awaiting inside the broker callback.
         self._fill_observations_lock = threading.Lock()
+        self._fill_observer_trade_refs: dict[int, Any] = {}
 
     # ---------- connection lifecycle ----------
 
@@ -537,6 +540,12 @@ class IBKRConnector:
                 order_account = getattr(order, "account", "") or ""
                 if order_account and order_account != self._account_id:
                     continue
+                if order_account == self._account_id:
+                    tag = parse_client_tag(
+                        str(getattr(order, "orderRef", "") or "")
+                    )
+                    if tag[0] is not None and tag[1] is not None:
+                        self._attach_external_fill_observer(trade)
             tif = str(getattr(order, "tif", "") or "DAY").upper()
             out.append(
                 BrokerOpenOrder(
@@ -1040,6 +1049,12 @@ class IBKRConnector:
         )
 
     def _attach_external_fill_observer(self, trade: Any) -> None:
+        # Keep subscription identity on the connector: some Trade proxies reject
+        # setattr. Never evict a still-live Trade and attach its callback twice.
+        key = id(trade)
+        existing = self._fill_observer_trade_refs.get(key)
+        if existing is not None and existing() is trade:
+            return
         fill_event = getattr(trade, "fillEvent", None)
         if fill_event is None:
             LOG.warning("trade fillEvent unavailable; external-fill observation skipped")
@@ -1049,6 +1064,16 @@ class IBKRConnector:
             fill_event += self._on_trade_fill_event
         except Exception as exc:  # pragma: no cover - broker edge
             LOG.warning("trade fillEvent subscription failed: %s", exc)
+            return
+        try:
+            reference = weakref.ref(
+                trade, lambda ref: self._fill_observer_trade_refs.pop(key, None),
+            )
+        except TypeError:
+            # Non-weakrefable proxies need one strong identity reference for
+            # this connector's lifetime. Normal ib_async Trades use weakrefs.
+            reference = lambda: trade
+        self._fill_observer_trade_refs[key] = reference
 
     def _emit_fill_event_unavailable_observation(self, trade: Any) -> None:
         if self._external_fill_observer is None:

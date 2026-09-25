@@ -276,9 +276,12 @@ class PositionCacheCoherenceTests(unittest.IsolatedAsyncioTestCase):
 
         tick = await engine.tick_once()
 
+        # A refreshed zero position updates the cache but cannot prove a sale.
+        # The stop repair must prevent a replacement buy until reconciliation.
         self.assertEqual(engine._positions, [])
-        self.assertEqual(tick.orders_submitted, 1)
-        self.assertEqual(len(connector.submitted_orders), 1)
+        self.assertEqual(tick.orders_submitted, 0)
+        self.assertEqual(tick.state_after, EngineState.HALTED)
+        self.assertEqual(connector.submitted_orders, [])
 
     async def test_p2_invalid_snapshot_journals_visibility_lost_and_skips(self) -> None:
         connector = _SequencedPositionConnector(
@@ -386,9 +389,12 @@ class PositionCacheCoherenceTests(unittest.IsolatedAsyncioTestCase):
 
         tick = await engine.tick_once()
 
+        # A refreshed zero position updates the cache but cannot prove a sale.
+        # The stop repair must prevent a replacement buy until reconciliation.
         self.assertEqual(engine._positions, [])
-        self.assertEqual(tick.orders_submitted, 1)
-        self.assertEqual(connector.submitted_orders[0].ticker, "SPY")
+        self.assertEqual(tick.orders_submitted, 0)
+        self.assertEqual(tick.state_after, EngineState.HALTED)
+        self.assertEqual(connector.submitted_orders, [])
 
     async def test_p6_timeout_snapshot_skips_submission_preserves_cache_and_retries(
         self,
@@ -411,6 +417,8 @@ class PositionCacheCoherenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(invalid_tick.orders_submitted, 0)
         self.assertEqual(positions_after_invalid, [_position(10)])
+        # A refreshed zero position updates the cache but cannot prove a sale.
+        # The stop repair must prevent a replacement buy until reconciliation.
         self.assertEqual(engine._positions, [])
         self.assertEqual(self._events("strategy_stopped_out"), [])
         self.assertEqual(
@@ -421,5 +429,6 @@ class PositionCacheCoherenceTests(unittest.IsolatedAsyncioTestCase):
             ],
             [],
         )
-        self.assertEqual(next_tick.orders_submitted, 1)
-        self.assertEqual(len(connector.submitted_orders), 1)
+        self.assertEqual(next_tick.orders_submitted, 0)
+        self.assertEqual(next_tick.state_after, EngineState.HALTED)
+        self.assertEqual(connector.submitted_orders, [])

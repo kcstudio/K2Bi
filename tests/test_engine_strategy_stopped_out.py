@@ -290,6 +290,7 @@ class StoppedOutLifecycleTests(unittest.IsolatedAsyncioTestCase):
             parent_perm_id=2000000,
             submitted_at=_mid_session_utc(),
             strategy_id=STRATEGY_ID,
+            parent_trade_id="T-restart", stop_order_id="1001", quantity=71,
         )
 
     def _events(self, event_type: str) -> list[dict]:
@@ -431,6 +432,12 @@ class StoppedOutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         engine._position_visibility_valid = True
         engine._active_protective_stops["G"] = self._record()
 
+        await self.connector.connect()
+        self.journal.append("engine_recovered", payload={"adopted_positions":[
+            {"ticker":"G","qty":71,"avg_price":"34.50"}]})
+        self.connector.executions_history = [BrokerExecution(
+            "stop-test", "1001", "2000001", "G", "sld", 71,
+            Decimal("29.77"), datetime.now(timezone.utc))]
         await engine._detect_strategy_stop_outs(cycle_id="cycle-s1")
 
         text = self.strategy_path.read_text(encoding="utf-8")
@@ -444,7 +451,7 @@ class StoppedOutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["payload"]["strategy_id"], STRATEGY_ID)
         self.assertEqual(event["payload"]["ticker"], "G")
         self.assertEqual(event["payload"]["fill_perm_id"], 2000001)
-        self.assertEqual(event["payload"]["fill_price"], "30.00")
+        self.assertEqual(event["payload"]["fill_price"], "29.77")
         self.assertEqual(commits[0]["slug"], STRATEGY_ID)
         self.assertIn("Stopped-Out-Strategy: strategy_", commits[0]["message"])
 
@@ -567,108 +574,24 @@ class StoppedOutLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["payload"]["prev_qty"], 71)
         self.assertEqual(event["payload"]["curr_qty"], 50)
 
-    async def test_s8_recovery_replay_detects_stop_fill_after_restart(self) -> None:
+    async def test_s8_recovery_resumes_canonical_stop_fill_after_restart(self) -> None:
         engine = self._make_engine()
         self._load_strategy(engine)
         self._stub_commit(engine)
-        self.journal.append(
-            "order_submitted",
-            payload={
-                "status": "Submitted",
-                "order_type": "LMT",
-                "limit_price": "34.50",
-                "stop_loss": "30.00",
-                "stop_broker_perm_id": "2000001",
-                "stop_price": "30.00",
-            },
-            strategy=STRATEGY_ID,
-            trade_id="T-restart",
-            ticker="G",
-            side="buy",
-            qty=71,
-            broker_order_id="1000",
-            broker_perm_id="2000000",
-        )
-        status = BrokerOrderStatusEvent(
-            broker_order_id="1001",
-            broker_perm_id="2000001",
-            status="Filled",
-            filled_qty=71,
-            remaining_qty=0,
-            avg_fill_price=Decimal("30.00"),
-            last_update_at=_mid_session_utc(),
-            client_tag=f"k2bi:{STRATEGY_ID}:T-restart:stop",
-        )
-
-        await engine._replay_stopped_out_stop_fills(
-            journal_tail=self.journal.read_all(),
-            broker_status=[status],
-            cycle_id="recovery-replay",
-        )
-
+        self.journal.append("order_filled", strategy=STRATEGY_ID,
+            trade_id="T-restart:stop", ticker="G", side="sell", qty=71,
+            broker_perm_id="2000001", broker_order_id="1001",
+            payload={"exec_id":"stop-test", "fill_price":"29.77", "fill_qty":71,
+                     "filled_at":_mid_session_utc().isoformat(),
+                     "stop_reconciliation":{"parent_trade_id":"T-restart",
+                                             "source":"verified_stop_execution"}})
+        await engine._resume_verified_stop_lifecycle(self.journal.read_all())
         event = self._events("strategy_stopped_out")[0]
-        self.assertEqual(event["payload"]["source"], "recovery_replay")
+        self.assertEqual(event["payload"]["source"], "verified_stop_execution")
+        self.assertEqual(event["payload"]["fill_price"], "29.77")
         self.assertIn("status: stopped_out", self.strategy_path.read_text())
-
-    async def test_s8b_recovery_replay_uses_execution_price_when_status_price_zero(
-        self,
-    ) -> None:
-        engine = self._make_engine()
-        self._load_strategy(engine)
-        self._stub_commit(engine)
-        await self.connector.connect()
-        self.journal.append(
-            "order_submitted",
-            payload={
-                "status": "Submitted",
-                "order_type": "LMT",
-                "limit_price": "34.50",
-                "stop_loss": "30.00",
-                "stop_broker_perm_id": "2000001",
-                "stop_price": "30.00",
-            },
-            strategy=STRATEGY_ID,
-            trade_id="T-restart",
-            ticker="G",
-            side="buy",
-            qty=71,
-            broker_order_id="1000",
-            broker_perm_id="2000000",
-        )
-        self.connector.executions_history = [
-            BrokerExecution(
-                exec_id="0000dc8f.6a7433d6.01.01",
-                broker_order_id="1001",
-                broker_perm_id="2000001",
-                ticker="G",
-                side="sld",
-                qty=71,
-                price=Decimal("32.44"),
-                filled_at=_mid_session_utc(),
-            )
-        ]
-        status = BrokerOrderStatusEvent(
-            broker_order_id="1001",
-            broker_perm_id="2000001",
-            status="Filled",
-            filled_qty=71,
-            remaining_qty=0,
-            avg_fill_price=Decimal("0"),
-            last_update_at=_mid_session_utc(),
-            client_tag=f"k2bi:{STRATEGY_ID}:T-restart:stop",
-        )
-
-        await engine._replay_stopped_out_stop_fills(
-            journal_tail=self.journal.read_all(),
-            broker_status=[status],
-            cycle_id="recovery-replay",
-        )
-
-        event = self._events("strategy_stopped_out")[0]
-        self.assertEqual(event["payload"]["source"], "recovery_replay")
-        self.assertEqual(event["payload"]["fill_perm_id"], 2000001)
-        self.assertEqual(event["payload"]["fill_price"], "32.44")
-        self.assertIn("stopped_out_fill_price: '32.44'", self.strategy_path.read_text())
+        await engine._resume_verified_stop_lifecycle(self.journal.read_all())
+        self.assertEqual(len(self._events("strategy_stopped_out")), 1)
 
     async def test_s9_new_long_entry_does_not_enter_stop_out_path(self) -> None:
         engine = self._make_engine()

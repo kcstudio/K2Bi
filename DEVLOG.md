@@ -2507,3 +2507,7 @@ distilled-rule: "When verification gates include an operator-override escape hat
 **Follow-ups:** After merge + /sync, K2B re-runs the parked A3 (`retry-ship 2026-06-07-001` -> re-author -> `run_full_ship` -> `verify-ship` -> `terminal_shipped`), closing orchestrator Ship 2.
 
 **Key decisions:** Symmetric with the limits advisory (both internal reviews advisory, deterministic + human gates are the real safety). Shipped as a PR (not direct-to-main) per Keith's pattern; the untracked CDNS strategy file was left alone (committed only the adapter + tests + DEVLOG).
+
+## 2026-09-25 -- protective stop accounting and restart repair
+
+Recovered K2Bi trades regain fill observers. The engine restores owned stop identities, journals exactly one verified full stop execution at the actual price before lifecycle work, and halts on missing evidence across restarts. Removed the trigger-price fallback. Includes a prepare-only historical reconciliation CLI. Kimi final review and closure passed; 493 network-denied engine, connector and journal checks passed. VPS application is a separate stop-guarded maintenance operation; no automatic paper-engine restart.

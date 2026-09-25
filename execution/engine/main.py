@@ -55,10 +55,14 @@ from typing import Any
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
+from execution.engine.stop_reconciliation import (
+    StopIdentity, plan_stop_fill, read_stop_history, unresolved_stop_barriers,
+)
 from ..connectors.ibkr import ConnectorImportError
 from ..connectors.types import (
     AuthRequiredError,
     BrokerExecution,
+    BrokerOpenOrder,
     BrokerFillObservation,
     BrokerOrderAck,
     BrokerOrderStatusEvent,
@@ -318,6 +322,9 @@ class ProtectiveStopRecord:
     parent_perm_id: int
     submitted_at: datetime
     strategy_id: str
+    parent_trade_id: str = ""
+    stop_order_id: str = ""
+    quantity: int = 0
 
 
 @dataclass
@@ -1118,6 +1125,20 @@ class Engine:
             + extended_checkpoints
             + narrow_journal_tail
         )
+        stop_history = read_stop_history(self.journal)
+        if unresolved_stop_barriers(stop_history):
+            self.state = EngineState.HALTED
+            self._shutdown_requested = True
+            return
+        # Carry canonical stop sells alongside extended position checkpoints.
+        known_ids = {r.get("journal_entry_id") for r in journal_tail}
+        for rec in stop_history:
+            if (rec.get("event_type") == "order_filled"
+                    and (rec.get("payload") or {}).get("stop_reconciliation")
+                    and rec.get("journal_entry_id") not in known_ids
+                    and str(rec.get("ts", "")) >= ext_lookback_start.isoformat()):
+                journal_tail.append(rec)
+        journal_tail.sort(key=lambda r: str(r.get("ts", "")))
         self._refresh_pending_orders_from_journal(now=startup_now)
         self._refresh_rapid_fire_state_from_journal(now=startup_now)
 
@@ -1287,11 +1308,14 @@ class Engine:
             self.state = EngineState.HALTED
             self._shutdown_requested = True
             return
-        await self._replay_stopped_out_stop_fills(
-            journal_tail=journal_tail,
-            broker_status=broker_status,
-            cycle_id="startup_recovery",
-        )
+        try:
+            self._restore_active_stops(journal_tail, broker_open_orders, reco.events)
+            await self._resume_verified_stop_lifecycle(stop_history)
+        except Exception as exc:
+            LOG.error("stop recovery requires review: %s", exc)
+            self.state = EngineState.HALTED
+            self._shutdown_requested = True
+            return
 
         self.journal.append(
             "engine_started",
@@ -1606,6 +1630,8 @@ class Engine:
         if self.state == EngineState.DISCONNECTED:
             return
         await self._detect_strategy_stop_outs(cycle_id=new_ulid())
+        if self.state == EngineState.HALTED or self._shutdown_requested:
+            return
         self._journal_stopped_out_strategy_skips(cycle_id=new_ulid())
 
         # Drift-check approved strategies (file-level hash comparison).
@@ -2670,6 +2696,117 @@ class Engine:
             if qty > 0
         )
 
+    def _halt_unverified_stop(
+        self, ticker: str, quantity: int, record: ProtectiveStopRecord | None,
+    ) -> None:
+        self.state = EngineState.HALTED
+        self._shutdown_requested = True
+        self.journal.append(
+            "engine_stopped", ticker=ticker,
+            broker_perm_id=str(record.stop_perm_id) if record else None,
+            payload={
+                "reason": "protective_stop_fill_unverified",
+                "terminal_state": "halted", "quantity": quantity,
+                "parent_trade_id": record.parent_trade_id if record else "",
+            },
+        )
+        self._engine_stopped_journaled = True
+
+    def _restore_active_stops(
+        self, journal_tail: list[dict[str, Any]],
+        broker_orders: list[BrokerOpenOrder],
+        recovery_events: list[recovery_mod.ReconciliationEvent],
+    ) -> None:
+        """Restore only unambiguous ordinary STP children owned by journal intent."""
+        restored = {}
+        quantities = self._position_qty_map(self._positions)
+        expected = recovery_mod.build_expected_stop_children(
+            positions=self._positions, journal_tail=journal_tail,
+            recovery_events=recovery_events,
+        )
+        for child in expected:
+            tag = child["client_tag"]
+            if not tag.startswith("k2bi:"):
+                tag = f"k2bi:{tag}"
+            matches = [o for o in broker_orders if o.client_tag == tag]
+            if len(matches) != 1:
+                raise ValueError("protective stop is missing or ambiguous")
+            order = matches[0]
+            ticker = child["ticker"]
+            if (order.ticker != ticker or order.side != "sell"
+                    or order.order_type != "STP" or order.filled_qty != 0
+                    or order.qty != quantities[ticker]
+                    or order.aux_price != Decimal(child["trigger_price"])):
+                raise ValueError("protective stop disagrees with journal identity")
+            if ticker in restored:
+                raise ValueError("multiple protective stops for one position")
+            restored[ticker] = ProtectiveStopRecord(
+                ticker=ticker,
+                stop_perm_id=self._positive_perm_id(order.broker_perm_id, field_name="stop_perm_id"),
+                stop_price=order.aux_price, parent_perm_id=0,
+                submitted_at=order.submitted_at, strategy_id=child["strategy"],
+                parent_trade_id=child["parent_trade_id"],
+                stop_order_id=str(self._positive_perm_id(order.broker_order_id, field_name="stop_order_id")),
+                quantity=quantities[ticker],
+            )
+        self._active_protective_stops = restored
+
+    async def _journal_verified_stop_close(
+        self, record: ProtectiveStopRecord, previous_qty: int,
+    ) -> BrokerExecution:
+        """Persist the accounting fact before any strategy lifecycle mutation."""
+        if previous_qty != record.quantity:
+            raise ValueError("position differs from protected quantity")
+        now = datetime.now(timezone.utc)
+        executions = await self.connector.get_executions_since(now - timedelta(days=2))
+        matches = [e for e in executions if e.broker_perm_id == str(record.stop_perm_id)]
+        if len(matches) != 1:
+            raise ValueError("missing, partial or ambiguous stop execution evidence")
+        execution = matches[0]
+        identity = StopIdentity(
+            record.ticker, record.strategy_id, record.parent_trade_id,
+            str(record.stop_perm_id), record.stop_order_id, record.quantity,
+        )
+        planned = plan_stop_fill(
+            read_stop_history(self.journal), identity, execution,
+            broker_qty=self._position_qty_map(self._positions).get(record.ticker, 0),
+            as_of=now,
+        )
+        if planned is not None:
+            written, read_back = self.journal.append_and_read_back(**planned)
+            if written != read_back:
+                raise ValueError("canonical stop fill read-back mismatch")
+        return execution
+
+    async def _resume_verified_stop_lifecycle(
+        self, records: list[dict[str, Any]],
+    ) -> None:
+        """A crash after accounting cannot permit a replacement buy on restart."""
+        completed = {
+            (r.get("strategy"), str((r.get("payload") or {}).get("fill_perm_id")))
+            for r in records if r.get("event_type") == "strategy_stopped_out"
+        }
+        for rec in records:
+            if (rec.get("event_type") != "order_filled"
+                    or not (rec.get("payload") or {}).get("stop_reconciliation")):
+                continue
+            strategy_id = rec["strategy"]
+            if (strategy_id, rec["broker_perm_id"]) in completed:
+                continue
+            # If the file was already rewritten but the commit/event failed,
+            # do not silently declare lifecycle complete. Operator review needed.
+            self._strategy_snapshot(strategy_id)
+            if self._position_qty_map(self._positions).get(rec["ticker"], 0) != 0:
+                raise ValueError("pending stop lifecycle conflicts with broker position")
+            await self._flip_strategy_to_stopped_out(
+                strategy_id=strategy_id, ticker=rec["ticker"],
+                fill_perm_id=int(rec["broker_perm_id"]),
+                fill_price=Decimal(rec["payload"]["fill_price"]),
+                cycle_id="startup_recovery", source="verified_stop_execution",
+            )
+            self._strategies = [s for s in self._strategies if s.name != strategy_id]
+            completed.add((strategy_id, rec["broker_perm_id"]))
+
     async def _detect_strategy_stop_outs(self, *, cycle_id: str) -> None:
         if not self._position_visibility_valid:
             return
@@ -2691,7 +2828,8 @@ class Engine:
                         cycle_id=cycle_id,
                         reason="no_active_protective_stop_record",
                     )
-                    continue
+                    self._halt_unverified_stop(ticker, prev_qty, None)
+                    return
                 if self._looks_like_resymbolized_position(
                     ticker=ticker,
                     prev_qty=prev_qty,
@@ -2703,14 +2841,29 @@ class Engine:
                         cycle_id=cycle_id,
                         reason="protective_stop_record_orphaned",
                     )
-                    continue
-                await self._flip_strategy_to_stopped_out(
-                    strategy_id=record.strategy_id,
-                    ticker=ticker,
-                    fill_perm_id=record.stop_perm_id,
-                    fill_price=record.stop_price,
-                    cycle_id=cycle_id,
-                )
+                    self._halt_unverified_stop(ticker, prev_qty, record)
+                    return
+                try:
+                    execution = await self._journal_verified_stop_close(record, prev_qty)
+                except Exception as exc:
+                    LOG.error("stop fill evidence rejected for %s: %s", ticker, exc)
+                    self._halt_unverified_stop(ticker, prev_qty, record)
+                    return
+                try:
+                    await self._flip_strategy_to_stopped_out(
+                        strategy_id=record.strategy_id,
+                        ticker=ticker,
+                        fill_perm_id=record.stop_perm_id,
+                        fill_price=execution.price,
+                        cycle_id=cycle_id,
+                        source="verified_stop_execution",
+                    )
+                except Exception:
+                    # The canonical fill survives a lifecycle crash. Startup
+                    # must finish lifecycle or halt before another submission.
+                    self.state = EngineState.HALTED
+                    self._shutdown_requested = True
+                    raise
                 self._clear_active_protective_stop_on_terminal(
                     ticker=ticker,
                     stop_perm_id=record.stop_perm_id,
@@ -2992,142 +3145,6 @@ class Engine:
             ticker=ticker.upper(),
             broker_perm_id=str(fill_perm_id),
         )
-
-    @staticmethod
-    def _order_submitted_by_trade(
-        journal_tail: list[dict[str, Any]],
-        *,
-        strategy_id: str,
-        trade_id: str,
-    ) -> dict[str, Any] | None:
-        for record in reversed(journal_tail):
-            if (
-                record.get("event_type") == "order_submitted"
-                and record.get("strategy") == strategy_id
-                and record.get("trade_id") == trade_id
-            ):
-                return record
-        return None
-
-    @staticmethod
-    def _stopped_out_fill_already_journaled(
-        journal_tail: list[dict[str, Any]],
-        *,
-        fill_perm_id: int,
-    ) -> bool:
-        for record in journal_tail:
-            if record.get("event_type") != "strategy_stopped_out":
-                continue
-            payload = record.get("payload") or {}
-            if payload.get("fill_perm_id") == fill_perm_id:
-                return True
-        return False
-
-    @staticmethod
-    def _positive_decimal_or_none(raw: Any) -> Decimal | None:
-        try:
-            value = Decimal(str(raw))
-        except (InvalidOperation, TypeError, ValueError):
-            return None
-        if not value.is_finite() or value <= 0:
-            return None
-        return value
-
-    @staticmethod
-    def _stop_fill_price_from_executions(
-        executions: list[BrokerExecution],
-        *,
-        status: BrokerOrderStatusEvent,
-    ) -> Decimal | None:
-        for execution in executions:
-            if (
-                status.broker_perm_id
-                and execution.broker_perm_id == status.broker_perm_id
-            ) or execution.broker_order_id == status.broker_order_id:
-                return Engine._positive_decimal_or_none(execution.price)
-        return None
-
-    async def _replay_stopped_out_stop_fills(
-        self,
-        *,
-        journal_tail: list[dict[str, Any]],
-        broker_status: list[BrokerOrderStatusEvent],
-        cycle_id: str,
-    ) -> None:
-        curr_positions = self._position_qty_map(self._positions)
-        stopped: set[str] = set()
-        broker_executions: list[BrokerExecution] | None = None
-        for status in broker_status:
-            if status.status != "Filled":
-                continue
-            strategy_id, trade_id, is_stop = parse_client_tag(status.client_tag)
-            if not is_stop or strategy_id is None or trade_id is None:
-                continue
-            try:
-                fill_perm_id = self._positive_perm_id(
-                    status.broker_perm_id,
-                    field_name="broker_perm_id",
-                )
-            except ValueError:
-                continue
-            if self._stopped_out_fill_already_journaled(
-                journal_tail,
-                fill_perm_id=fill_perm_id,
-            ):
-                continue
-            submitted = self._order_submitted_by_trade(
-                journal_tail,
-                strategy_id=strategy_id,
-                trade_id=trade_id,
-            )
-            if submitted is None:
-                continue
-            submitted_payload = submitted.get("payload") or {}
-            try:
-                submitted_stop_perm_id = self._positive_perm_id(
-                    submitted_payload.get("stop_broker_perm_id"),
-                    field_name="stop_broker_perm_id",
-                )
-            except ValueError:
-                continue
-            if submitted_stop_perm_id != fill_perm_id:
-                continue
-            ticker = str(submitted.get("ticker") or "").upper()
-            if not ticker or curr_positions.get(ticker, 0) > 0:
-                continue
-            fill_price = self._positive_decimal_or_none(status.avg_fill_price)
-            if fill_price is None:
-                if broker_executions is None:
-                    try:
-                        broker_executions = await self.connector.get_executions_since(
-                            status.last_update_at - recovery_mod.DEFAULT_LOOKBACK
-                        )
-                    except (AuthRequiredError, ConnectorError, DisconnectedError):
-                        broker_executions = []
-                fill_price = self._stop_fill_price_from_executions(
-                    broker_executions,
-                    status=status,
-                )
-            if fill_price is None:
-                raw_price = submitted_payload.get("stop_price") or submitted_payload.get(
-                    "stop_loss"
-                )
-                fill_price = self._positive_decimal_or_none(raw_price)
-                if fill_price is None:
-                    continue
-            await self._flip_strategy_to_stopped_out(
-                strategy_id=strategy_id,
-                ticker=ticker,
-                fill_perm_id=fill_perm_id,
-                fill_price=fill_price,
-                cycle_id=cycle_id,
-                source="recovery_replay",
-            )
-            stopped.add(strategy_id)
-        if stopped:
-            self._strategies = [
-                snap for snap in self._strategies if snap.name not in stopped
-            ]
 
     async def _skip_buy_for_existing_position(
         self,
@@ -3440,7 +3457,9 @@ class Engine:
             broker_order_id=ack.broker_order_id,
             broker_perm_id=ack.broker_perm_id,
         )
-        self._record_active_protective_stop(snap=snap, order=order, ack=ack)
+        self._record_active_protective_stop(
+            snap=snap, order=order, ack=ack, parent_trade_id=trade_id,
+        )
         self._pending_orders.setdefault(
             (snap.name, order.ticker.upper()), set()
         ).add(ack.broker_order_id)
@@ -3505,6 +3524,7 @@ class Engine:
         snap: ApprovedStrategySnapshot,
         order: Order,
         ack: BrokerOrderAck,
+        parent_trade_id: str = "",
     ) -> None:
         if order.stop_loss is None:
             return
@@ -3524,6 +3544,9 @@ class Engine:
             ),
             submitted_at=ack.submitted_at,
             strategy_id=snap.name,
+            parent_trade_id=parent_trade_id,
+            stop_order_id=ack.stop_broker_order_id or "",
+            quantity=order.qty,
         )
 
     def _clear_active_protective_stop_on_terminal(
