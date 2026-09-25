@@ -1,0 +1,20 @@
+[Unit]
+Description=K2Bi bounded SEC research pilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=k2bi
+Group=k2bi
+WorkingDirectory=/home/k2bi/research-pilot/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/k2bi/Projects/K2Bi/.venv/bin/python3 /home/k2bi/research-pilot/current/pilot.py --config /home/k2bi/research-pilot/config.json --state /home/k2bi/research-pilot/state
+TimeoutStartSec=150
+Restart=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/k2bi/research-pilot/state
+NoNewPrivileges=yes
+PrivateTmp=yes
+InaccessiblePaths=/home/k2bi/Projects/K2Bi-Vault

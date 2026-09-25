@@ -58,6 +58,7 @@ excludes:
                                  # Claude Code runs; Mini is Trader tier (no Claude Code)
   - .claude/settings.local.json  # gitignored per-machine override
   - .codex                       # Codex handoff specs and local job context
+  - .agents                      # local agent skill discovery; not VPS runtime payload
   # Python + node detritus
   - .venv
   - __pycache__

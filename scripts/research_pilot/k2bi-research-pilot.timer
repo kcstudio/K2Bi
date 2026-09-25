@@ -1,0 +1,11 @@
+[Unit]
+Description=K2Bi research pilot at 18:00 New York time
+
+[Timer]
+OnCalendar=*-*-* 18:00:00 America/New_York
+Persistent=true
+AccuracySec=1s
+Unit=k2bi-research-pilot.service
+
+[Install]
+WantedBy=timers.target

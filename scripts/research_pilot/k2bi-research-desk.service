@@ -1,0 +1,19 @@
+[Unit]
+Description=Private K2Bi research desk (SSH tunnel only)
+After=network.target
+
+[Service]
+User=k2bi
+Group=k2bi
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/k2bi/Projects/K2Bi/.venv/bin/python3 -m http.server 8771 --bind 127.0.0.1 --directory /home/k2bi/research-pilot/state
+Restart=on-failure
+RestartSec=10
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=yes
+PrivateTmp=yes
+InaccessiblePaths=/home/k2bi/Projects/K2Bi-Vault
+
+[Install]
+WantedBy=multi-user.target

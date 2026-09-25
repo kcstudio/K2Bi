@@ -254,6 +254,7 @@ Phase 3.9+), not CI/CD.
    top-level repo path is uncovered by `targets:` or `excludes:`.
 
 **Excluded from deploy** (see `deploy-config.yml`):
+- `.agents/` contains local agent skills and is excluded from VPS deployment.
 - `.git/`, `.githooks/`, `tests/`, `wiki/`, `proposals/`, `.pending-sync/`,
   `.minimax-reviews/`, `.code-reviews/`, `.sync-state/`, `.venv/`, `__pycache__/`
 
