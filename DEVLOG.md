@@ -1,3 +1,11 @@
+## 2026-10-02 -- Local EOD practice desk and read-only paper visibility
+
+Code commit: `14f82849dafd78a4c89b14e67bb86ddf8f38679c`. Added a deterministic local end-of-day practice simulator, verified receipt storage, and a dashboard that keeps virtual portfolios separate from captured IBKR paper holdings. The read-only capture validates saved broker evidence and displays native currencies without conversion, current quotes or order eligibility claims.
+
+Verification: Kimi passed the full candidate, final display correction and separate quote dependency closure. The final local gate passed 134 tests and 77 subtests. The exact exported shipping bundle passed 69 tests and 64 subtests against a clean committed baseline. Browser checks passed for actual and unknown states, source details and narrow screens. The existing dirty tracked files and accepted EOD package were preserved byte-for-byte. Private broker snapshots were excluded from Git.
+
+No deployment, orders, engine activation or service changes were performed. Per-currency cash verification and a separately frozen deployment payload remain required before any later activation.
+
 ## 2026-06-08 -- apply_approved_limits orchestrator adapter shipped (A4 builder increment)
 
 **Scope:** Shipped `apply_approved_limits(...)` in `scripts/lib/invest_orchestrator_adapters.py` (commit `d424b62`), the limits analog of `run_full_ship`. It is an orchestrator-callable adapter that applies an operator-approved limits proposal (e.g. an `instrument_whitelist` add) under a bound approval token, owning its own review gates, commit, and outer rollback, and wrapping the existing `handle_approve_limits(...)` without weakening it or the validators. This lets the K2B orchestrator (a separate increment) land a validator change after Keith's green light instead of Keith hand-running `/invest-ship --approve-limits`.
