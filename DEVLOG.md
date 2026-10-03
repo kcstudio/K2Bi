@@ -1,3 +1,11 @@
+## 2026-10-03 -- Dated closing prices and native paper cash readiness
+
+Code commit: `32d4efd521b53bfb24362a20c59483204356c129`. Added completed-session lag for saved tracked-company closing prices and account-matched currency cash, preserving negative values and unknown reliability. The dashboard separates old holdings, newer cash and historical price capture dates, displays manual-refresh and stale states, and makes no current-quote or order-readiness claim. Private captures remain local and are excluded from Git.
+
+Verification: independent Kimi candidate closure PASS; final gate 139 tests and 92 subtests; clean exact exported bundle 74 tests and 79 subtests; browser actual, missing, stale and narrow-screen checks PASS. Sol repaired incompatible DeepSeek output within the frozen scope; both failed worker replies and cumulative usage remain preserved. Existing dirty files and yesterday's delivery history were preserved. No orders, deployment, engine activation, validator changes or service changes were performed.
+
+Further price-policy eligibility, per-currency funding, account and risk readiness, recurring reliability and explicit activation remain separate work.
+
 ## 2026-10-02 -- Local EOD practice desk and read-only paper visibility
 
 Code commit: `14f82849dafd78a4c89b14e67bb86ddf8f38679c`. Added a deterministic local end-of-day practice simulator, verified receipt storage, and a dashboard that keeps virtual portfolios separate from captured IBKR paper holdings. The read-only capture validates saved broker evidence and displays native currencies without conversion, current quotes or order eligibility claims.
