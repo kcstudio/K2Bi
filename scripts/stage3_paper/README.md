@@ -50,3 +50,18 @@ is evaluated with the XNYS calendar; daily bars are not intraday prices.
 Manual cash capture:
 
     scripts/gateway-query.sh -f scripts/stage3_paper/cash_capture.py > <cash_snapshot.json>
+
+## Offline action card and provenance
+
+The paper tab shows NO PROPOSAL: WAIT with candidate, quantity, cost and risk
+withheld until current research, funding and risk context exist. Negative USD
+cash is a debit balance, not profit or loss. HKD is not automatically USD.
+Settled cash and pending orders remain unknown; actual validators are not run.
+Risk config is read only and fingerprinted as context, never approval.
+
+Optional --price-proof supplies a hash-bound acquisition sidecar matched to
+the reviewed finite capture program and exact request settings. This verifies
+saved historical reference provenance, not live entitlement or fill permission.
+The risk context uses the unchanged execution/validators/config.yaml. No engine
+code or order API is invoked. All refreshes are manual. Invented examples are
+explicitly labelled and have no action controls or execution permission.

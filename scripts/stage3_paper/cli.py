@@ -17,6 +17,7 @@ def _parser():
     render.add_argument("--state-dir", required=True)
     render.add_argument("--snapshot", default=None)
     render.add_argument("--prices", default=None)
+    render.add_argument("--price-proof", default=None)
     render.add_argument("--cash-snapshot", default=None)
     render.add_argument("--as-of", required=True)
     render.add_argument("--output", required=True)
@@ -66,6 +67,11 @@ def render_command(args, *, out_write=None):
         prices_raw = _read_source(args.prices, "prices", sources)
         if prices_raw is None:
             return 2
+    proof_raw = _read_source(args.price_proof, "price proof", sources) if args.price_proof else None
+    if args.price_proof and proof_raw is None: return 2
+    config_path = _store.safe_path(Path(__file__).resolve().parents[2]/"execution/validators/config.yaml")
+    config_raw = _read_source(config_path, "risk config", sources)
+    if config_raw is None: return 2
     cash_raw = None
     if args.cash_snapshot:
         cash_raw = _read_source(args.cash_snapshot, "cash snapshot", sources)
@@ -78,7 +84,7 @@ def render_command(args, *, out_write=None):
         return 2
     try:
         page = _desk.render(receipt, snapshot_raw, as_of=args.as_of,
-                            prices_raw=prices_raw, cash_raw=cash_raw)
+                            prices_raw=prices_raw, cash_raw=cash_raw, proof_raw=proof_raw, config_raw=config_raw)
     except ValueError as exc:
         sys.stderr.write("source failed closed: " + str(exc) + "\n")
         return 2

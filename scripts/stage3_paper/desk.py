@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import html
 import re
+import json
+from zoneinfo import ZoneInfo
+from scripts.stage3_paper import reference as _ref, action_card as _card
 
 from scripts.stage2_eod import desk as _eod
 from scripts.stage3_paper import snapshot as _snap
@@ -14,6 +17,25 @@ _PANEL_RE = re.compile(
 
 def _esc(value):
     return html.escape(str(value), quote=True)
+
+
+def _hkt(value):
+    return _snap._ts(value, 'display time').astimezone(ZoneInfo('Asia/Hong_Kong')).strftime('%d %b %Y %H:%M HKT') if value else 'unknown'
+
+
+def _action_html(card):
+    fields = [('Paper account', card['account']), ('Candidate', card['candidate']),
+              ('Quantity', card['quantity']), ('Estimated cost', card['estimated_cost']),
+              ('Estimated risk', card['estimated_risk'])]
+    rows = ''.join(_row(k, 'Withheld' if v is None else v) for k, v in fields)
+    checks = ''.join('<tr><th>' + _esc(c['label'].replace('_', ' ').capitalize().replace('Usd', 'USD'))
+                     + '</th><td>' + _esc(c['status'].replace('_', ' ')) + '</td><td>'
+                     + _esc(c['detail']) + '</td></tr>' for c in card['checks'])
+    return ('<h3>' + ('NO PROPOSAL: WAIT' if card['status'] == 'WAIT' else _esc(card['status']))
+            + '</h3><p>' + _esc(card['reason']) + '</p><p>Next step: ' + _esc(card['next_step'])
+            + '</p><div class="st3-scroll"><table>' + rows + '</table><table>' + checks
+            + '</table></div><details><summary>Risk context details</summary><p>Validators not run.</p><pre>'
+            + _esc(json.dumps(card['risk_config'], sort_keys=True)) + '</pre></details>')
 
 
 def _row(key, val):
@@ -45,17 +67,17 @@ def _prices_html(prices):
                         + _esc(r.get("state")) + "</td><td class=\"st3-unknown\">"
                         + _esc(r.get("reason", "")) + "</td><td></td><td></td></tr>")
     return ('<h4>Tracked-company closing prices</h4>'
-            '<p>Price input provenance is unverified: this legacy file does not distinguish recorded from invented prices. Inspect the saved source receipt.</p>'
+            '<p>' + ('Recorded capture and request settings match this saved price file; historical reference only.' if prices.get('provenance') == 'recorded_request_verified' else 'INVENTED OFFLINE EXAMPLE.' if prices.get('provenance') == 'invented_fixture' else 'Price input provenance is unverified: this legacy file does not distinguish recorded from invented prices. Inspect the saved source receipt.') + '</p>'
             '<p class="st3-note">Historical closing prices only; not current quotes; '
-            'not prices for actual paper holdings and implying no trade eligibility. Adjustment treatment and feed entitlement remain unverified.</p>'
+            'not prices for actual paper holdings and implying no trade eligibility. Feed entitlement remains unverified. Adjustment: ' + _esc(prices.get('adjustment', 'unverified')) + '.</p>'
             '<div class="st3-scroll"><table class="st3-prices"><thead><tr>'
             '<th scope="col">Company</th><th scope="col">Last completed dated session</th>'
             '<th scope="col">USD close</th><th scope="col">Session lag</th>'
             '<th scope="col">Session status</th></tr></thead><tbody>'
             + "".join(rows) + '</tbody></table></div>'
-            '<p class="st3-scope">Price capture ' + _esc(prices.get("completed_at", ""))
-            + '; evaluation ' + _esc(prices.get("as_of", "")) + '. Research panels remain the saved research replay; refresh is manual.</p>'
-            + '<details><summary>Price source details</summary>' + '<table>' + _row('Raw sha256', prices['raw_sha256']) + '</table></details>')
+            '<p class="st3-scope">Price capture ' + _esc(_hkt(prices.get("completed_at", "")))
+            + '; evaluation ' + _esc(_hkt(prices.get("as_of", ""))) + '. Research panels remain the saved research replay; refresh is manual.</p>'
+            + '<details><summary>Price source details</summary>' + '<table>' + _row('Captured at', prices['completed_at']) + _row('Evaluated at', prices['as_of']) + _row('Raw sha256', prices['raw_sha256']) + _row('Proof sha256', prices.get('proof_sha256', 'unknown')) + '</table></details>')
 
 
 def _cash_html(cash):
@@ -85,16 +107,16 @@ def _cash_html(cash):
         caveat += ' Unknown USD: no USD balance reported.'
     return (banner + '<h4>Recorded paper currency cash</h4><p>' + _esc(cash['freshness']) + '</p>' + body
             + '<p class="st3-scope">' + _esc(caveat) + ' BASE is never USD.</p>'
-            + '<p class="st3-scope">Captured ' + _esc(cash.get("completed_at", ""))
-            + '; evaluated ' + _esc(cash.get("as_of", "")) + '; refresh is manual.</p>'
-            + '<details><summary>Currency cash source details</summary><table>' + _row('Raw sha256', cash['raw_sha256']) + _row('AccountReady', cash['account_ready']) + '</table></details>')
+            + '<p class="st3-scope">Captured ' + _esc(_hkt(cash.get("completed_at", "")))
+            + '; evaluated ' + _esc(_hkt(cash.get("as_of", ""))) + '; refresh is manual.</p>'
+            + '<details><summary>Currency cash source details</summary><table>' + _row('Captured at', cash['completed_at']) + _row('Evaluated at', cash['as_of']) + _row('Raw sha256', cash['raw_sha256']) + _row('AccountReady', cash['account_ready']) + '</table></details>')
 
 
-def _body(parsed, prices=None, cash=None):
+def _body(parsed, prices=None, cash=None, card=None):
     banner = ""
     if parsed is None:
         return ('<div class="st3-wrap"><style>.st3-wrap{min-width:0;overflow-wrap:anywhere;}.st3-scroll{overflow-x:auto;max-width:100%;}</style><p class="st3-unknown">No paper snapshot provided; '
-                'paper positions and account values are unknown.</p>' + _prices_html(prices) + _cash_html(cash) + '</div>')
+                'paper positions and account values are unknown.</p>' + _action_html(card) + _prices_html(prices) + _cash_html(cash) + '</div>')
     if parsed["origin"] == "fixture":
         banner = ('<p class="st3-banner st3-fixture" role="note">INVENTED OFFLINE BROKER FIXTURE. '
                   'Not captured from a live Gateway.</p>')
@@ -147,11 +169,11 @@ def _body(parsed, prices=None, cash=None):
     outer = ('<div class="st3-wrap"><style>.st3-wrap{min-width:0;overflow-wrap:anywhere;word-break:break-word;}'
              '.st3-scroll{overflow-x:auto;max-width:100%;}.st3-banner{padding:.5rem;border:1px solid currentColor;'
              'font-weight:bold;}.st3-fixture{background:#ffe8b3;}.st3-stale{background:#e8e8e8;}'
-             '.st3-unknown{font-style:italic;}@media(max-width:390px){.st3-wrap{max-width:100%;}}</style>')
+             '.st3-wrap th,.st3-wrap td{padding:.5rem .8rem;text-align:left;}.st3-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere;}.st3-unknown{font-style:italic;}@media(max-width:390px){.st3-wrap{max-width:100%;}}</style>')
     prices_html = _prices_html(prices)
     cash_html = _cash_html(cash)
-    return (outer + banner + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
-            + _esc(parsed['completed_at']) + '; evaluated ' + _esc(parsed['evaluated_at'])
+    return (outer + banner + _action_html(card) + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
+            + _esc(_hkt(parsed['completed_at'])) + '; evaluated ' + _esc(_hkt(parsed['evaluated_at']))
             + '; refresh is manual.</p>' + reason
             + '<h4>Paper holdings</h4>' + positions_html + '<h4>Account balances</h4>' + values_html
             + prices_html + cash_html
@@ -165,16 +187,18 @@ def _body(parsed, prices=None, cash=None):
               'eligibility, or orders are claimed.</p></div>')
 
 
-def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None):
+def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None):
     _snap._ts(as_of, "as_of")
     base = _eod.render(receipt)
     parsed = _snap.parse_snapshot(snapshot_raw, as_of=as_of) if snapshot_raw is not None else None
-    prices = _ready.price_readiness(prices_raw, as_of=as_of) if prices_raw is not None else None
+    if proof_raw is not None and prices_raw is None: raise ValueError('price proof needs prices')
+    prices = _ref.verify_reference(prices_raw, proof_raw, as_of=as_of) if prices_raw is not None else None
     cash = _ready.cash_readiness(cash_raw, as_of=as_of) if cash_raw is not None else None
     match = _PANEL_RE.search(base)
     if match is None or _PANEL_RE.search(base, match.end()) is not None:
         raise ValueError("accepted template needs exactly one panel-paper section")
     original = match.group(0)
     open_tag = original[:original.index(">") + 1]
-    replacement = open_tag + _body(parsed, prices, cash) + "</section>"
+    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example)
+    replacement = open_tag + _body(parsed, prices, cash, card) + "</section>"
     return base[:match.start()] + replacement + base[match.end():]
