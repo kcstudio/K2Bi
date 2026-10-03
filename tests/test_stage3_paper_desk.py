@@ -196,3 +196,31 @@ class ActualDeskIntegrationTests(unittest.TestCase):
         protected = Path(__file__).resolve().parents[1]/'scripts/stage3_paper/bad.html'
         self.assertEqual(cli.main(self.arguments(source, protected)), 2)
         self.assertFalse(protected.exists())
+
+
+class ResearchDeskTests(unittest.TestCase):
+    def test_missing_invented_stale_and_escaped_research(self):
+        from unittest.mock import patch
+        from tests.test_stage3_research_evidence import brief
+        with patch.object(desk._eod, 'render', return_value=_receipt_html()):
+            missing = desk.render(FakeReceipt(), None, as_of='2024-06-01T12:00:00Z')
+            self.assertIn('no separate dated research brief', missing)
+            for origin in ('recorded', 'fixture'):
+                page = desk.render(FakeReceipt(), None, as_of='2024-06-02T12:00:00Z', research_raw=brief(origin=origin, summary='<script>bad()</script>'))
+                self.assertIn('NO PROPOSAL: WAIT', page)
+                self.assertIn('&lt;script&gt;bad()', page)
+                self.assertNotIn('<script>bad()', page)
+                self.assertIn('stale', page)
+                self.assertIn('does not refresh the old company', page)
+                self.assertIn('01 Jun 2024 19:00 HKT', page)
+                self.assertIn('02 Jun 2024 20:00 HKT', page)
+                self.assertIn('INVENTED OFFLINE RESEARCH FIXTURE' if origin == 'fixture' else 'Supplied research brief, unverified', page)
+    def test_cli_research_source_output_collision(self):
+        from unittest.mock import patch
+        from tests.test_stage3_research_evidence import brief
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td)/'source.html'; source.write_bytes(brief())
+            args = cli._parser().parse_args(['render','--state-dir',td,'--research-evidence',str(source),'--as-of','2024-06-01T12:00:00Z','--output',str(source)])
+            with patch.object(cli._store, 'latest', return_value=FakeReceipt()):
+                self.assertEqual(cli.render_command(args), 2)
+            self.assertEqual(source.read_bytes(), brief())

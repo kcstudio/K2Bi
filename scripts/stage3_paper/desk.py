@@ -11,6 +11,7 @@ from scripts.stage2_eod import desk as _eod
 from scripts.stage3_paper import snapshot as _snap
 from scripts.stage3_paper import readiness as _ready
 from scripts.stage3_paper import account_readiness as _account
+from scripts.stage3_paper import research_evidence as _research
 
 _PANEL_RE = re.compile(
     r'<section\b(?=[^>]*\bid="panel-paper")[^>]*>.*?</section>', re.DOTALL)
@@ -127,11 +128,21 @@ def _account_html(data):
     return ('<h4>Account funding and visible orders</h4><p>Saved readiness snapshot: ' + _esc(_hkt(data['completed_at'])) + '; evaluated ' + _esc(_hkt(data['as_of'])) + '; ' + _esc(data['freshness']) + '; refresh is manual.</p><p>' + _esc(origin) + '. Settled USD funding: unknown. Reserved commitments: unknown. Trading permissions and restrictions: unknown.</p><p>' + _esc(visibility) + '. This covers API-visible orders only, not guaranteed absence of all manual/user orders or permission to trade. Reported limits are not current execution quotes.</p>' + table + '<p>Account and orders were captured separately, not atomically. Broker reliability flag at account capture: ' + _esc(account['account_ready'] if account else 'unknown') + '. AccountReady is not approval. Cash is not profit or loss; HKD and BASE are not spendable USD proof.</p><details><summary>Readiness source, balances and order details</summary><p>Settlement totals retain reported currency; native settled USD scope remains unverified.</p>' + details + '</details>')
 
 
-def _body(parsed, prices=None, cash=None, card=None, account=None):
+def _research_html(data):
+    if data is None:
+        return '<h3>Research brief</h3><p>What we know: no separate dated research brief was supplied. The company panels remain the old research replay.</p><p>What is missing: verified current recommendation, a current price usable for this trade and your approved paper-trading rules. Next step: supply a dated brief for review; no action is authorized.</p>'
+    label = 'INVENTED OFFLINE RESEARCH FIXTURE' if data['origin'] == 'fixture' else 'Supplied research brief, unverified'
+    proposal = data['proposal']
+    intent = proposal['side'] + ': ' + proposal['rationale'] if proposal else 'No reported idea'
+    sources = ''.join(_row('Reported source', row['uri']) + _row('Published at', row['published_at']) + _row('Reported source hash', row['sha256']) for row in data['sources'])
+    return ('<h3>' + _esc(label) + '</h3><p>What we know: supplied brief for ' + _esc(data['symbol']) + ', ' + _esc(data['freshness']) + '. ' + _esc(data['summary']) + '</p><p>Reported idea: ' + _esc(intent) + '</p><p>Research dated ' + _esc(_hkt(data['research_as_of'])) + '; saved ' + _esc(_hkt(data['captured_at'])) + '; expires ' + _esc(_hkt(data['expires_at'])) + '; evaluated ' + _esc(_hkt(data['evaluated_at'])) + '. Refresh is manual.</p><p>What is missing: independently checked underlying reports, verified current recommendation, a current price usable for this trade and your approved paper-trading rules. Next step: review the supplied evidence and missing funding, risk and recovery checks. No proposed trade or approval is granted.</p><p>This brief does not refresh the old company research replay, holdings, cash or closing prices; each retains its own date.</p><details><summary>Research source and date details</summary><table>' + _row('Research as of', data['research_as_of']) + _row('Saved at', data['captured_at']) + _row('Expires at', data['expires_at']) + _row('Evaluated at', data['evaluated_at']) + _row('Raw sha256', data['raw_sha256']) + sources + '</table><p>Passive reported references only; no source was opened, fetched or authenticated.</p></details>')
+
+
+def _body(parsed, prices=None, cash=None, card=None, account=None, research=None):
     banner = ""
     if parsed is None:
         return ('<div class="st3-wrap"><style>.st3-wrap{min-width:0;overflow-wrap:anywhere;}.st3-scroll{overflow-x:auto;max-width:100%;}.st3-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere;}</style><p class="st3-unknown">No paper snapshot provided; '
-                'paper positions and account values are unknown.</p>' + _action_html(card) + _account_html(account) + _prices_html(prices) + _cash_html(cash) + '</div>')
+                'paper positions and account values are unknown.</p>' + _action_html(card) + _research_html(research) + _account_html(account) + _prices_html(prices) + _cash_html(cash) + '</div>')
     if parsed["origin"] == "fixture":
         banner = ('<p class="st3-banner st3-fixture" role="note">INVENTED OFFLINE BROKER FIXTURE. '
                   'Not captured from a live Gateway.</p>')
@@ -187,7 +198,7 @@ def _body(parsed, prices=None, cash=None, card=None, account=None):
              '.st3-wrap th,.st3-wrap td{padding:.5rem .8rem;text-align:left;}.st3-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere;}.st3-unknown{font-style:italic;}@media(max-width:390px){.st3-wrap{max-width:100%;}}</style>')
     prices_html = _prices_html(prices)
     cash_html = _cash_html(cash)
-    return (outer + banner + _action_html(card) + _account_html(account) + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
+    return (outer + banner + _action_html(card) + _research_html(research) + _account_html(account) + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
             + _esc(_hkt(parsed['completed_at'])) + '; evaluated ' + _esc(_hkt(parsed['evaluated_at']))
             + '; refresh is manual.</p>' + reason
             + '<h4>Paper holdings</h4>' + positions_html + '<h4>Account balances</h4>' + values_html
@@ -202,7 +213,7 @@ def _body(parsed, prices=None, cash=None, card=None, account=None):
               'eligibility, or orders are claimed.</p></div>')
 
 
-def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None):
+def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None, research_raw=None):
     _snap._ts(as_of, "as_of")
     base = _eod.render(receipt)
     parsed = _snap.parse_snapshot(snapshot_raw, as_of=as_of) if snapshot_raw is not None else None
@@ -211,11 +222,12 @@ def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proo
     cash = _ready.cash_readiness(cash_raw, as_of=as_of) if cash_raw is not None else None
     if account_proof_raw is not None and account_raw is None: raise ValueError("account proof needs readiness source")
     account = _account.parse_account_readiness(account_raw, as_of=as_of, proof_raw=account_proof_raw) if account_raw is not None else None
+    research = _research.parse_research_evidence(research_raw, as_of=as_of) if research_raw is not None else None
     match = _PANEL_RE.search(base)
     if match is None or _PANEL_RE.search(base, match.end()) is not None:
         raise ValueError("accepted template needs exactly one panel-paper section")
     original = match.group(0)
     open_tag = original[:original.index(">") + 1]
-    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account)
-    replacement = open_tag + _body(parsed, prices, cash, card, account) + "</section>"
+    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account, research=research)
+    replacement = open_tag + _body(parsed, prices, cash, card, account, research) + "</section>"
     return base[:match.start()] + replacement + base[match.end():]

@@ -256,6 +256,7 @@ def build_card(
     config_raw=None,
     example=None,
     account_readiness=None,
+    research=None,
 ):
     """Build an offline action card. Always non-executable."""
     config = _config(config_raw)
@@ -263,6 +264,10 @@ def build_card(
         return _example_card(example, config)
     account, _ = _match_account(reference, cash, holdings)
     checks = _checks(reference, cash, holdings, config, account_readiness)
+    if research is not None:
+        check = next(c for c in checks if c['label'] == 'current_recommendation')
+        intent = research['proposal']['side'] if research['proposal'] else 'no reported idea'
+        check['detail'] = ('Invented research fixture' if research['origin'] == 'fixture' else 'Supplied unverified research brief') + ': ' + research['symbol'] + ', ' + intent + ', ' + research['freshness'] + '. Current recommendation, a current price usable for this trade and your approved paper-trading rules remain unverified.'
     if reference is None or not isinstance(reference, dict):
         reason = "No verified current proposal is available."
     elif reference.get("reference_status") != "verified_historical_reference":

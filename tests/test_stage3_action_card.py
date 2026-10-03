@@ -148,3 +148,21 @@ class ActionCardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuppliedResearchCardTests(unittest.TestCase):
+    def test_all_research_states_withhold_real_action(self):
+        from scripts.stage3_paper.research_evidence import parse_research_evidence
+        from tests.test_stage3_research_evidence import brief, ts, BASE
+        for origin in ('recorded', 'fixture'):
+            for as_of in ('2024-06-01T12:00:00Z', '2024-06-02T12:00:00Z'):
+                research = parse_research_evidence(brief(origin=origin), as_of=as_of)
+                card = build_card(make_reference(), make_cash('100.00'), make_holdings(), research=research)
+                self.assertEqual(card['status'], 'WAIT')
+                for field in ('candidate', 'quantity', 'estimated_cost', 'estimated_risk'):
+                    self.assertIsNone(card[field])
+                self.assertFalse(card['executable'])
+                check = next(c for c in card['checks'] if c['label'] == 'current_recommendation')
+                self.assertEqual(check['status'], 'unknown')
+                self.assertIn('approved paper-trading rules', check['detail'])
+                self.assertIn(research['freshness'], check['detail'])
