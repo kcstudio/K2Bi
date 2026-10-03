@@ -243,3 +243,32 @@ class AcquisitionPanelTests(unittest.TestCase):
         with patch.object(desk._eod, 'render', return_value=_receipt_html()): page = desk.render(FakeReceipt(), None, as_of=quote['completed_at'], quote_raw=json.dumps(unavailable).encode())
         self.assertIn('No usable prices were returned. Quote access remains unverified', page)
         with self.assertRaises(ValueError): desk.render(FakeReceipt(), None, as_of=quote['completed_at'], quote_proof_raw=b'{}')
+
+class OfflinePreparationDeskTests(unittest.TestCase):
+    def test_missing_fixture_and_failed_input_are_separate(self):
+        from unittest.mock import patch
+        from tests.test_stage3_preparation import _risk_raw, _recovery_raw, AS_OF, _config_bytes
+        with patch.object(desk._eod, 'render', return_value=_receipt_html()):
+            missing = desk.render(FakeReceipt(), None, as_of=AS_OF)
+            self.assertIn('Offline order preparation: WAIT', missing)
+            self.assertIn('Risk context: captured unknown', missing)
+            page = desk.render(FakeReceipt(), None, as_of=AS_OF, risk_raw=_risk_raw(), recovery_raw=_recovery_raw(), config_raw=_config_bytes())
+            self.assertIn('INVENTED OFFLINE PREVIEW', page)
+            self.assertIn('NO PROPOSAL: WAIT', page)
+            self.assertIn('Estimated cost (USD)', page)
+            self.assertIn('Buy SPY', page)
+            self.assertIn('passed in this example', page)
+            self.assertIn('The example fits the existing trade-risk limits.', page)
+            self.assertIn('max-width:100%;overflow-wrap:anywhere', page)
+            self.assertIn('white-space:pre-wrap', page)
+            self.assertIn('diagnostics only', page)
+            self.assertNotIn('<button', page)
+            with self.assertRaises(ValueError): desk.render(FakeReceipt(), None, as_of=AS_OF, risk_raw=b'{}')
+            with self.assertRaisesRegex(ValueError, 'non-empty bytes'): desk.render(FakeReceipt(), None, as_of=AS_OF, risk_raw=_risk_raw(), recovery_raw=_recovery_raw(), config_raw=b'')
+    def test_cli_context_output_collision_preserves_source(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td)/'context.html'; source.write_bytes(b'{}')
+            args = cli._parser().parse_args(['render','--state-dir',td,'--risk-context',str(source),'--as-of','2024-03-04T15:00:00Z','--output',str(source)])
+            with patch.object(cli._store, 'latest', return_value=FakeReceipt()): self.assertEqual(cli.render_command(args), 2)
+            self.assertEqual(source.read_bytes(), b'{}')

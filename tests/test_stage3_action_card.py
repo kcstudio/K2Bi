@@ -174,3 +174,11 @@ class AcquisitionWaitTests(unittest.TestCase):
         checks = {row['label']:row for row in card['checks']}
         self.assertEqual(checks['current_price']['status'], 'unknown')
         self.assertEqual(checks['underlying_source_bytes']['status'], 'matched_saved_bytes')
+
+class OfflinePreparationCardTests(unittest.TestCase):
+    def test_fixture_checks_never_promote_actual_card(self):
+        card = build_card(None, None, None, preparation={'status':'INVENTED OFFLINE PREVIEW'})
+        self.assertEqual(card['status'], 'WAIT')
+        self.assertFalse(card['executable'])
+        self.assertTrue(all(card[field] is None for field in ('candidate','quantity','estimated_cost','estimated_risk')))
+        self.assertEqual(card['checks'][-1]['status'], 'invented_only')

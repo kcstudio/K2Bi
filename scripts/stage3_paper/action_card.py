@@ -259,6 +259,7 @@ def build_card(
     research=None,
     source_proof=None,
     quote=None,
+    preparation=None,
 ):
     """Build an offline action card. Always non-executable."""
     config = _config(config_raw)
@@ -268,6 +269,8 @@ def build_card(
     checks = _checks(reference, cash, holdings, config, account_readiness)
     checks.append({"label": "underlying_source_bytes", "status": "unknown" if source_proof is None else source_proof["source_integrity"], "detail": "Saved-byte integrity only; the research conclusion remains unverified."})
     checks.append({"label": "current_price", "status": "unknown", "detail": "No verified current price usable for a trade; saved feed observations do not establish execution eligibility."})
+    if preparation is not None:
+        checks.append({'label': 'offline_preparation', 'status': 'not_run' if preparation['status'] == 'WAIT' else 'invented_only', 'detail': 'Offline example checks never approve this actual account or a real proposal. Broker/journal diagnostics are not applied.'})
     if research is not None:
         check = next(c for c in checks if c['label'] == 'current_recommendation')
         intent = research['proposal']['side'] if research['proposal'] else 'no reported idea'

@@ -11,6 +11,7 @@ from scripts.stage3_paper import reference as _ref, action_card as _card
 
 from scripts.stage2_eod import desk as _eod
 from scripts.stage3_paper import snapshot as _snap
+from scripts.stage3_paper import preparation as _prep
 from scripts.stage3_paper import readiness as _ready
 from scripts.stage3_paper import account_readiness as _account
 from scripts.stage3_paper import research_evidence as _research
@@ -41,6 +42,17 @@ def _action_html(card):
             + '</p><div class="st3-scroll"><table>' + rows + '</table><table>' + checks
             + '</table></div><details><summary>Risk context details</summary><p>Validators not run.</p><pre>'
             + _esc(json.dumps(card['risk_config'], sort_keys=True)) + '</pre></details>')
+
+
+def _preparation_html(data):
+    candidate = None if data['candidate'] is None else data['candidate']['side'].capitalize() + ' ' + data['candidate']['symbol']
+    labels = {'instrument_whitelist':'Allowed instrument', 'market_hours':'Market session', 'position_size':'Position size', 'trade_risk':'Trade risk', 'leverage':'Cash-only trading', 'recovery_reconciliation':'Journal and broker example', 'broker_reconciliation':'Actual broker reconciliation', 'current_quote':'Current price usable for a trade', 'approved_paper_rules':'Your approved paper-trading rules', 'current_recommendation':'Current recommendation'}
+    explanations = {'instrument_whitelist':'The example uses an allowed instrument.', 'market_hours':'The example time is in an allowed market session.', 'position_size':'The example fits the existing position-size limit.', 'trade_risk':'The example fits the existing trade-risk limits.', 'leverage':'The example fits the existing cash-only checks.', 'recovery_reconciliation':'The example journal and broker records reconcile; diagnostics are not applied.'}
+    fields = [('Account', data['account']), ('Candidate', candidate), ('Quantity', data['quantity']), ('Estimated cost (USD)', data['estimated_cost']), ('Estimated risk (USD)', data['estimated_risk'])]
+    rows = ''.join(_row(k, 'Withheld' if v is None else v) for k, v in fields)
+    checks = ''.join('<tr><th>' + _esc(labels[c['label']]) + '</th><td>' + _esc('passed in this example' if c['status'] == 'approved' else c['status'].replace('_', ' ')) + '</td><td>' + _esc(explanations[c['label']] if c['status'] == 'approved' else c['detail']) + '</td></tr>' for c in data['checks'])
+    dates = ''.join('<p>' + label + ': captured ' + _esc(_hkt(d['captured'])) + '; evaluated ' + _esc(_hkt(d['evaluated'])) + '; expires ' + _esc(_hkt(d['expires'])) + '.</p>' for label, d in (('Risk context', data['evidence_dates']['risk']), ('Broker and journal context', data['evidence_dates']['recovery'])))
+    return ('<h3>Offline order preparation: ' + _esc(data['status']) + '</h3><p>' + _esc(data['reason']) + '</p><p>Next step: ' + _esc(data['next_step']) + '.</p><p>This checks an invented example only when explicitly supplied. It never approves, submits or applies an order. Your approved paper-trading rules, settled USD funding and a current price usable for a trade still need verification.</p>' + dates + '<div class="st3-scroll"><table>' + rows + '</table><table>' + checks + '</table></div><details><summary>Offline checks and reconciliation diagnostics</summary><p>Reported events and adopted positions are diagnostics only. Nothing is written to the broker or journal.</p><pre>' + _esc(json.dumps(data, sort_keys=True, indent=2)) + '</pre></details>')
 
 
 def _row(key, val):
@@ -229,7 +241,7 @@ def _body(parsed, prices=None, cash=None, card=None, account=None, research=None
               'eligibility, or orders are claimed.</p></div>')
 
 
-def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None, research_raw=None, research_proof_raw=None, source_blobs=None, quote_raw=None, quote_proof_raw=None):
+def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None, research_raw=None, research_proof_raw=None, source_blobs=None, quote_raw=None, quote_proof_raw=None, risk_raw=None, recovery_raw=None):
     _snap._ts(as_of, "as_of")
     base = _eod.render(receipt)
     parsed = _snap.parse_snapshot(snapshot_raw, as_of=as_of) if snapshot_raw is not None else None
@@ -248,6 +260,7 @@ def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proo
         raise ValueError("accepted template needs exactly one panel-paper section")
     original = match.group(0)
     open_tag = original[:original.index(">") + 1]
-    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account, research=research, source_proof=source_check, quote=quote)
-    replacement = open_tag + _body(parsed, prices, cash, card, account, research) + _proof_html(source_check, quote) + "</section>"
+    preparation = _prep.build_preparation(risk_raw, recovery_raw, as_of=as_of, config_raw=config_raw if config_raw is not None else Path(__file__).resolve().parents[2].joinpath('execution/validators/config.yaml').read_bytes())
+    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account, research=research, source_proof=source_check, quote=quote, preparation=preparation)
+    replacement = open_tag + _body(parsed, prices, cash, card, account, research) + '<div class="st3-wrap" style="min-width:0;max-width:100%;overflow-wrap:anywhere">' + _proof_html(source_check, quote) + _preparation_html(preparation) + '</div></section>'
     return base[:match.start()] + replacement + base[match.end():]
