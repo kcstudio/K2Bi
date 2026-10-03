@@ -1,3 +1,9 @@
+## 2026-10-03 -- Isolated read-only desk deployment preparation
+
+Documentation commit: `f3b1371087c9084c57624e0e69976b25d81a0579`. Prepared a reviewed runtime dependency inventory and local isolated payload, with private captures, execution code, validator configuration, services and unrelated dirty files excluded. The deployment guide distinguishes the CLI's required read-only configuration file from the Python renderer's optional context input. It documents checksum verification, clean export and rollback preparation, plus the remaining funding, mandate, current quote, deterministic risk, reconciliation and activation gates.
+
+Verification: Kimi documentation closure PASS; Stage 2 and Stage 3 canonical suite 166 tests and 92 subtests; exact clean exported suite 101 tests and 79 subtests; 20 deterministic renders preserved all source bytes, while missing, stale and mismatched-proof cases stayed unknown or failed closed. Payload hashes matched locally. This is preparation only. No deployment, service change, engine activation, broker action or automatic refresh occurred. The preceding action-card administrative review gap remains recorded separately.
+
 ## 2026-10-03 -- Verified saved historical reference provenance
 
 Code commit: `3918679a81730a3f1b605ed4a22e708a457de99b`. Bound saved closing prices to the reviewed finite acquisition program, exact request settings, account identity, capture interval and response hash. Recorded historical references remain distinct from invented fixtures, stale or unverified sources, executable quotes and fill permission.
