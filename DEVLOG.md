@@ -1,3 +1,9 @@
+## 2026-10-03 -- Verified saved historical reference provenance
+
+Code commit: `3918679a81730a3f1b605ed4a22e708a457de99b`. Bound saved closing prices to the reviewed finite acquisition program, exact request settings, account identity, capture interval and response hash. Recorded historical references remain distinct from invented fixtures, stale or unverified sources, executable quotes and fill permission.
+
+Verification: Kimi findings-only candidate closure PASS; canonical 154 tests and 92 subtests; clean exported bundle 89 tests and 79 subtests. DeepSeek supplied a complete compact two-file package; Sol added the bounded provenance and stale-reference fixes. Existing dirty files, accepted EOD bytes and prior stopped history were preserved. Private capture evidence was not committed. No orders, FX, deployment or activation occurred.
+
 ## 2026-10-03 -- Dated closing prices and native paper cash readiness
 
 Code commit: `32d4efd521b53bfb24362a20c59483204356c129`. Added completed-session lag for saved tracked-company closing prices and account-matched currency cash, preserving negative values and unknown reliability. The dashboard separates old holdings, newer cash and historical price capture dates, displays manual-refresh and stale states, and makes no current-quote or order-readiness claim. Private captures remain local and are excluded from Git.
