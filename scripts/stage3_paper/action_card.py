@@ -137,14 +137,14 @@ def _holdings_check(holdings):
     return ("unknown", "Holdings freshness is unknown.")
 
 
-def _checks(reference, cash, holdings, config):
+def _checks(reference, cash, holdings, config, account_readiness=None):
     cash_status, cash_detail = _cash_check(cash)
     history_status, history_detail = _history_check(reference)
     holdings_status, holdings_detail = _holdings_check(holdings)
     risk_detail = "Risk checks not run; actual validators have not executed."
     if config is not None:
         risk_detail += " Config limits were hashed, not evaluated."
-    return [
+    checks = [
         {"label": "historical_reference", "status": history_status, "detail": history_detail},
         {"label": "holdings_freshness", "status": holdings_status, "detail": holdings_detail},
         {"label": "usd_cash", "status": cash_status, "detail": cash_detail},
@@ -170,6 +170,17 @@ def _checks(reference, cash, holdings, config):
         },
         {"label": "risk", "status": "not_run", "detail": risk_detail},
     ]
+
+
+    for check in checks:
+        if check['label'] == 'settled_cash' and account_readiness is not None:
+            check['detail'] = 'Settled USD funding is unknown. Reported settlement totals retain their currency and unverified scope; HKD and BASE are not USD proof.'
+        if check['label'] == 'pending_orders' and account_readiness is not None:
+            state = account_readiness['orders_state']
+            check['status'] = state
+            check['detail'] = ('No visible API orders at capture.' if state == 'no_visible_api_orders' else 'Visible API orders at capture.' if state == 'visible_api_orders' else 'API order coverage is unknown.') + ' Manual/user order coverage and reserved commitments remain unverified; this is not permission to trade.'
+    checks.append({'label': 'trading_restrictions', 'status': 'unknown', 'detail': 'Trading permissions and account restrictions are unverified. AccountReady is a broker reliability flag, not approval.'})
+    return checks
 
 
 def _wait(reason, account, checks, config):
@@ -244,13 +255,14 @@ def build_card(
     *,
     config_raw=None,
     example=None,
+    account_readiness=None,
 ):
     """Build an offline action card. Always non-executable."""
     config = _config(config_raw)
     if example is not None:
         return _example_card(example, config)
     account, _ = _match_account(reference, cash, holdings)
-    checks = _checks(reference, cash, holdings, config)
+    checks = _checks(reference, cash, holdings, config, account_readiness)
     if reference is None or not isinstance(reference, dict):
         reason = "No verified current proposal is available."
     elif reference.get("reference_status") != "verified_historical_reference":

@@ -19,6 +19,8 @@ def _parser():
     render.add_argument("--prices", default=None)
     render.add_argument("--price-proof", default=None)
     render.add_argument("--cash-snapshot", default=None)
+    render.add_argument("--account-readiness", default=None)
+    render.add_argument("--account-proof", default=None)
     render.add_argument("--as-of", required=True)
     render.add_argument("--output", required=True)
     return parser
@@ -77,6 +79,9 @@ def render_command(args, *, out_write=None):
         cash_raw = _read_source(args.cash_snapshot, "cash snapshot", sources)
         if cash_raw is None:
             return 2
+    account_raw = _read_source(args.account_readiness, "account readiness", sources) if args.account_readiness else None
+    account_proof_raw = _read_source(args.account_proof, "account proof", sources) if args.account_proof else None
+    if (args.account_readiness and account_raw is None) or (args.account_proof and account_proof_raw is None): return 2
     try:
         safe_state, safe_output = _eod_cli.destinations(state_dir, output, sources=tuple(sources))
     except Exception:
@@ -84,7 +89,7 @@ def render_command(args, *, out_write=None):
         return 2
     try:
         page = _desk.render(receipt, snapshot_raw, as_of=args.as_of,
-                            prices_raw=prices_raw, cash_raw=cash_raw, proof_raw=proof_raw, config_raw=config_raw)
+                            prices_raw=prices_raw, cash_raw=cash_raw, proof_raw=proof_raw, config_raw=config_raw, account_raw=account_raw, account_proof_raw=account_proof_raw)
     except ValueError as exc:
         sys.stderr.write("source failed closed: " + str(exc) + "\n")
         return 2

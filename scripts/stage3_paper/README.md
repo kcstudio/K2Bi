@@ -65,3 +65,10 @@ saved historical reference provenance, not live entitlement or fill permission.
 The risk context uses the unchanged execution/validators/config.yaml. No engine
 code or order API is invoked. All refreshes are manual. Invented examples are
 explicitly labelled and have no action controls or execution permission.
+
+
+Account readiness is a separate saved shape, supplied with `--account-readiness` and optional `--account-proof`. It records separately timed account and API-visible open-order request completions through the finite read-only Gateway helper. Its standalone capture uses only stdlib and installed ib_async, with leased client ID 90 through 99, StartupFetch(0), no binding, no market data, and cleanup on every path.
+
+A completed API-visible snapshot can show no visible API orders at capture. It does not prove all manual/user orders are absent or grant permission. Missing completion, attribution, reliable account flag, provenance or freshness stays unknown. Order quantities and limits are observations, not executable quotes; remaining quantities and reserved commitments are unverified. Settlement totals retain reported currency and scope. Native settled USD, trading permissions and restrictions remain unknown. Positive cash and AccountReady do not approve trading. The actual card continues to WAIT with proposal fields withheld.
+
+Keep raw snapshots and acquisition proofs private and immutable. A proof binds exact source, request settings, raw bytes and capture time for ordinary saved integrity. It is not malicious-forgery authentication. Refresh is manual, and evaluation time must be explicit. This package does not submit, cancel or bind orders, change permissions, convert currencies, activate services or bypass risk validators.

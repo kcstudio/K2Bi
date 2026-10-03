@@ -10,6 +10,7 @@ from scripts.stage3_paper import reference as _ref, action_card as _card
 from scripts.stage2_eod import desk as _eod
 from scripts.stage3_paper import snapshot as _snap
 from scripts.stage3_paper import readiness as _ready
+from scripts.stage3_paper import account_readiness as _account
 
 _PANEL_RE = re.compile(
     r'<section\b(?=[^>]*\bid="panel-paper")[^>]*>.*?</section>', re.DOTALL)
@@ -112,11 +113,25 @@ def _cash_html(cash):
             + '<details><summary>Currency cash source details</summary><table>' + _row('Captured at', cash['completed_at']) + _row('Evaluated at', cash['as_of']) + _row('Raw sha256', cash['raw_sha256']) + _row('AccountReady', cash['account_ready']) + '</table></details>')
 
 
-def _body(parsed, prices=None, cash=None, card=None):
+def _account_html(data):
+    if data is None:
+        return '<h4>Account funding and visible orders</h4><p>Not captured: settled USD, pending orders and restrictions are unknown.</p>'
+    account, orders = data['account'], data['orders']
+    state = data['orders_state']
+    visibility = ('No visible API orders at capture' if state == 'no_visible_api_orders' else 'Visible API orders at capture' if state == 'visible_api_orders' else 'API order coverage unknown')
+    values = ''.join(_row(r['tag'].removeprefix('$LEDGER-') + ' (' + (r['currency'] or 'unspecified currency') + ')', r['value']) for r in (account['values'] or []) if account) if account else ''
+    rows = ''.join('<tr><td>' + _esc(r['symbol']) + '</td><td>' + _esc(r['side']) + '</td><td>' + _esc(r['quantity']) + '</td><td>' + _esc(r['currency']) + '</td><td>' + _esc(r['limit_price'] if r['limit_price'] is not None else 'unknown') + '</td><td>' + _esc(r['status']) + '</td></tr>' for r in (orders['rows'] or [])) if orders else ''
+    origin = 'INVENTED OFFLINE FIXTURE' if data['origin'] == 'fixture' else 'Recorded request verified' if data['provenance'] == 'recorded_request_verified' else 'Source provenance unverified'
+    table = '<div class="st3-scroll"><table><tr><th>Symbol</th><th>Side</th><th>Reported quantity</th><th>Currency</th><th>Reported limit</th><th>Status</th></tr>' + rows + '</table></div>' if rows else ''
+    details = '<div class="st3-scroll"><table>' + values + '</table></div><pre>' + _esc(json.dumps({'request': data['request'], 'account': account, 'orders': orders, 'raw_sha256': data['raw_sha256'], 'proof_sha256': data['proof_sha256']}, sort_keys=True)) + '</pre>'
+    return ('<h4>Account funding and visible orders</h4><p>Saved readiness snapshot: ' + _esc(_hkt(data['completed_at'])) + '; evaluated ' + _esc(_hkt(data['as_of'])) + '; ' + _esc(data['freshness']) + '; refresh is manual.</p><p>' + _esc(origin) + '. Settled USD funding: unknown. Reserved commitments: unknown. Trading permissions and restrictions: unknown.</p><p>' + _esc(visibility) + '. This covers API-visible orders only, not guaranteed absence of all manual/user orders or permission to trade. Reported limits are not current execution quotes.</p>' + table + '<p>Account and orders were captured separately, not atomically. Broker reliability flag at account capture: ' + _esc(account['account_ready'] if account else 'unknown') + '. AccountReady is not approval. Cash is not profit or loss; HKD and BASE are not spendable USD proof.</p><details><summary>Readiness source, balances and order details</summary><p>Settlement totals retain reported currency; native settled USD scope remains unverified.</p>' + details + '</details>')
+
+
+def _body(parsed, prices=None, cash=None, card=None, account=None):
     banner = ""
     if parsed is None:
-        return ('<div class="st3-wrap"><style>.st3-wrap{min-width:0;overflow-wrap:anywhere;}.st3-scroll{overflow-x:auto;max-width:100%;}</style><p class="st3-unknown">No paper snapshot provided; '
-                'paper positions and account values are unknown.</p>' + _action_html(card) + _prices_html(prices) + _cash_html(cash) + '</div>')
+        return ('<div class="st3-wrap"><style>.st3-wrap{min-width:0;overflow-wrap:anywhere;}.st3-scroll{overflow-x:auto;max-width:100%;}.st3-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere;}</style><p class="st3-unknown">No paper snapshot provided; '
+                'paper positions and account values are unknown.</p>' + _action_html(card) + _account_html(account) + _prices_html(prices) + _cash_html(cash) + '</div>')
     if parsed["origin"] == "fixture":
         banner = ('<p class="st3-banner st3-fixture" role="note">INVENTED OFFLINE BROKER FIXTURE. '
                   'Not captured from a live Gateway.</p>')
@@ -172,7 +187,7 @@ def _body(parsed, prices=None, cash=None, card=None):
              '.st3-wrap th,.st3-wrap td{padding:.5rem .8rem;text-align:left;}.st3-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere;}.st3-unknown{font-style:italic;}@media(max-width:390px){.st3-wrap{max-width:100%;}}</style>')
     prices_html = _prices_html(prices)
     cash_html = _cash_html(cash)
-    return (outer + banner + _action_html(card) + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
+    return (outer + banner + _action_html(card) + _account_html(account) + '<h3>Paper account snapshot</h3><p>Saved account snapshot: '
             + _esc(_hkt(parsed['completed_at'])) + '; evaluated ' + _esc(_hkt(parsed['evaluated_at']))
             + '; refresh is manual.</p>' + reason
             + '<h4>Paper holdings</h4>' + positions_html + '<h4>Account balances</h4>' + values_html
@@ -187,18 +202,20 @@ def _body(parsed, prices=None, cash=None, card=None):
               'eligibility, or orders are claimed.</p></div>')
 
 
-def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None):
+def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None):
     _snap._ts(as_of, "as_of")
     base = _eod.render(receipt)
     parsed = _snap.parse_snapshot(snapshot_raw, as_of=as_of) if snapshot_raw is not None else None
     if proof_raw is not None and prices_raw is None: raise ValueError('price proof needs prices')
     prices = _ref.verify_reference(prices_raw, proof_raw, as_of=as_of) if prices_raw is not None else None
     cash = _ready.cash_readiness(cash_raw, as_of=as_of) if cash_raw is not None else None
+    if account_proof_raw is not None and account_raw is None: raise ValueError("account proof needs readiness source")
+    account = _account.parse_account_readiness(account_raw, as_of=as_of, proof_raw=account_proof_raw) if account_raw is not None else None
     match = _PANEL_RE.search(base)
     if match is None or _PANEL_RE.search(base, match.end()) is not None:
         raise ValueError("accepted template needs exactly one panel-paper section")
     original = match.group(0)
     open_tag = original[:original.index(">") + 1]
-    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example)
-    replacement = open_tag + _body(parsed, prices, cash, card) + "</section>"
+    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account)
+    replacement = open_tag + _body(parsed, prices, cash, card, account) + "</section>"
     return base[:match.start()] + replacement + base[match.end():]
