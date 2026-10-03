@@ -4,6 +4,8 @@ from __future__ import annotations
 import html
 import re
 import json
+import hashlib
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from scripts.stage3_paper import reference as _ref, action_card as _card
 
@@ -12,6 +14,7 @@ from scripts.stage3_paper import snapshot as _snap
 from scripts.stage3_paper import readiness as _ready
 from scripts.stage3_paper import account_readiness as _account
 from scripts.stage3_paper import research_evidence as _research
+from scripts.stage3_paper import research_proof as _research_proof, quote_evidence as _quote
 
 _PANEL_RE = re.compile(
     r'<section\b(?=[^>]*\bid="panel-paper")[^>]*>.*?</section>', re.DOTALL)
@@ -138,6 +141,19 @@ def _research_html(data):
     return ('<h3>' + _esc(label) + '</h3><p>What we know: supplied brief for ' + _esc(data['symbol']) + ', ' + _esc(data['freshness']) + '. ' + _esc(data['summary']) + '</p><p>Reported idea: ' + _esc(intent) + '</p><p>Research dated ' + _esc(_hkt(data['research_as_of'])) + '; saved ' + _esc(_hkt(data['captured_at'])) + '; expires ' + _esc(_hkt(data['expires_at'])) + '; evaluated ' + _esc(_hkt(data['evaluated_at'])) + '. Refresh is manual.</p><p>What is missing: independently checked underlying reports, verified current recommendation, a current price usable for this trade and your approved paper-trading rules. Next step: review the supplied evidence and missing funding, risk and recovery checks. No proposed trade or approval is granted.</p><p>This brief does not refresh the old company research replay, holdings, cash or closing prices; each retains its own date.</p><details><summary>Research source and date details</summary><table>' + _row('Research as of', data['research_as_of']) + _row('Saved at', data['captured_at']) + _row('Expires at', data['expires_at']) + _row('Evaluated at', data['evaluated_at']) + _row('Raw sha256', data['raw_sha256']) + sources + '</table><p>Passive reported references only; no source was opened, fetched or authenticated.</p></details>')
 
 
+def _proof_html(proof, quote):
+    source = ('unknown' if proof is None else {'matched_saved_bytes': 'matched the saved report bytes', 'unknown': 'unknown'}[proof['source_integrity']])
+    origin = ('unverified' if proof is None else {'recorded_request_receipt': 'saved request receipt', 'invented_fixture': 'invented offline fixture', 'unverified': 'unverified'}[proof['acquisition_origin']])
+    text = '<h3>Source and price evidence</h3><p>Underlying report bytes: ' + _esc(source) + '; origin: ' + _esc(origin) + '. Matching saved bytes does not independently verify the research conclusion.</p>'
+    if quote is None: return text + '<p>No separate current-price capture supplied. A current price usable for a trade remains unknown.</p>'
+    text += '<p>' + ('INVENTED OFFLINE FIXTURE. ' if quote['origin'] == 'fixture' else 'Saved manual price capture. ') + 'Saved ' + _esc(_hkt(quote['completed_at'])) + '; evaluated ' + _esc(_hkt(quote['evaluated_at'])) + '; ' + _esc(quote['local_capture_freshness']) + '. Session: ' + _esc(quote['regular_session_status']) + '. Not a price usable for a trade.</p>'
+    text += '<p>Price result: ' + _esc(quote['status']) + ('. No usable prices were returned. Quote access remains unverified; a later manual check is needed.' if quote['status'] == 'unavailable' else '. Saved observations are display only; quote access and a current price usable for a trade remain unverified.') + '</p>'
+    text += '<table><tr><th>Instrument</th><th>Bid</th><th>Ask</th><th>Last trade</th><th>Observed feed</th></tr>'
+    for row in quote['rows']:
+        text += '<tr>' + ''.join('<td>' + _esc(row.get(k) if row.get(k) is not None else 'unknown') + '</td>' for k in ('symbol', 'bid', 'ask', 'last', 'feed_classification')) + '</tr>'
+    return text + '</table><p>Requested delayed fallback is not proof of the observed feed. Last-trade time is not the bid or ask time. No trading approval is granted.</p><details><summary>Acquisition, feed and timestamp details</summary><pre>' + _esc(json.dumps({'research': proof, 'prices': quote}, indent=2)) + '</pre></details>'
+
+
 def _body(parsed, prices=None, cash=None, card=None, account=None, research=None):
     banner = ""
     if parsed is None:
@@ -213,7 +229,7 @@ def _body(parsed, prices=None, cash=None, card=None, account=None, research=None
               'eligibility, or orders are claimed.</p></div>')
 
 
-def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None, research_raw=None):
+def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proof_raw=None, config_raw=None, example=None, account_raw=None, account_proof_raw=None, research_raw=None, research_proof_raw=None, source_blobs=None, quote_raw=None, quote_proof_raw=None):
     _snap._ts(as_of, "as_of")
     base = _eod.render(receipt)
     parsed = _snap.parse_snapshot(snapshot_raw, as_of=as_of) if snapshot_raw is not None else None
@@ -223,11 +239,15 @@ def render(receipt, snapshot_raw, *, as_of, prices_raw=None, cash_raw=None, proo
     if account_proof_raw is not None and account_raw is None: raise ValueError("account proof needs readiness source")
     account = _account.parse_account_readiness(account_raw, as_of=as_of, proof_raw=account_proof_raw) if account_raw is not None else None
     research = _research.parse_research_evidence(research_raw, as_of=as_of) if research_raw is not None else None
+    if (research_proof_raw is not None or source_blobs) and research_raw is None: raise ValueError("source proof needs research brief")
+    source_check = _research_proof.verify_research_sources(research_raw, research_proof_raw, source_blobs or {}, as_of=as_of, expected_program_sha256=hashlib.sha256(Path(_research_proof.__file__).read_bytes()).hexdigest()) if research_raw is not None else None
+    if quote_proof_raw is not None and quote_raw is None: raise ValueError("quote proof needs quote snapshot")
+    quote = _quote.parse_quote_evidence(quote_raw, as_of=as_of, proof_raw=quote_proof_raw, expected_program_sha256=hashlib.sha256(Path(__file__).with_name('quote_capture.py').read_bytes()).hexdigest()) if quote_raw is not None else None
     match = _PANEL_RE.search(base)
     if match is None or _PANEL_RE.search(base, match.end()) is not None:
         raise ValueError("accepted template needs exactly one panel-paper section")
     original = match.group(0)
     open_tag = original[:original.index(">") + 1]
-    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account, research=research)
-    replacement = open_tag + _body(parsed, prices, cash, card, account, research) + "</section>"
+    card = _card.build_card(prices, cash, parsed, config_raw=config_raw, example=example, account_readiness=account, research=research, source_proof=source_check, quote=quote)
+    replacement = open_tag + _body(parsed, prices, cash, card, account, research) + _proof_html(source_check, quote) + "</section>"
     return base[:match.start()] + replacement + base[match.end():]

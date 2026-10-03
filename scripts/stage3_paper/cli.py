@@ -22,6 +22,7 @@ def _parser():
     render.add_argument("--account-readiness", default=None)
     render.add_argument("--account-proof", default=None)
     render.add_argument("--research-evidence", default=None)
+    for name in ("research-proof", "source-g", "source-cdns", "quote-snapshot", "quote-proof"): render.add_argument("--" + name, default=None)
     render.add_argument("--as-of", required=True)
     render.add_argument("--output", required=True)
     return parser
@@ -86,6 +87,13 @@ def render_command(args, *, out_write=None):
     research_path = getattr(args, "research_evidence", None)
     research_raw = _read_source(research_path, "research evidence", sources) if research_path else None
     if research_path and research_raw is None: return 2
+    extra = {}
+    for name in ("research_proof", "source_g", "source_cdns", "quote_snapshot", "quote_proof"):
+        path = getattr(args, name, None)
+        extra[name] = _read_source(path, name, sources) if path else None
+        if path and extra[name] is None: return 2
+    from scripts.stage3_paper.research_proof import FIXED_URLS
+    blobs = {FIXED_URLS[symbol]: extra[name] for symbol, name in (("G", "source_g"), ("CDNS", "source_cdns")) if extra[name] is not None}
     try:
         safe_state, safe_output = _eod_cli.destinations(state_dir, output, sources=tuple(sources))
     except Exception:
@@ -93,7 +101,7 @@ def render_command(args, *, out_write=None):
         return 2
     try:
         page = _desk.render(receipt, snapshot_raw, as_of=args.as_of,
-                            prices_raw=prices_raw, cash_raw=cash_raw, proof_raw=proof_raw, config_raw=config_raw, account_raw=account_raw, account_proof_raw=account_proof_raw, research_raw=research_raw)
+                            prices_raw=prices_raw, cash_raw=cash_raw, proof_raw=proof_raw, config_raw=config_raw, account_raw=account_raw, account_proof_raw=account_proof_raw, research_raw=research_raw, research_proof_raw=extra["research_proof"], source_blobs=blobs, quote_raw=extra["quote_snapshot"], quote_proof_raw=extra["quote_proof"])
     except ValueError as exc:
         sys.stderr.write("source failed closed: " + str(exc) + "\n")
         return 2

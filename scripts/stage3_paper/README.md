@@ -76,3 +76,12 @@ Keep raw snapshots and acquisition proofs private and immutable. A proof binds e
 ## Supplied dated research brief
 
 `--research-evidence PATH` accepts strict `offline-research-evidence` JSON. It displays a supplied brief, reported idea and separate research/save/expiry/evaluation dates. Recorded means supplied, not authenticated research; hashes and fresh dates do not verify source contents or approve a recommendation. References are passive escaped text and are never opened or fetched. Fixtures are explicitly invented. Missing, stale or supplied briefs keep the actual card WAIT with candidate, quantity, cost and risk withheld. Current executable quote, approved mandate, funding, restrictions, risk and recovery remain separate missing checks. Old company replay and account snapshots retain their own dates. No broker or external source requests occur.
+
+
+### Saved source and price evidence
+
+The manual renderer accepts `--research-proof`, `--source-g`, and `--source-cdns` with a dated `--research-evidence` brief. It checks the actual supplied SEC response bytes, their company identity and receipt hashes against the reviewed acquisition code. Matching bytes is not independent approval of the research conclusion. References remain passive.
+
+`--quote-snapshot` and optional `--quote-proof` display a finite saved paper Gateway capture. Requested delayed fallback and observed feed are separate. The broker clock, native last-trade timestamp, local receipt time and render evaluation remain distinct. Missing callbacks or timestamps stay unknown; old data stays stale. Historical closes and saved snapshots are not executable prices. Every actual action card remains WAIT with quantity, cost and risk withheld.
+
+The standalone `quote_capture.py` is an explicit operator read through the existing Gateway helper only after source review. It requests three fixed instruments, no paid regulatory snapshots, and cleans up only unfinished market-data request IDs. Running the renderer never refreshes sources or the broker. Deployment and paper activation are separate gates.

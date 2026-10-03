@@ -166,3 +166,11 @@ class SuppliedResearchCardTests(unittest.TestCase):
                 self.assertEqual(check['status'], 'unknown')
                 self.assertIn('approved paper-trading rules', check['detail'])
                 self.assertIn(research['freshness'], check['detail'])
+
+class AcquisitionWaitTests(unittest.TestCase):
+    def test_matching_source_and_feed_observations_do_not_approve(self):
+        card = build_card(None, make_cash(), make_holdings(), source_proof={'source_integrity':'matched_saved_bytes'}, quote={'quote_eligibility':False})
+        self.assertEqual(card['status'], 'WAIT')
+        checks = {row['label']:row for row in card['checks']}
+        self.assertEqual(checks['current_price']['status'], 'unknown')
+        self.assertEqual(checks['underlying_source_bytes']['status'], 'matched_saved_bytes')

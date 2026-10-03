@@ -224,3 +224,22 @@ class ResearchDeskTests(unittest.TestCase):
             with patch.object(cli._store, 'latest', return_value=FakeReceipt()):
                 self.assertEqual(cli.render_command(args), 2)
             self.assertEqual(source.read_bytes(), brief())
+
+class AcquisitionPanelTests(unittest.TestCase):
+    def test_fixture_quote_dates_unknown_and_withheld_actions(self):
+        from unittest.mock import patch
+        from tests.test_stage3_quote_evidence import canonical
+        quote = canonical(); quote["origin"] = "fixture"
+        with patch.object(desk._eod, 'render', return_value=_receipt_html()):
+            page = desk.render(FakeReceipt(), None, as_of=quote['completed_at'], quote_raw=json.dumps(quote).encode())
+        self.assertIn('INVENTED OFFLINE FIXTURE', page)
+        self.assertIn('Source and price evidence', page)
+        self.assertIn('Last-trade time is not the bid or ask time', page)
+        self.assertIn('Not a price usable for a trade', page)
+        self.assertNotIn('placeOrder', page)
+        self.assertIn('WAIT', page)
+        self.assertIn('quote access and a current price usable', page)
+        unavailable = dict(quote, status='unavailable', account_matched=False, server_time=None, rows=[dict(r, status='unavailable', reason='not requested', requested_at=None, completed_at=None, snapshot_end_observed=False, observed_data_type=None, observed_data_type_at=None, bid=None, ask=None, last=None, last_trade_at=None, received_at=None) for r in quote['rows']])
+        with patch.object(desk._eod, 'render', return_value=_receipt_html()): page = desk.render(FakeReceipt(), None, as_of=quote['completed_at'], quote_raw=json.dumps(unavailable).encode())
+        self.assertIn('No usable prices were returned. Quote access remains unverified', page)
+        with self.assertRaises(ValueError): desk.render(FakeReceipt(), None, as_of=quote['completed_at'], quote_proof_raw=b'{}')
